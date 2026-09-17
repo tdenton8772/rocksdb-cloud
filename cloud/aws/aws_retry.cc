@@ -129,6 +129,16 @@ Status AwsCloudOptions::GetClientConfiguration(
   }
 
   config->region = ToAwsString(region);
+
+  // NAM: Support custom S3 endpoint (e.g. MinIO) via AWS_ENDPOINT_URL env var.
+  // The AWS C++ SDK 1.11.x reads this natively for newer client configs, but
+  // the older ClientConfiguration path used by RocksDB-Cloud does not.
+  // Setting endpointOverride ensures all requests go to the custom endpoint.
+  const char* endpoint_url = getenv("AWS_ENDPOINT_URL");
+  if (endpoint_url && endpoint_url[0] != '\0') {
+    config->endpointOverride = ToAwsString(std::string(endpoint_url));
+  }
+
   return Status::OK();
 }
 #else

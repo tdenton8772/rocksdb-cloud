@@ -117,10 +117,18 @@ class AwsS3ClientWrapper {
     if (cloud_options.s3_client_factory) {
       client_ = cloud_options.s3_client_factory(creds, config);
     } else if (creds) {
+      // Use path-style addressing when a custom S3 endpoint is set (e.g. MinIO).
+      // Virtual-hosted style requires DNS resolution of bucket.endpoint which
+      // doesn't work with MinIO or other S3-compatible stores.
+      // Check both endpointOverride (explicit) and AWS_ENDPOINT_URL (SDK env var).
+      const char* endpoint_env = getenv("AWS_ENDPOINT_URL");
+      bool hasCustomEndpoint = !config.endpointOverride.empty() ||
+                               (endpoint_env && endpoint_env[0] != '\0');
+      bool useVirtualAddressing = !hasCustomEndpoint;
       client_ = std::make_shared<Aws::S3::S3Client>(
           creds, config,
           Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-          true /* useVirtualAddressing */);
+          useVirtualAddressing);
     } else {
       client_ = std::make_shared<Aws::S3::S3Client>(config);
     }
