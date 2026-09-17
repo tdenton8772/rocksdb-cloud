@@ -94,6 +94,13 @@ if(CCACHE_FOUND)
 endif(CCACHE_FOUND)
 
 option(WITH_JEMALLOC "build with JeMalloc" OFF)
+option(WITH_AWS "build with AWS" OFF)
+if(WITH_AWS)
+  find_package(AWSSDK REQUIRED COMPONENTS s3 transfer)
+  add_definitions(-DUSE_AWS)
+  include_directories(${AWS_INCLUDE_DIR})
+  list(APPEND THIRDPARTY_LIBS ${AWSSDK_LINK_LIBRARIES})
+endif()
 option(WITH_LIBURING "build with liburing" ON)
 option(WITH_SNAPPY "build with SNAPPY" OFF)
 option(WITH_LZ4 "build with lz4" OFF)
@@ -1097,7 +1104,20 @@ set(SOURCES
         utilities/ttl/db_ttl_impl.cc
         utilities/wal_filter.cc
         utilities/write_batch_with_index/write_batch_with_index.cc
-        utilities/write_batch_with_index/write_batch_with_index_internal.cc)
+        utilities/write_batch_with_index/write_batch_with_index_internal.cc
+        cloud/aws/aws_file_system.cc
+        cloud/aws/aws_retry.cc
+        cloud/aws/aws_s3.cc
+        cloud/db_cloud_impl.cc
+        cloud/cloud_file_system.cc
+        cloud/cloud_file_system_impl.cc
+        cloud/cloud_log_controller.cc
+        cloud/manifest_reader.cc
+        cloud/purge.cc
+        cloud/cloud_manifest.cc
+        cloud/cloud_scheduler.cc
+        cloud/cloud_storage_provider.cc
+        cloud/cloud_file_deletion_scheduler.cc)
 
 list(APPEND SOURCES
   utilities/transactions/lock/range/range_tree/lib/locktree/concurrent_tree.cc

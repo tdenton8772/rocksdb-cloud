@@ -37,7 +37,9 @@ class SstFileManagerImpl : public SstFileManager {
   ~SstFileManagerImpl();
 
   // DB will call OnAddFile whenever a new sst/blob file is added.
-  Status OnAddFile(const std::string& file_path);
+  // Virtual so cloud/ can override it (ConstantSizeSstFileManager reports a
+  // fixed size rather than stat'ing a file that may only exist in the cloud).
+  virtual Status OnAddFile(const std::string& file_path);
 
   // Overload where size of the file is provided by the caller rather than
   // queried from the filesystem. This is an optimization.
