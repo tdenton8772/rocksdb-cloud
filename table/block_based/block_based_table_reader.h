@@ -683,6 +683,17 @@ class BlockBasedTable : public TableReader, public SameFileBlobReader {
       bool avoid_shared_metadata_cache,
       BlockCacheLookupContext* lookup_context);
 
+  struct IndexFilterPinningInfo {
+    bool pin_top_level_index; // top-level index block
+    bool pin_top_level_filter; // top-level filter block
+    bool pin_partition; // applies to both index and filter partitions
+    bool pin_unpartitioned; // applies to both index and filter blocks
+  };
+  static IndexFilterPinningInfo ShouldPinIndexFilterBlocks(
+      const BlockBasedTableOptions& table_options, const Rep* rep,
+      const int level, size_t file_size, size_t max_file_size_for_l0_meta_pin,
+      bool avoid_shared_metadata_cache);
+
   static BlockType GetBlockTypeForMetaBlockByName(const Slice& meta_block_name);
 
   Status VerifyChecksumInMetaBlocks(const ReadOptions& read_options,
