@@ -184,7 +184,8 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
     }
 
     // delete local file
-    if (!cfs_->GetCloudFileSystemOptions().keep_local_sst_files) {
+    if (cfs_->GetCloudFileSystemOptions().local_sst_file_mode ==
+        LocalSstFileMode::kRemotePrimary) {
       status_ = cfs_->GetBaseFileSystem()->DeleteFile(fname_, opts, dbg);
       if (!status_.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),

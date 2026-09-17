@@ -50,8 +50,16 @@ void CloudFileSystemOptions::Dump(Logger* log) const {
          dest_bucket.GetRegion().c_str());
   Header(log, "                           COptions.log_type: %s",
          (controller != nullptr) ? controller->Name() : "None");
-  Header(log, "               COptions.keep_local_sst_files: %d",
-         keep_local_sst_files);
+  {
+    const char* mode_str = "unknown";
+    switch (local_sst_file_mode) {
+      case LocalSstFileMode::kRemotePrimary: mode_str = "remote_primary"; break;
+      case LocalSstFileMode::kEagerMirror: mode_str = "eager_mirror"; break;
+      case LocalSstFileMode::kCacheOnDemand: mode_str = "cache_on_demand"; break;
+      case LocalSstFileMode::kTrickleSync: mode_str = "trickle_sync"; break;
+    }
+    Header(log, "              COptions.local_sst_file_mode: %s", mode_str);
+  }
   Header(log, "               COptions.keep_local_log_files: %d",
          keep_local_log_files);
   Header(log, "             COptions.server_side_encryption: %d",
@@ -300,11 +308,40 @@ int offset_of(T1 CloudFileSystemOptions::*member) {
   return int(size_t(&(dummy_ceo_options.*member)) - size_t(&dummy_ceo_options));
 }
 
+static std::unordered_map<std::string, LocalSstFileMode>
+    local_sst_file_mode_string_map = {
+        {"kRemotePrimary", LocalSstFileMode::kRemotePrimary},
+        {"kEagerMirror", LocalSstFileMode::kEagerMirror},
+        {"kCacheOnDemand", LocalSstFileMode::kCacheOnDemand},
+        {"kTrickleSync", LocalSstFileMode::kTrickleSync},
+};
+
 const std::unordered_map<std::string, OptionTypeInfo>
     CloudFileSystemOptions::cloud_fs_option_type_info = {
+        {"local_sst_file_mode",
+         OptionTypeInfo::Enum<LocalSstFileMode>(
+             offset_of(&CloudFileSystemOptions::local_sst_file_mode),
+             &local_sst_file_mode_string_map)},
+        // Legacy alias for backwards compatibility.
+        // "true"/"1" -> kEagerMirror, "false"/"0" -> kRemotePrimary
         {"keep_local_sst_files",
-         {offset_of(&CloudFileSystemOptions::keep_local_sst_files),
-          OptionType::kBoolean}},
+         {offset_of(&CloudFileSystemOptions::local_sst_file_mode),
+          OptionType::kUnknown, OptionVerificationType::kAlias,
+          OptionTypeFlags::kNone,
+          [](const ConfigOptions& /*opts*/, const std::string& /*name*/,
+             const std::string& value, void* addr) {
+            auto* mode = static_cast<LocalSstFileMode*>(addr);
+            if (value == "true" || value == "1") {
+              *mode = LocalSstFileMode::kEagerMirror;
+            } else if (value == "false" || value == "0") {
+              *mode = LocalSstFileMode::kRemotePrimary;
+            } else {
+              return Status::InvalidArgument(
+                  "keep_local_sst_files must be true/false. "
+                  "Use local_sst_file_mode for new modes.");
+            }
+            return Status::OK();
+          }}},
         {"keep_local_log_files",
          {offset_of(&CloudFileSystemOptions::keep_local_log_files),
           OptionType::kBoolean}},

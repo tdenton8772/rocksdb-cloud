@@ -171,7 +171,7 @@ IOStatus CloudFileSystemImpl::NewSequentialFile(
   }
 
   if (sstfile || manifest || identity) {
-    if (cloud_fs_options.keep_local_sst_files || !sstfile) {
+    if (KeepsLocalSstFiles(cloud_fs_options.local_sst_file_mode) || !sstfile) {
       // We read first from local storage and then from cloud storage.
       st = base_fs_->NewSequentialFile(fname, file_opts, result, dbg);
       if (!st.ok()) {
@@ -240,7 +240,7 @@ IOStatus CloudFileSystemImpl::NewRandomAccessFile(
 
   const IOOptions io_opts;
   if (sstfile || manifest || identity) {
-    if (cloud_fs_options.keep_local_sst_files || !sstfile) {
+    if (KeepsLocalSstFiles(cloud_fs_options.local_sst_file_mode) || !sstfile) {
       // Read from local storage and then from cloud storage.
       st = base_fs_->NewRandomAccessFile(fname, file_opts, result, dbg);
 
@@ -1064,8 +1064,10 @@ std::string CloudFileSystemImpl::GenerateNewEpochId() {
 Status CloudFileSystemImpl::CheckOption(const FileOptions& file_opts) {
   // Cannot mmap files that reside on cloud storage, unless the file is also
   // local
-  if (file_opts.use_mmap_reads && !cloud_fs_options.keep_local_sst_files) {
-    std::string msg = "Mmap only if keep_local_sst_files is set";
+  if (file_opts.use_mmap_reads &&
+      !SupportsMmapReads(cloud_fs_options.local_sst_file_mode)) {
+    std::string msg =
+        "Mmap only if local_sst_file_mode is kEagerMirror";
     return Status::InvalidArgument(msg);
   }
   return Status::OK();
@@ -1635,11 +1637,12 @@ IOStatus CloudFileSystemImpl::SanitizeLocalDirectory(
           "at startup",
           GetSrcObjectPath().c_str(), local_name.c_str());
     }
-    if (!cloud_fs_options.keep_local_sst_files && !read_only) {
+    if (!KeepsLocalSstFiles(cloud_fs_options.local_sst_file_mode) &&
+        !read_only) {
       Log(InfoLogLevel::INFO_LEVEL, info_log_,
           "[cloud_fs_impl] SanitizeDirectory info.  "
-          " No destination bucket specified and options.keep_local_sst_files "
-          "is false. Existing sst files from src bucket %s will not be "
+          " No destination bucket specified and local_sst_file_mode is "
+          "kRemotePrimary. Existing sst files from src bucket %s will not be "
           " downloaded into local dir but newly created sst files will "
           " remain in local dir %s",
           GetSrcObjectPath().c_str(), local_name.c_str());

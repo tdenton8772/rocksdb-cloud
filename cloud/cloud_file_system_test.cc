@@ -31,7 +31,7 @@ TEST(CloudFileSystemTest, TestBucket) {
 TEST(CloudFileSystemTest, ConfigureOptions) {
   ConfigOptions config_options;
   CloudFileSystemOptions copts, copy;
-  copts.keep_local_sst_files = false;
+  copts.local_sst_file_mode = LocalSstFileMode::kRemotePrimary;
   copts.keep_local_log_files = false;
   copts.create_bucket_if_missing = false;
   copts.validate_filesize = false;
@@ -45,7 +45,8 @@ TEST(CloudFileSystemTest, ConfigureOptions) {
   std::string str;
   ASSERT_OK(copts.Serialize(config_options, &str));
   ASSERT_OK(copy.Configure(config_options, str));
-  ASSERT_FALSE(copy.keep_local_sst_files);
+  ASSERT_EQ(copy.local_sst_file_mode, LocalSstFileMode::kRemotePrimary);
+  ASSERT_FALSE(copy.get_keep_local_sst_files());  // backwards compat
   ASSERT_FALSE(copy.keep_local_log_files);
   ASSERT_FALSE(copy.create_bucket_if_missing);
   ASSERT_FALSE(copy.validate_filesize);
@@ -56,8 +57,8 @@ TEST(CloudFileSystemTest, ConfigureOptions) {
   ASSERT_EQ(copy.constant_sst_file_size_in_sst_file_manager, 100);
   ASSERT_EQ(copy.purger_periodicity_millis, 101);
 
-  // Now try a different value
-  copts.keep_local_sst_files = true;
+  // Now try kEagerMirror (legacy true)
+  copts.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   copts.keep_local_log_files = true;
   copts.create_bucket_if_missing = true;
   copts.validate_filesize = true;
@@ -70,7 +71,8 @@ TEST(CloudFileSystemTest, ConfigureOptions) {
 
   ASSERT_OK(copts.Serialize(config_options, &str));
   ASSERT_OK(copy.Configure(config_options, str));
-  ASSERT_TRUE(copy.keep_local_sst_files);
+  ASSERT_EQ(copy.local_sst_file_mode, LocalSstFileMode::kEagerMirror);
+  ASSERT_TRUE(copy.get_keep_local_sst_files());  // backwards compat
   ASSERT_TRUE(copy.keep_local_log_files);
   ASSERT_TRUE(copy.create_bucket_if_missing);
   ASSERT_TRUE(copy.validate_filesize);
@@ -80,6 +82,66 @@ TEST(CloudFileSystemTest, ConfigureOptions) {
   ASSERT_TRUE(copy.run_purger);
   ASSERT_EQ(copy.constant_sst_file_size_in_sst_file_manager, 200);
   ASSERT_EQ(copy.purger_periodicity_millis, 201);
+}
+
+TEST(CloudFileSystemTest, ConfigureAllSstModes) {
+  ConfigOptions config_options;
+  CloudFileSystemOptions copts, copy;
+  std::string str;
+
+  // Test all four modes round-trip through serialize/configure
+  LocalSstFileMode modes[] = {
+      LocalSstFileMode::kRemotePrimary,
+      LocalSstFileMode::kEagerMirror,
+      LocalSstFileMode::kCacheOnDemand,
+      LocalSstFileMode::kTrickleSync,
+  };
+  for (auto mode : modes) {
+    copts.local_sst_file_mode = mode;
+    ASSERT_OK(copts.Serialize(config_options, &str));
+    ASSERT_OK(copy.Configure(config_options, str));
+    ASSERT_EQ(copy.local_sst_file_mode, mode);
+  }
+}
+
+TEST(CloudFileSystemTest, LegacyBooleanAlias) {
+  ConfigOptions config_options;
+  config_options.invoke_prepare_options = false;
+
+  // "keep_local_sst_files=true" should map to kEagerMirror
+  std::unique_ptr<CloudFileSystem> cfs;
+  ASSERT_OK(CloudFileSystemEnv::CreateFromString(
+      config_options, "keep_local_sst_files=true", &cfs));
+  auto copts = cfs->GetOptions<CloudFileSystemOptions>();
+  ASSERT_EQ(copts->local_sst_file_mode, LocalSstFileMode::kEagerMirror);
+
+  // "keep_local_sst_files=false" should map to kRemotePrimary
+  ASSERT_OK(CloudFileSystemEnv::CreateFromString(
+      config_options, "keep_local_sst_files=false", &cfs));
+  copts = cfs->GetOptions<CloudFileSystemOptions>();
+  ASSERT_EQ(copts->local_sst_file_mode, LocalSstFileMode::kRemotePrimary);
+}
+
+TEST(CloudFileSystemTest, HelperFunctions) {
+  // kRemotePrimary: no local files
+  ASSERT_FALSE(KeepsLocalSstFiles(LocalSstFileMode::kRemotePrimary));
+  ASSERT_FALSE(SupportsMmapReads(LocalSstFileMode::kRemotePrimary));
+  ASSERT_FALSE(DownloadsAllOnOpen(LocalSstFileMode::kRemotePrimary));
+
+  // kEagerMirror: all local, mmap OK, downloads on open
+  ASSERT_TRUE(KeepsLocalSstFiles(LocalSstFileMode::kEagerMirror));
+  ASSERT_TRUE(SupportsMmapReads(LocalSstFileMode::kEagerMirror));
+  ASSERT_TRUE(DownloadsAllOnOpen(LocalSstFileMode::kEagerMirror));
+
+  // kCacheOnDemand: keeps local, no mmap, no bulk download
+  ASSERT_TRUE(KeepsLocalSstFiles(LocalSstFileMode::kCacheOnDemand));
+  ASSERT_FALSE(SupportsMmapReads(LocalSstFileMode::kCacheOnDemand));
+  ASSERT_FALSE(DownloadsAllOnOpen(LocalSstFileMode::kCacheOnDemand));
+
+  // kTrickleSync: keeps local, no mmap, no bulk download
+  ASSERT_TRUE(KeepsLocalSstFiles(LocalSstFileMode::kTrickleSync));
+  ASSERT_FALSE(SupportsMmapReads(LocalSstFileMode::kTrickleSync));
+  ASSERT_FALSE(DownloadsAllOnOpen(LocalSstFileMode::kTrickleSync));
 }
 
 TEST(CloudFileSystemTest, ConfigureBucketOptions) {
@@ -111,12 +173,12 @@ TEST(CloudFileSystemTest, ConfigureEnv) {
   ConfigOptions config_options;
   config_options.invoke_prepare_options = false;
   ASSERT_OK(CloudFileSystemEnv::CreateFromString(
-      config_options, "keep_local_sst_files=true", &cfs));
+      config_options, "local_sst_file_mode=kCacheOnDemand", &cfs));
   ASSERT_NE(cfs, nullptr);
   ASSERT_STREQ(cfs->Name(), "cloud");
   auto copts = cfs->GetOptions<CloudFileSystemOptions>();
   ASSERT_NE(copts, nullptr);
-  ASSERT_TRUE(copts->keep_local_sst_files);
+  ASSERT_EQ(copts->local_sst_file_mode, LocalSstFileMode::kCacheOnDemand);
 }
 
 TEST(CloudFileSystemTest, TestInitialize) {
@@ -163,14 +225,14 @@ TEST(CloudFileSystemTest, ConfigureAwsEnv) {
 
   ConfigOptions config_options;
   Status s = CloudFileSystemEnv::CreateFromString(
-      config_options, "id=aws; keep_local_sst_files=true", &cfs);
+      config_options, "id=aws; local_sst_file_mode=kEagerMirror", &cfs);
 #ifdef USE_AWS
   ASSERT_OK(s);
   ASSERT_NE(cfs, nullptr);
   ASSERT_STREQ(cfs->Name(), "aws");
   auto copts = cfs->GetOptions<CloudFileSystemOptions>();
   ASSERT_NE(copts, nullptr);
-  ASSERT_TRUE(copts->keep_local_sst_files);
+  ASSERT_EQ(copts->local_sst_file_mode, LocalSstFileMode::kEagerMirror);
   ASSERT_NE(cfs->GetStorageProvider(), nullptr);
   ASSERT_STREQ(cfs->GetStorageProvider()->Name(),
                CloudStorageProviderImpl::kS3());

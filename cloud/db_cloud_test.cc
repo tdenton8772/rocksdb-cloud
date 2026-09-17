@@ -251,7 +251,7 @@ class CloudTest : public testing::Test {
     copt.dest_bucket.SetObjectPath(dest_object_path);
     if (!copt.dest_bucket.IsValid() &&
         force_keep_local_on_invalid_dest_bucket) {
-      copt.keep_local_sst_files = true;
+      copt.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
     }
     // Create new AWS env
     Status st = CloudFileSystemEnv::NewAwsFileSystem(
@@ -902,7 +902,7 @@ TEST_F(CloudTest, DbidRegistry) {
 }
 
 TEST_F(CloudTest, KeepLocalFiles) {
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   for (int iter = 0; iter < 4; ++iter) {
     cloud_fs_options_.use_direct_io_for_cloud_download =
         iter == 0 || iter == 1;
@@ -947,7 +947,7 @@ TEST_F(CloudTest, CopyToFromS3) {
   // iter 1 -- using transfer manager
   for (int iter = 0; iter < 2; ++iter) {
     // Create aws env
-    cloud_fs_options_.keep_local_sst_files = true;
+    cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
     cloud_fs_options_.use_aws_transfer_manager = iter == 1;
     CreateCloudEnv();
     auto* cimpl = GetCloudFileSystemImpl();
@@ -993,7 +993,7 @@ TEST_F(CloudTest, DelayFileDeletion) {
   std::string fname = dbname_ + "/000010.sst";
 
   // Create aws env
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   cloud_fs_options_.cloud_file_deletion_delay = std::chrono::seconds(2);
   CreateCloudEnv();
   auto* cimpl = GetCloudFileSystemImpl();
@@ -1239,7 +1239,7 @@ TEST_F(CloudTest, DISABLED_KeepLocalLogKinesis) {
 TEST_F(CloudTest, TwoDBsOneBucket) {
   auto firstDB = dbname_;
   auto secondDB = dbname_ + "-1";
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   std::string value;
 
   cloud_fs_options_.resync_on_open = true;
@@ -1441,7 +1441,7 @@ TEST_F(CloudTest, MigrateFromPureRocksDB) {
   // TODO(dhruba) Figure out how to make this work without skipping dbid
   // verification
   cloud_fs_options_.skip_dbid_verification = true;
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   cloud_fs_options_.validate_filesize = false;
   OpenDB();
   for (int i = 5; i < 10; ++i) {
@@ -1463,7 +1463,7 @@ TEST_F(CloudTest, MigrateFromPureRocksDB) {
 // This is useful for tests.
 TEST_F(CloudTest, NoDestOrSrc) {
   DestroyDir(dbname_);
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   cloud_fs_options_.src_bucket.SetBucketName("");
   cloud_fs_options_.src_bucket.SetObjectPath("");
   cloud_fs_options_.dest_bucket.SetBucketName("");
@@ -1506,7 +1506,7 @@ TEST_F(CloudTest, PreloadCloudManifest) {
 // back to any cloud bucket. Once cloned, all updates are local.
 //
 TEST_F(CloudTest, Ephemeral) {
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   options_.level0_file_num_compaction_trigger = 100;  // never compact
 
   // Create a primary DB with two files
@@ -1603,7 +1603,7 @@ TEST_F(CloudTest, Ephemeral) {
 // one of the MANIFEST. In this case, we want to verify that ephemeral clone is
 // able to reinitialize instead of crash looping.
 TEST_F(CloudTest, EphemeralOnCorruptedDB) {
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   cloud_fs_options_.resync_on_open = true;
   options_.level0_file_num_compaction_trigger = 100;  // never compact
 
@@ -1659,7 +1659,7 @@ TEST_F(CloudTest, EphemeralOnCorruptedDB) {
 // data to be resynced with the master db.
 //
 TEST_F(CloudTest, EphemeralResync) {
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   cloud_fs_options_.resync_on_open = true;
   options_.level0_file_num_compaction_trigger = 100;  // never compact
 
@@ -1754,7 +1754,7 @@ TEST_F(CloudTest, EphemeralResync) {
 }
 
 TEST_F(CloudTest, CheckpointToCloud) {
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   options_.level0_file_num_compaction_trigger = 100;  // never compact
 
   // Pre-create the bucket.
@@ -1868,7 +1868,7 @@ TEST_F(CloudTest, PersistentCache) {
 // This test create 2 DBs that shares a block cache. Ensure that reads from one
 // DB do not get the values from the other DB.
 TEST_F(CloudTest, SharedBlockCache) {
-  cloud_fs_options_.keep_local_sst_files = false;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kRemotePrimary;
 
   // Share the block cache.
   BlockBasedTableOptions bbto;
@@ -2324,7 +2324,7 @@ TEST_F(CloudTest, NewCookieOnOpenTest) {
 // Test invisible file deletion when db is opened.
 TEST_F(CloudTest, InvisibleFileDeletionOnDBOpenTest) {
   std::string cookie1 = "", cookie2 = "-1-1";
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
 
   // opening with cookie1
   OpenDB();
@@ -2428,7 +2428,7 @@ TEST_F(CloudTest, InvisibleFileDeletionOnDBOpenTest) {
 // files will be deleted while cloud files will be kept
 TEST_F(CloudTest, DisableInvisibleFileDeletionOnOpenTest) {
   std::string cookie1 = "", cookie2 = "1";
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   cloud_fs_options_.cookie_on_open = cookie1;
   cloud_fs_options_.new_cookie_on_open = cookie1;
 
@@ -2511,7 +2511,7 @@ TEST_F(CloudTest, DisableObsoleteFileDeletionOnOpenTest) {
   // put wal files into one directory so that we don't need to count number of local
   // wal files
   options_.wal_dir = dbname_ + "/wal";
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   // disable cm roll so that no new manifest files generated
   cloud_fs_options_.roll_cloud_manifest_on_open = false;
 
@@ -2835,7 +2835,7 @@ TEST_F(CloudTest, OpenWithManifestMissing) {
 // - reopen ephemeral (epoch = 1)
 TEST_F(CloudTest, ReopenEphemeralAfterFileDeletion) {
   cloud_fs_options_.resync_on_open = true;
-  cloud_fs_options_.keep_local_sst_files = false;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kRemotePrimary;
 
   auto durableDBName = dbname_;
 
@@ -2913,7 +2913,7 @@ TEST_F(CloudTest, ReopenEphemeralAfterFileDeletion) {
 }
 
 TEST_F(CloudTest, SanitizeDirectoryTest) {
-  cloud_fs_options_.keep_local_sst_files = true;
+  cloud_fs_options_.local_sst_file_mode = LocalSstFileMode::kEagerMirror;
   OpenDB();
   ASSERT_OK(db_->Put({}, "k1", "v1"));
   ASSERT_OK(db_->Flush({}));

@@ -52,6 +52,49 @@ enum LogType : unsigned char {
 };
 
 // Type of AWS access credentials
+// Controls how SST files are managed between local storage and cloud (S3).
+//
+// kRemotePrimary:   Local SSTs are deleted after upload to cloud. Reads go
+//                   directly to cloud storage. Minimal local disk usage.
+//                   (Legacy behavior when keep_local_sst_files=false)
+//
+// kEagerMirror:     All cloud SSTs are downloaded to local on DB::Open.
+//                   Reads always served from local. Slow startup with large
+//                   datasets. (Legacy behavior when keep_local_sst_files=true)
+//
+// kCacheOnDemand:   Local SSTs are kept after write. On read miss, SST is
+//                   fetched from cloud and cached locally. No bulk download
+//                   on open -- fast startup regardless of dataset size.
+//
+// kTrickleSync:     Like kCacheOnDemand, plus a background thread that slowly
+//                   downloads all cloud SSTs to local storage over time.
+//                   Combines fast startup with eventual full local caching.
+enum class LocalSstFileMode : uint8_t {
+  kRemotePrimary = 0,
+  kEagerMirror = 1,
+  kCacheOnDemand = 2,
+  kTrickleSync = 3,
+};
+
+// Returns true if local SST files are retained (not deleted after upload).
+// True for all modes except kRemotePrimary.
+inline bool KeepsLocalSstFiles(LocalSstFileMode m) {
+  return m != LocalSstFileMode::kRemotePrimary;
+}
+
+// Returns true if mmap reads are safe (all SSTs guaranteed local).
+// Only true for kEagerMirror which downloads everything on open.
+inline bool SupportsMmapReads(LocalSstFileMode m) {
+  return m == LocalSstFileMode::kEagerMirror;
+}
+
+// Returns true if all SSTs should be downloaded from cloud during open.
+// Only true for kEagerMirror.
+inline bool DownloadsAllOnOpen(LocalSstFileMode m) {
+  return m == LocalSstFileMode::kEagerMirror;
+}
+
+// Type of AWS access credentials
 enum class AwsAccessType {
   kUndefined,  // Use AWS SDK's default credential chain
   kSimple,
@@ -219,14 +262,20 @@ class CloudFileSystemOptions {
   // Only used if keep_local_log_files is true and log_type is kKafka.
   KafkaLogOptions kafka_log_options;
 
-  // If true,  then sst files are stored locally and uploaded to the cloud in
-  // the background. On restart, all files from the cloud that are not present
-  // locally are downloaded.
-  // If false, then local sst files are created, uploaded to cloud immediately,
-  //           and local file is deleted. All reads are satisfied by fetching
-  //           data from the cloud.
-  // Default:  false
-  bool keep_local_sst_files;
+  // Controls how SST files are managed between local storage and cloud.
+  // See LocalSstFileMode enum for detailed documentation of each mode.
+  // Default: kRemotePrimary (equivalent to legacy keep_local_sst_files=false)
+  LocalSstFileMode local_sst_file_mode;
+
+  // DEPRECATED: Use local_sst_file_mode directly.
+  // Provided for backwards compatibility with existing code.
+  void set_keep_local_sst_files(bool v) {
+    local_sst_file_mode = v ? LocalSstFileMode::kEagerMirror
+                            : LocalSstFileMode::kRemotePrimary;
+  }
+  bool get_keep_local_sst_files() const {
+    return KeepsLocalSstFiles(local_sst_file_mode);
+  }
 
   // If true,  then .log and MANIFEST files are stored in a local file system.
   //           they are not uploaded to any cloud logging system.
@@ -395,7 +444,8 @@ class CloudFileSystemOptions {
   CloudFileSystemOptions(
       CloudType _cloud_type = CloudType::kCloudAws,
       LogType _log_type = LogType::kLogKafka,
-      bool _keep_local_sst_files = false, bool _keep_local_log_files = true,
+      bool _keep_local_sst_files = false,
+      bool _keep_local_log_files = true,
       uint64_t _purger_periodicity_millis = 10 * 60 * 1000,
       bool _validate_filesize = true,
       std::shared_ptr<CloudRequestCallback> _cloud_request_callback = nullptr,
@@ -413,7 +463,9 @@ class CloudFileSystemOptions {
       bool _delete_cloud_invisible_files_on_open = true,
       std::chrono::seconds _cloud_file_deletion_delay = std::chrono::hours(1))
       : log_type(_log_type),
-        keep_local_sst_files(_keep_local_sst_files),
+        local_sst_file_mode(_keep_local_sst_files
+            ? LocalSstFileMode::kEagerMirror
+            : LocalSstFileMode::kRemotePrimary),
         keep_local_log_files(_keep_local_log_files),
         purger_periodicity_millis(_purger_periodicity_millis),
         validate_filesize(_validate_filesize),
