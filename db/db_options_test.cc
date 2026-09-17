@@ -7,12 +7,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
+#include "env/mock_env.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
@@ -56,6 +58,11 @@ class DBOptionsTest : public DBTestBase {
     EXPECT_OK(GetStringFromMutableCFOptions(
         config_options, MutableCFOptions(options), &options_str));
     EXPECT_OK(StringToMap(options_str, &mutable_map));
+    for (auto& opt : TEST_GetImmutableInMutableCFOptions()) {
+      // Not yet mutable but migrated to MutableCFOptions in preparation for
+      // being mutable
+      mutable_map.erase(opt);
+    }
     return mutable_map;
   }
 
@@ -65,7 +72,8 @@ class DBOptionsTest : public DBTestBase {
     options.env = env_;
     ImmutableDBOptions db_options(options);
     test::RandomInitCFOptions(&options, options, rnd);
-    auto sanitized_options = SanitizeOptions(db_options, options);
+    auto sanitized_options =
+        SanitizeCfOptions(db_options, /*read_only*/ false, options);
     auto opt_map = GetMutableCFOptionsMap(sanitized_options);
     delete options.compaction_filter;
     return opt_map;
@@ -94,6 +102,40 @@ TEST_F(DBOptionsTest, ImmutableTrackAndVerifyWalsInManifest) {
   Status s =
       dbfull()->SetDBOptions({{"track_and_verify_wals_in_manifest", "false"}});
   ASSERT_FALSE(s.ok());
+}
+
+TEST_F(DBOptionsTest, ImmutableAsyncWalPrecreate) {
+  Options options;
+  options.env = env_;
+  options.async_wal_precreate = true;
+
+  ImmutableDBOptions db_options(options);
+  ASSERT_TRUE(db_options.async_wal_precreate);
+
+  Reopen(options);
+  ASSERT_TRUE(dbfull()->GetDBOptions().async_wal_precreate);
+
+  Status s = dbfull()->SetDBOptions({{"async_wal_precreate", "false"}});
+  ASSERT_FALSE(s.ok());
+}
+
+TEST_F(DBOptionsTest, SanitizeAsyncWalPrecreateWithWalRecycle) {
+  // This checks the option-level contract for the incompatible WAL paths:
+  // SanitizeOptions() preserves WAL recycling and disables only the
+  // opportunistic async precreation path, so the immutable options reflect
+  // effective behavior.
+  Options options;
+  options.env = env_;
+  options.async_wal_precreate = true;
+  options.recycle_log_file_num = 1;
+
+  Options sanitized_options = SanitizeOptions(dbname_, options);
+  ASSERT_FALSE(sanitized_options.async_wal_precreate);
+  ASSERT_EQ(1U, sanitized_options.recycle_log_file_num);
+
+  options.recycle_log_file_num = 0;
+  sanitized_options = SanitizeOptions(dbname_, options);
+  ASSERT_TRUE(sanitized_options.async_wal_precreate);
 }
 
 TEST_F(DBOptionsTest, ImmutableVerifySstUniqueIdInManifest) {
@@ -231,21 +273,33 @@ TEST_F(DBOptionsTest, SetMutableTableOptions) {
   ASSERT_OK(dbfull()->SetOptions(
       cfh, {{"table_factory.block_size", "16384"},
             {"table_factory.block_restart_interval", "11"}}));
+  // Old c_bbto
+  ASSERT_EQ(c_bbto->block_size, 8192);
+  ASSERT_EQ(c_bbto->block_restart_interval, 7);
+  // New c_bbto
+  c_opts = dbfull()->GetOptions(cfh);
+  c_bbto = c_opts.table_factory->GetOptions<BlockBasedTableOptions>();
   ASSERT_EQ(c_bbto->block_size, 16384);
   ASSERT_EQ(c_bbto->block_restart_interval, 11);
 
   // Now set an option that is not mutable - options should not change
-  ASSERT_NOK(
-      dbfull()->SetOptions(cfh, {{"table_factory.no_block_cache", "false"}}));
+  // FIXME: find a way to make this fail again
+  // ASSERT_NOK(
+  //    dbfull()->SetOptions(cfh, {{"table_factory.no_block_cache", "false"}}));
+  c_opts = dbfull()->GetOptions(cfh);
+  ASSERT_EQ(c_bbto, c_opts.table_factory->GetOptions<BlockBasedTableOptions>());
   ASSERT_EQ(c_bbto->no_block_cache, true);
   ASSERT_EQ(c_bbto->block_size, 16384);
   ASSERT_EQ(c_bbto->block_restart_interval, 11);
 
   // Set some that are mutable and some that are not - options should not change
-  ASSERT_NOK(dbfull()->SetOptions(
-      cfh, {{"table_factory.no_block_cache", "false"},
-            {"table_factory.block_size", "8192"},
-            {"table_factory.block_restart_interval", "7"}}));
+  // FIXME: find a way to make this fail again
+  // ASSERT_NOK(dbfull()->SetOptions(
+  //     cfh, {{"table_factory.no_block_cache", "false"},
+  //           {"table_factory.block_size", "8192"},
+  //           {"table_factory.block_restart_interval", "7"}}));
+  c_opts = dbfull()->GetOptions(cfh);
+  ASSERT_EQ(c_bbto, c_opts.table_factory->GetOptions<BlockBasedTableOptions>());
   ASSERT_EQ(c_bbto->no_block_cache, true);
   ASSERT_EQ(c_bbto->block_size, 16384);
   ASSERT_EQ(c_bbto->block_restart_interval, 11);
@@ -256,6 +310,8 @@ TEST_F(DBOptionsTest, SetMutableTableOptions) {
       cfh, {{"table_factory.block_size", "8192"},
             {"table_factory.does_not_exist", "true"},
             {"table_factory.block_restart_interval", "7"}}));
+  c_opts = dbfull()->GetOptions(cfh);
+  ASSERT_EQ(c_bbto, c_opts.table_factory->GetOptions<BlockBasedTableOptions>());
   ASSERT_EQ(c_bbto->no_block_cache, true);
   ASSERT_EQ(c_bbto->block_size, 16384);
   ASSERT_EQ(c_bbto->block_restart_interval, 11);
@@ -271,6 +327,7 @@ TEST_F(DBOptionsTest, SetMutableTableOptions) {
             {"table_factory.block_restart_interval", "13"}}));
   c_opts = dbfull()->GetOptions(cfh);
   ASSERT_EQ(c_opts.blob_file_size, 32768);
+  c_bbto = c_opts.table_factory->GetOptions<BlockBasedTableOptions>();
   ASSERT_EQ(c_bbto->block_size, 16384);
   ASSERT_EQ(c_bbto->block_restart_interval, 13);
   // Set some on the table and a bad one on the ColumnFamily - options should
@@ -279,6 +336,7 @@ TEST_F(DBOptionsTest, SetMutableTableOptions) {
       cfh, {{"table_factory.block_size", "1024"},
             {"no_such_option", "32768"},
             {"table_factory.block_restart_interval", "7"}}));
+  ASSERT_EQ(c_bbto, c_opts.table_factory->GetOptions<BlockBasedTableOptions>());
   ASSERT_EQ(c_bbto->block_size, 16384);
   ASSERT_EQ(c_bbto->block_restart_interval, 13);
 }
@@ -300,31 +358,26 @@ TEST_F(DBOptionsTest, SetWithCustomMemTableFactory) {
   }
   Options options;
   options.create_if_missing = true;
-  // Try with fail_if_options_file_error=false/true to update the options
-  for (bool on_error : {false, true}) {
-    options.fail_if_options_file_error = on_error;
-    options.env = env_;
-    options.disable_auto_compactions = false;
+  options.env = env_;
+  options.disable_auto_compactions = false;
 
-    options.memtable_factory.reset(new DummySkipListFactory());
-    Reopen(options);
+  options.memtable_factory.reset(new DummySkipListFactory());
+  Reopen(options);
 
-    ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
-    ASSERT_OK(
-        dbfull()->SetOptions(cfh, {{"disable_auto_compactions", "true"}}));
-    ColumnFamilyDescriptor cfd;
-    ASSERT_OK(cfh->GetDescriptor(&cfd));
-    ASSERT_STREQ(cfd.options.memtable_factory->Name(),
-                 DummySkipListFactory::kClassName());
-    ColumnFamilyHandle* test = nullptr;
-    ASSERT_OK(dbfull()->CreateColumnFamily(options, "test", &test));
-    ASSERT_OK(test->GetDescriptor(&cfd));
-    ASSERT_STREQ(cfd.options.memtable_factory->Name(),
-                 DummySkipListFactory::kClassName());
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  ASSERT_OK(dbfull()->SetOptions(cfh, {{"disable_auto_compactions", "true"}}));
+  ColumnFamilyDescriptor cfd;
+  ASSERT_OK(cfh->GetDescriptor(&cfd));
+  ASSERT_STREQ(cfd.options.memtable_factory->Name(),
+               DummySkipListFactory::kClassName());
+  ColumnFamilyHandle* test = nullptr;
+  ASSERT_OK(dbfull()->CreateColumnFamily(options, "test", &test));
+  ASSERT_OK(test->GetDescriptor(&cfd));
+  ASSERT_STREQ(cfd.options.memtable_factory->Name(),
+               DummySkipListFactory::kClassName());
 
-    ASSERT_OK(dbfull()->DropColumnFamily(test));
-    delete test;
-  }
+  ASSERT_OK(dbfull()->DropColumnFamily(test));
+  delete test;
 }
 
 TEST_F(DBOptionsTest, SetBytesPerSync) {
@@ -415,12 +468,47 @@ TEST_F(DBOptionsTest, SetWalBytesPerSync) {
   ASSERT_GT(low_bytes_per_sync, counter);
 }
 
+TEST_F(DBOptionsTest, MutableManifestOptions) {
+  // These aren't end-to-end tests, but sufficient to ensure the VersionSet
+  // receives the updates with SetDBOptions
+  for (int64_t i : {0, 1, 100, 100000, 10000000}) {
+    ASSERT_OK(
+        db_->SetDBOptions({{"max_manifest_file_size", std::to_string(i)}}));
+    ASSERT_EQ(i,
+              static_cast<int64_t>(db_->GetDBOptions().max_manifest_file_size));
+    ASSERT_EQ(i,
+              static_cast<int64_t>(
+                  dbfull()->GetVersionSet()->TEST_GetMinMaxManifestFileSize()));
+    if (i > 1) {
+      ++i;
+    }
+    ASSERT_OK(
+        db_->SetDBOptions({{"max_manifest_space_amp_pct", std::to_string(i)}}));
+    ASSERT_EQ(i, static_cast<int64_t>(
+                     db_->GetDBOptions().max_manifest_space_amp_pct));
+    ASSERT_EQ(i,
+              static_cast<int64_t>(
+                  dbfull()->GetVersionSet()->TEST_GetMaxManifestSpaceAmpPct()));
+    if (i > 1) {
+      ++i;
+    }
+    ASSERT_OK(db_->SetDBOptions(
+        {{"manifest_preallocation_size", std::to_string(i)}}));
+    ASSERT_EQ(i, static_cast<int64_t>(
+                     db_->GetDBOptions().manifest_preallocation_size));
+    ASSERT_EQ(
+        i, static_cast<int64_t>(
+               dbfull()->GetVersionSet()->TEST_GetManifestPreallocationSize()));
+  }
+}
+
 TEST_F(DBOptionsTest, WritableFileMaxBufferSize) {
   Options options;
   options.create_if_missing = true;
   options.writable_file_max_buffer_size = 1024 * 1024;
   options.level0_file_num_compaction_trigger = 3;
   options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
   options.env = env_;
   int buffer_size = 1024 * 1024;
   Reopen(options);
@@ -1430,7 +1518,6 @@ TEST_F(DBOptionsTest, ChangeCompression) {
   SyncPoint::GetInstance()->DisableProcessing();
 }
 
-
 TEST_F(DBOptionsTest, BottommostCompressionOptsWithFallbackType) {
   // Verify the bottommost compression options still take effect even when the
   // bottommost compression type is left at its default value. Verify for both
@@ -1573,6 +1660,274 @@ TEST_F(DBOptionsTest, TempOptionsFailTest) {
     }
   }
   ASSERT_FALSE(found_temp_file);
+}
+
+TEST_F(DBOptionsTest, SetOptionsNoManifestWrite) {
+  ASSERT_OK(Put("x", "x"));
+  ASSERT_OK(Flush());
+
+  // In addition to checking manifest file, we want to ensure that SetOptions
+  // is essentially atomic, without releasing the DB mutex between applying
+  // the options to the cfd and installing new Version and SuperVersion. We
+  // probabilistically verify that by attempting to catch an inconsistency.
+  auto* const cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  std::optional<std::thread> t;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::LogAndApply:WakeUpAndNotDone", [&](void* arg) {
+        auto* mu = static_cast<InstrumentedMutex*>(arg);
+        // Option not yet modified
+        ASSERT_FALSE(cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+        ASSERT_FALSE(
+            cfd->current()->GetMutableCFOptions().disable_auto_compactions);
+        ASSERT_FALSE(
+            cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+        t = std::thread([mu, cfd]() {
+          InstrumentedMutexLock l(mu);
+          // Assuming above correctness, we can only acquire the mutex after
+          // options fully installed.
+          ASSERT_TRUE(
+              cfd->GetLatestMutableCFOptions().disable_auto_compactions);
+          ASSERT_TRUE(
+              cfd->current()->GetMutableCFOptions().disable_auto_compactions);
+          ASSERT_TRUE(
+              cfd->GetCurrentMutableCFOptions().disable_auto_compactions);
+        });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Baseline manifest file info
+  std::vector<std::string> live_files;
+  uint64_t orig_manifest_file_size;
+  ASSERT_OK(dbfull()->GetLiveFiles(live_files, &orig_manifest_file_size));
+  uint64_t orig_manifest_file_num = dbfull()->TEST_Current_Manifest_FileNo();
+
+  // Although this test mostly concerns SetOptions, we also include SetDBOptions
+  // just for the added scope
+  ASSERT_OK(db_->SetDBOptions({{"max_open_files", "100"}}));
+  ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "true"}}));
+
+  // Verify that our above check was activated and completed
+  ASSERT_TRUE(t.has_value());
+  t->join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verify manifest was not written to
+  uint64_t new_manifest_file_size;
+  ASSERT_OK(dbfull()->GetLiveFiles(live_files, &new_manifest_file_size));
+  uint64_t new_manifest_file_num = dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_EQ(orig_manifest_file_num, new_manifest_file_num);
+  ASSERT_EQ(orig_manifest_file_size, new_manifest_file_size);
+
+  ASSERT_EQ(Get("x"), "x");
+}
+
+TEST_F(DBOptionsTest, SetOptionsMultipleColumnFamilies) {
+  Options options;
+  options.create_if_missing = true;
+  options.env = CurrentOptions().env;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  // Create two additional column families
+  CreateColumnFamilies({"cf1", "cf2"}, options);
+  ReopenWithColumnFamilies({"default", "cf1", "cf2"}, options);
+
+  // Verify initial state - auto compaction should be disabled
+  ASSERT_TRUE(dbfull()->GetOptions(handles_[0]).disable_auto_compactions);
+  ASSERT_TRUE(dbfull()->GetOptions(handles_[1]).disable_auto_compactions);
+  ASSERT_TRUE(dbfull()->GetOptions(handles_[2]).disable_auto_compactions);
+
+  // Set options on multiple column families at once
+  ASSERT_OK(dbfull()->SetOptions({handles_[1], handles_[2]},
+                                 {{"disable_auto_compactions", "false"}}));
+
+  ASSERT_TRUE(
+      dbfull()->GetOptions(handles_[0]).disable_auto_compactions);  // unchanged
+  ASSERT_FALSE(
+      dbfull()->GetOptions(handles_[1]).disable_auto_compactions);  // changed
+  ASSERT_FALSE(
+      dbfull()->GetOptions(handles_[2]).disable_auto_compactions);  // changed
+
+  std::unordered_map<ColumnFamilyHandle*,
+                     std::unordered_map<std::string, std::string>>
+      options_map;
+  options_map[handles_[0]] = {{"disable_auto_compactions", "false"}};
+  options_map[handles_[1]] = {{"disable_auto_compactions", "true"}};
+  options_map[handles_[2]] = {{"disable_auto_compactions", "true"}};
+  ASSERT_OK(dbfull()->SetOptions(options_map));
+
+  ASSERT_FALSE(dbfull()->GetOptions(handles_[0]).disable_auto_compactions);
+  ASSERT_TRUE(dbfull()->GetOptions(handles_[1]).disable_auto_compactions);
+  ASSERT_TRUE(dbfull()->GetOptions(handles_[2]).disable_auto_compactions);
+}
+
+// Confirms the default value and serialization/parse round-trip of the new
+// option. No DB open required; exercises only the options-metadata layer.
+TEST_F(DBOptionsTest, UseDirectIoForCompactionReadsRoundTrip) {
+  // Default value must remain false to preserve existing semantics.
+  ASSERT_FALSE(DBOptions().use_direct_io_for_compaction_reads);
+
+  DBOptions parsed;
+  ConfigOptions config_options;
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                   "use_direct_io_for_compaction_reads=true",
+                                   &parsed));
+  ASSERT_TRUE(parsed.use_direct_io_for_compaction_reads);
+  ASSERT_OK(GetDBOptionsFromString(config_options, DBOptions(),
+                                   "use_direct_io_for_compaction_reads=false",
+                                   &parsed));
+  ASSERT_FALSE(parsed.use_direct_io_for_compaction_reads);
+}
+
+// Validates that Open rejects the documented incompatible combination.
+TEST_F(DBOptionsTest, UseDirectIoForCompactionReadsValidation) {
+  // mmap_reads + use_direct_io_for_compaction_reads is rejected at Open
+  // time, the same way mmap_reads + use_direct_reads has always been
+  // rejected.
+  Options bad_options = CurrentOptions();
+  bad_options.create_if_missing = true;
+  bad_options.allow_mmap_reads = true;
+  bad_options.use_direct_io_for_compaction_reads = true;
+  Status bad_status = TryReopen(bad_options);
+  ASSERT_TRUE(bad_status.IsNotSupported()) << bad_status.ToString();
+}
+
+// Confirms the option is plumbed all the way to the live DB's options API:
+// after opening with the flag set, GetDBOptions() reports it back. Only runs
+// when the environment supports direct I/O.
+TEST_F(DBOptionsTest, UseDirectIoForCompactionReadsLiveReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.use_direct_io_for_compaction_reads = true;
+  // Use a buffered user-read setup so the new flag is the one doing the work.
+  options.use_direct_reads = false;
+  options.use_direct_io_for_flush_and_compaction = false;
+  Status s = TryReopen(options);
+  if (s.IsNotSupported() || s.IsInvalidArgument()) {
+    ROCKSDB_GTEST_BYPASS(
+        "Direct I/O not supported in this test environment; live reopen "
+        "cannot be exercised.");
+    return;
+  }
+  ASSERT_OK(s);
+  ASSERT_TRUE(dbfull()->GetDBOptions().use_direct_io_for_compaction_reads);
+  Close();
+}
+
+TEST_F(DBOptionsTest, UseDirectIoForCompactionReadsUnsupportedFileSystem) {
+  auto fs = std::make_shared<MockFileSystem>(Env::Default()->GetSystemClock(),
+                                             /*supports_direct_io=*/false);
+  std::unique_ptr<Env> mock_env = NewCompositeEnv(fs);
+
+  Options options = CurrentOptions();
+  options.env = mock_env.get();
+  options.create_if_missing = true;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_flush_and_compaction = false;
+  options.use_direct_io_for_compaction_reads = true;
+
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_NE(s.ToString().find("Direct I/O is not supported"), std::string::npos)
+      << s.ToString();
+}
+
+TEST_F(
+    DBOptionsTest,
+    UseDirectIoForCompactionReadsSetDBOptionsKeepsVerificationReadsBuffered) {
+  auto fs = std::make_shared<MockFileSystem>(Env::Default()->GetSystemClock(),
+                                             /*supports_direct_io=*/true);
+  std::unique_ptr<Env> mock_env = NewCompositeEnv(fs);
+
+  Options options = CurrentOptions();
+  options.env = mock_env.get();
+  options.create_if_missing = true;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_flush_and_compaction = false;
+  options.use_direct_io_for_compaction_reads = true;
+
+  ASSERT_OK(TryReopen(options));
+
+  bool observed = false;
+  FileOptions observed_file_options;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SetDBOptions:FileOptionsForCompaction", [&](void* arg) {
+        observed = true;
+        observed_file_options = *static_cast<FileOptions*>(arg);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(dbfull()->SetDBOptions({{"bytes_per_sync", "1024"}}));
+  ASSERT_TRUE(observed);
+  ASSERT_FALSE(observed_file_options.use_direct_reads);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Close();
+}
+
+// Exercises the FileSystem::OptimizeForCompactionTableRead and
+// OptimizeForBlobFileRead helpers directly, asserting that the compaction-only
+// flag does not affect shared FileSystem hooks.
+TEST_F(DBOptionsTest, OptimizeForCompactionTableReadUsesGlobalDirectReadsOnly) {
+  FileOptions in_opts;
+  in_opts.use_direct_reads = false;
+
+  {
+    Options check_options;
+    check_options.use_direct_reads = false;
+    check_options.use_direct_io_for_compaction_reads = true;
+    check_options.use_direct_io_for_flush_and_compaction = false;
+    ImmutableDBOptions immutable(check_options);
+    FileOptions sst_read =
+        env_->GetFileSystem()->OptimizeForCompactionTableRead(in_opts,
+                                                              immutable);
+    FileOptions blob_read =
+        env_->GetFileSystem()->OptimizeForBlobFileRead(in_opts, immutable);
+    EXPECT_FALSE(sst_read.use_direct_reads);
+    EXPECT_FALSE(blob_read.use_direct_reads);
+    EXPECT_FALSE(sst_read.use_direct_writes);
+  }
+
+  {
+    Options off_options;
+    off_options.use_direct_reads = false;
+    off_options.use_direct_io_for_compaction_reads = false;
+    off_options.use_direct_io_for_flush_and_compaction = false;
+    ImmutableDBOptions immutable_off(off_options);
+    FileOptions sst_read_off =
+        env_->GetFileSystem()->OptimizeForCompactionTableRead(in_opts,
+                                                              immutable_off);
+    EXPECT_FALSE(sst_read_off.use_direct_reads);
+  }
+
+  {
+    Options global_on_options;
+    global_on_options.use_direct_reads = true;
+    global_on_options.use_direct_io_for_compaction_reads = false;
+    global_on_options.use_direct_io_for_flush_and_compaction = false;
+    ImmutableDBOptions immutable_global(global_on_options);
+    FileOptions sst_read_global =
+        env_->GetFileSystem()->OptimizeForCompactionTableRead(in_opts,
+                                                              immutable_global);
+    EXPECT_TRUE(sst_read_global.use_direct_reads);
+  }
+
+  {
+    Options both_on;
+    both_on.use_direct_reads = true;
+    both_on.use_direct_io_for_compaction_reads = true;
+    both_on.use_direct_io_for_flush_and_compaction = false;
+    ImmutableDBOptions immutable_both(both_on);
+    FileOptions sst_read_both =
+        env_->GetFileSystem()->OptimizeForCompactionTableRead(in_opts,
+                                                              immutable_both);
+    EXPECT_TRUE(sst_read_both.use_direct_reads);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

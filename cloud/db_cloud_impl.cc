@@ -192,7 +192,9 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
   // uploaded to S3 for every update, so always enable rolling of Manifest file
   options.max_manifest_file_size = DBCloudImpl::max_manifest_file_size;
 
-  DB* db = nullptr;
+  // RocksDB 11.0 removed the raw DB** variants of Open/OpenForReadOnly; the
+  // surviving overloads hand back a std::unique_ptr<DB>.
+  std::unique_ptr<DB> db;
   std::string dbid;
   if (read_only) {
     st = DB::OpenForReadOnly(options, local_dbname, column_families, handles,
@@ -220,9 +222,10 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
   }
 
   if (st.ok()) {
-    DBCloudImpl* cloud = new DBCloudImpl(db, std::move(local_env));
-    *dbptr = cloud;
+    // Read the identity before releasing: StackableDB(DB*) takes ownership.
     db->GetDbIdentity(dbid);
+    DBCloudImpl* cloud = new DBCloudImpl(db.release(), std::move(local_env));
+    *dbptr = cloud;
   }
   Log(InfoLogLevel::INFO_LEVEL, options.info_log,
       "Opened cloud db with local dir %s dbid %s. %s", local_dbname.c_str(),

@@ -18,7 +18,6 @@
 
 #pragma once
 
-
 #include <algorithm>
 #include <iostream>
 #include <vector>
@@ -69,7 +68,7 @@ class EnvMirror : public EnvWrapper {
     assert(as == bs);
     return as;
   }
-#if defined(_MSC_VER)
+#if defined(_MSC_VER)  // ODR-SAFE
 #pragma warning(push)
 // logical operation on address of string constant
 #pragma warning(disable : 4130)
@@ -83,12 +82,12 @@ class EnvMirror : public EnvWrapper {
     std::sort(ar.begin(), ar.end());
     std::sort(br.begin(), br.end());
     if (!as.ok() || ar != br) {
-      assert(0 == "getchildren results don't match");
+      assert(nullptr == "getchildren results don't match");
     }
     *r = ar;
     return as;
   }
-#if defined(_MSC_VER)
+#if defined(_MSC_VER)  // ODR-SAFE
 #pragma warning(pop)
 #endif
   Status DeleteFile(const std::string& f) override {
@@ -176,4 +175,3 @@ class EnvMirror : public EnvWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

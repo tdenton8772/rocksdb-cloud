@@ -10,8 +10,10 @@
 #include "port/port.h"
 #include "rocksdb/env.h"
 #include "rocksdb/unique_id.h"
+#include "rocksdb/utilities/options_type.h"
 #include "table/table_properties_internal.h"
 #include "table/unique_id_impl.h"
+#include "util/compression.h"
 #include "util/random.h"
 #include "util/string_util.h"
 
@@ -36,6 +38,40 @@ void AppendProperty(std::string& props, const std::string& key,
                     const std::string& kv_delim) {
   AppendProperty(props, key, std::to_string(value), prop_delim, kv_delim);
 }
+
+std::shared_ptr<CompressionManager> ResolveCompressionManagerForDisplay(
+    Slice compatibility_name,
+    const std::shared_ptr<CompressionManager>& compression_manager) {
+  std::shared_ptr<CompressionManager> mgr_to_use;
+  if (compression_manager) {
+    mgr_to_use = compression_manager->FindCompatibleCompressionManager(
+        compatibility_name);
+  }
+  if (mgr_to_use == nullptr) {
+    ConfigOptions strict;
+    strict.ignore_unknown_options = false;
+    strict.ignore_unsupported_options = false;
+    Status s = CompressionManager::CreateFromString(
+        strict, compatibility_name.ToString(), &mgr_to_use);
+    if (!s.ok()) {
+      mgr_to_use.reset();
+    }
+  }
+  return mgr_to_use;
+}
+
+std::string CompressionTypeDisplayName(
+    CompressionType compression_type,
+    const std::shared_ptr<CompressionManager>& compression_manager) {
+  if (compression_manager) {
+    std::string name =
+        compression_manager->CompressionTypeToString(compression_type);
+    if (!name.empty()) {
+      return name;
+    }
+  }
+  return CompressionTypeToString(compression_type);
+}
 }  // namespace
 
 std::string TableProperties::ToString(const std::string& prop_delim,
@@ -45,6 +81,12 @@ std::string TableProperties::ToString(const std::string& prop_delim,
 
   // Basic Info
   AppendProperty(result, "# data blocks", num_data_blocks, prop_delim,
+                 kv_delim);
+  AppendProperty(result, "# data blocks compression rejected",
+                 num_data_blocks_compression_rejected, prop_delim, kv_delim);
+  AppendProperty(result, "# data blocks compression bypassed",
+                 num_data_blocks_compression_bypassed, prop_delim, kv_delim);
+  AppendProperty(result, "# uniform blocks", num_uniform_blocks, prop_delim,
                  kv_delim);
   AppendProperty(result, "# entries", num_entries, prop_delim, kv_delim);
   AppendProperty(result, "# deletions", num_deletions, prop_delim, kv_delim);
@@ -64,6 +106,8 @@ std::string TableProperties::ToString(const std::string& prop_delim,
                  prop_delim, kv_delim);
 
   AppendProperty(result, "data block size", data_size, prop_delim, kv_delim);
+  AppendProperty(result, "data uncompressed size", uncompressed_data_size,
+                 prop_delim, kv_delim);
   char index_block_size_str[80];
   snprintf(index_block_size_str, sizeof(index_block_size_str),
            "index block size (user-key? %d, delta-value? %d)",
@@ -113,6 +157,10 @@ std::string TableProperties::ToString(const std::string& prop_delim,
                  user_defined_timestamps_persisted ? std::string("true")
                                                    : std::string("false"),
                  prop_delim, kv_delim);
+  AppendProperty(result, "largest sequence number in file", key_largest_seqno,
+                 prop_delim, kv_delim);
+  AppendProperty(result, "smallest sequence number in file", key_smallest_seqno,
+                 prop_delim, kv_delim);
 
   AppendProperty(
       result, "merge operator name",
@@ -137,6 +185,8 @@ std::string TableProperties::ToString(const std::string& prop_delim,
   AppendProperty(result, "creation time", creation_time, prop_delim, kv_delim);
 
   AppendProperty(result, "time stamp of earliest key", oldest_key_time,
+                 prop_delim, kv_delim);
+  AppendProperty(result, "time stamp of newest key", newest_key_time,
                  prop_delim, kv_delim);
 
   AppendProperty(result, "file creation time", file_creation_time, prop_delim,
@@ -173,6 +223,7 @@ std::string TableProperties::ToString(const std::string& prop_delim,
 
 void TableProperties::Add(const TableProperties& tp) {
   data_size += tp.data_size;
+  uncompressed_data_size += tp.uncompressed_data_size;
   index_size += tp.index_size;
   index_partitions += tp.index_partitions;
   top_level_index_size += tp.top_level_index_size;
@@ -182,6 +233,11 @@ void TableProperties::Add(const TableProperties& tp) {
   raw_key_size += tp.raw_key_size;
   raw_value_size += tp.raw_value_size;
   num_data_blocks += tp.num_data_blocks;
+  num_data_blocks_compression_rejected +=
+      tp.num_data_blocks_compression_rejected;
+  num_data_blocks_compression_bypassed +=
+      tp.num_data_blocks_compression_bypassed;
+  num_uniform_blocks += tp.num_uniform_blocks;
   num_entries += tp.num_entries;
   num_filter_entries += tp.num_filter_entries;
   num_deletions += tp.num_deletions;
@@ -197,6 +253,7 @@ std::map<std::string, uint64_t>
 TableProperties::GetAggregatablePropertiesAsMap() const {
   std::map<std::string, uint64_t> rv;
   rv["data_size"] = data_size;
+  rv["uncompressed_data_size"] = uncompressed_data_size;
   rv["index_size"] = index_size;
   rv["index_partitions"] = index_partitions;
   rv["top_level_index_size"] = top_level_index_size;
@@ -204,6 +261,11 @@ TableProperties::GetAggregatablePropertiesAsMap() const {
   rv["raw_key_size"] = raw_key_size;
   rv["raw_value_size"] = raw_value_size;
   rv["num_data_blocks"] = num_data_blocks;
+  rv["num_data_blocks_compression_rejected"] =
+      num_data_blocks_compression_rejected;
+  rv["num_data_blocks_compression_bypassed"] =
+      num_data_blocks_compression_bypassed;
+  rv["num_uniform_blocks"] = num_uniform_blocks;
   rv["num_entries"] = num_entries;
   rv["num_filter_entries"] = num_filter_entries;
   rv["num_deletions"] = num_deletions;
@@ -263,12 +325,20 @@ const std::string TablePropertiesNames::kIndexKeyIsUserKey =
     "rocksdb.index.key.is.user.key";
 const std::string TablePropertiesNames::kIndexValueIsDeltaEncoded =
     "rocksdb.index.value.is.delta.encoded";
+const std::string TablePropertiesNames::kUDIIsPrimaryIndex =
+    "rocksdb.udi.is.primary.index";
 const std::string TablePropertiesNames::kFilterSize = "rocksdb.filter.size";
 const std::string TablePropertiesNames::kRawKeySize = "rocksdb.raw.key.size";
 const std::string TablePropertiesNames::kRawValueSize =
     "rocksdb.raw.value.size";
 const std::string TablePropertiesNames::kNumDataBlocks =
     "rocksdb.num.data.blocks";
+const std::string TablePropertiesNames::kNumDataBlocksCompressionRejected =
+    "rocksdb.num.data.blocks.compression.rejected";
+const std::string TablePropertiesNames::kNumDataBlocksCompressionBypassed =
+    "rocksdb.num.data.blocks.compression.bypassed";
+const std::string TablePropertiesNames::kNumUniformBlocks =
+    "rocksdb.num.uniform.blocks";
 const std::string TablePropertiesNames::kNumEntries = "rocksdb.num.entries";
 const std::string TablePropertiesNames::kNumFilterEntries =
     "rocksdb.num.filter_entries";
@@ -299,6 +369,8 @@ const std::string TablePropertiesNames::kCompressionOptions =
 const std::string TablePropertiesNames::kCreationTime = "rocksdb.creation.time";
 const std::string TablePropertiesNames::kOldestKeyTime =
     "rocksdb.oldest.key.time";
+const std::string TablePropertiesNames::kNewestKeyTime =
+    "rocksdb.newest.key.time";
 const std::string TablePropertiesNames::kFileCreationTime =
     "rocksdb.file.creation.time";
 const std::string TablePropertiesNames::kSlowCompressionEstimatedDataSize =
@@ -311,6 +383,230 @@ const std::string TablePropertiesNames::kTailStartOffset =
     "rocksdb.tail.start.offset";
 const std::string TablePropertiesNames::kUserDefinedTimestampsPersisted =
     "rocksdb.user.defined.timestamps.persisted";
+const std::string TablePropertiesNames::kKeyLargestSeqno =
+    "rocksdb.key.largest.seqno";
+const std::string TablePropertiesNames::kKeySmallestSeqno =
+    "rocksdb.key.smallest.seqno";
+const std::string TablePropertiesNames::kDataBlockRestartInterval =
+    "rocksdb.data.block.restart.interval";
+const std::string TablePropertiesNames::kIndexBlockRestartInterval =
+    "rocksdb.index.block.restart.interval";
+const std::string TablePropertiesNames::kSeparateKeyValueInDataBlock =
+    "rocksdb.separate.key.value.in.data.block";
+
+static std::unordered_map<std::string, OptionTypeInfo>
+    table_properties_type_info = {
+        {"orig_file_number",
+         {offsetof(struct TableProperties, orig_file_number),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"data_size",
+         {offsetof(struct TableProperties, data_size), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"uncompressed_data_size",
+         {offsetof(struct TableProperties, uncompressed_data_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"index_size",
+         {offsetof(struct TableProperties, index_size), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"index_partitions",
+         {offsetof(struct TableProperties, index_partitions),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"top_level_index_size",
+         {offsetof(struct TableProperties, top_level_index_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"index_key_is_user_key",
+         {offsetof(struct TableProperties, index_key_is_user_key),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"index_value_is_delta_encoded",
+         {offsetof(struct TableProperties, index_value_is_delta_encoded),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"udi_is_primary_index",
+         {offsetof(struct TableProperties, udi_is_primary_index),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"filter_size",
+         {offsetof(struct TableProperties, filter_size), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"raw_key_size",
+         {offsetof(struct TableProperties, raw_key_size), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"raw_value_size",
+         {offsetof(struct TableProperties, raw_value_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_data_blocks",
+         {offsetof(struct TableProperties, num_data_blocks),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_data_blocks_compression_rejected",
+         {offsetof(struct TableProperties,
+                   num_data_blocks_compression_rejected),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_data_blocks_compression_bypassed",
+         {offsetof(struct TableProperties,
+                   num_data_blocks_compression_bypassed),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_uniform_blocks",
+         {offsetof(struct TableProperties, num_uniform_blocks),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_entries",
+         {offsetof(struct TableProperties, num_entries), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"num_filter_entries",
+         {offsetof(struct TableProperties, num_filter_entries),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_deletions",
+         {offsetof(struct TableProperties, num_deletions), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"num_merge_operands",
+         {offsetof(struct TableProperties, num_merge_operands),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_range_deletions",
+         {offsetof(struct TableProperties, num_range_deletions),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"format_version",
+         {offsetof(struct TableProperties, format_version),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"fixed_key_len",
+         {offsetof(struct TableProperties, fixed_key_len), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"column_family_id",
+         {offsetof(struct TableProperties, column_family_id),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"creation_time",
+         {offsetof(struct TableProperties, creation_time), OptionType::kUInt64T,
+          OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        {"oldest_key_time",
+         {offsetof(struct TableProperties, oldest_key_time),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"newest_key_time",
+         {offsetof(struct TableProperties, newest_key_time),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"file_creation_time",
+         {offsetof(struct TableProperties, file_creation_time),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"slow_compression_estimated_data_size",
+         {offsetof(struct TableProperties,
+                   slow_compression_estimated_data_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"fast_compression_estimated_data_size",
+         {offsetof(struct TableProperties,
+                   fast_compression_estimated_data_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"external_sst_file_global_seqno_offset",
+         {offsetof(struct TableProperties,
+                   external_sst_file_global_seqno_offset),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"tail_start_offset",
+         {offsetof(struct TableProperties, tail_start_offset),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"user_defined_timestamps_persisted",
+         {offsetof(struct TableProperties, user_defined_timestamps_persisted),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"key_largest_seqno",
+         {offsetof(struct TableProperties, key_largest_seqno),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"key_smallest_seqno",
+         {offsetof(struct TableProperties, key_smallest_seqno),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"data_block_restart_interval",
+         {offsetof(struct TableProperties, data_block_restart_interval),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"index_block_restart_interval",
+         {offsetof(struct TableProperties, index_block_restart_interval),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"separate_key_value_in_data_block",
+         {offsetof(struct TableProperties, separate_key_value_in_data_block),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"db_id",
+         {offsetof(struct TableProperties, db_id), OptionType::kEncodedString}},
+        {"db_session_id",
+         {offsetof(struct TableProperties, db_session_id),
+          OptionType::kEncodedString}},
+        {"db_host_id",
+         {offsetof(struct TableProperties, db_host_id),
+          OptionType::kEncodedString}},
+        {"column_family_name",
+         {offsetof(struct TableProperties, column_family_name),
+          OptionType::kEncodedString}},
+        {"filter_policy_name",
+         {offsetof(struct TableProperties, filter_policy_name),
+          OptionType::kEncodedString}},
+        {"comparator_name",
+         {offsetof(struct TableProperties, comparator_name),
+          OptionType::kEncodedString}},
+        {"merge_operator_name",
+         {offsetof(struct TableProperties, merge_operator_name),
+          OptionType::kEncodedString}},
+        {"prefix_extractor_name",
+         {offsetof(struct TableProperties, prefix_extractor_name),
+          OptionType::kEncodedString}},
+        {"property_collectors_names",
+         {offsetof(struct TableProperties, property_collectors_names),
+          OptionType::kEncodedString}},
+        {"compression_name",
+         {offsetof(struct TableProperties, compression_name),
+          OptionType::kEncodedString}},
+        {"compression_options",
+         {offsetof(struct TableProperties, compression_options),
+          OptionType::kEncodedString}},
+        {"seqno_to_time_mapping",
+         {offsetof(struct TableProperties, seqno_to_time_mapping),
+          OptionType::kEncodedString}},
+        {"user_collected_properties",
+         OptionTypeInfo::StringMap(
+             offsetof(struct TableProperties, user_collected_properties),
+             OptionVerificationType::kNormal, OptionTypeFlags::kNone)},
+        {"readable_properties",
+         OptionTypeInfo::StringMap(
+             offsetof(struct TableProperties, readable_properties),
+             OptionVerificationType::kNormal, OptionTypeFlags::kNone)},
+};
+
+Status TableProperties::Serialize(const ConfigOptions& opts,
+                                  std::string* output) const {
+  return OptionTypeInfo::SerializeType(opts, table_properties_type_info, this,
+                                       output);
+}
+Status TableProperties::Parse(const ConfigOptions& opts,
+                              const std::string& serialized,
+                              TableProperties* table_properties) {
+  return OptionTypeInfo::ParseType(opts, serialized, table_properties_type_info,
+                                   table_properties);
+}
+bool TableProperties::AreEqual(const ConfigOptions& opts,
+                               const TableProperties* other_table_properties,
+                               std::string* mismatch) const {
+  return OptionTypeInfo::TypesAreEqual(opts, table_properties_type_info, this,
+                                       other_table_properties, mismatch);
+}
 
 #ifndef NDEBUG
 // WARNING: TEST_SetRandomTableProperties assumes the following layout of
@@ -353,5 +649,81 @@ void TEST_SetRandomTableProperties(TableProperties* props) {
   }
 }
 #endif
+
+std::string ParseCompressionNameForDisplay(
+    const std::string& compression_name) {
+  // The single-argument overload intentionally consults globally registered
+  // CompressionManagers, keyed by the encoded compatibility name, so custom
+  // managers can contribute display names without an explicit manager handle.
+  return ParseCompressionNameForDisplay(compression_name, nullptr);
+}
+
+std::string ParseCompressionNameForDisplay(
+    const std::string& compression_name,
+    std::shared_ptr<CompressionManager> compression_manager) {
+  // Empty = no compression
+  if (compression_name.empty()) {
+    return "NoCompression";
+  }
+
+  // Check for format_version 7 format (contains ';')
+  size_t first_semicolon = compression_name.find(';');
+  if (first_semicolon == std::string::npos) {
+    // Old format - return as-is
+    return compression_name;
+  }
+
+  // New format: "<compatibility_name>;<hex_codes>;"
+  size_t second_semicolon = compression_name.find(';', first_semicolon + 1);
+  if (second_semicolon == std::string::npos) {
+    // Malformed - missing second field
+    return "Unknown";
+  }
+
+  Slice compatibility_name(compression_name.data(), first_semicolon);
+  auto mgr_to_use = ResolveCompressionManagerForDisplay(compatibility_name,
+                                                        compression_manager);
+
+  // Extract hex codes
+  std::string hex_codes = compression_name.substr(
+      first_semicolon + 1, second_semicolon - first_semicolon - 1);
+
+  // Validate hex string length (must be even)
+  if (hex_codes.size() % 2 != 0) {
+    return "Unknown";
+  }
+
+  // Parse each 2-char hex code to CompressionType.
+  // Note: This intentionally mirrors GetDecompressor()'s decoding shape but
+  // differs in error semantics. GetDecompressor() treats kNoCompression
+  // (0x00) and values >= kDisableCompressionOption (0xFF) as corruption. For
+  // display purposes, we silently filter these out and return "NoCompression"
+  // if no valid types remain.
+  std::vector<std::string> types;
+  for (size_t i = 0; i < hex_codes.size(); i += 2) {
+    const char* ptr = hex_codes.data() + i;
+    uint64_t val = 0;
+    if (!ParseBaseChars<16>(&ptr, 2, &val)) {
+      return "Unknown";
+    }
+    auto ct = static_cast<CompressionType>(val);
+    if (ct != kNoCompression && ct != kDisableCompressionOption) {
+      types.push_back(CompressionTypeDisplayName(ct, mgr_to_use));
+    }
+  }
+
+  if (types.empty()) {
+    return "NoCompression";
+  } else if (types.size() == 1) {
+    return types[0];
+  } else {
+    // Multiple types - join with commas
+    std::string result = types[0];
+    for (size_t i = 1; i < types.size(); ++i) {
+      result += "," + types[i];
+    }
+    return result;
+  }
+}
 
 }  // namespace ROCKSDB_NAMESPACE

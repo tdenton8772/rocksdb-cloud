@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -135,57 +136,6 @@ class DeleteFileTest : public DBTestBase {
   }
 };
 
-TEST_F(DeleteFileTest, AddKeysAndQueryLevels) {
-  Options options = CurrentOptions();
-  SetOptions(&options);
-  Destroy(options);
-  options.create_if_missing = true;
-  Reopen(options);
-
-  CreateTwoLevels();
-  std::vector<LiveFileMetaData> metadata;
-  db_->GetLiveFilesMetaData(&metadata);
-
-  std::string level1file;
-  int level1keycount = 0;
-  std::string level2file;
-  int level2keycount = 0;
-  int level1index = 0;
-  int level2index = 1;
-
-  ASSERT_EQ((int)metadata.size(), 2);
-  if (metadata[0].level == 2) {
-    level1index = 1;
-    level2index = 0;
-  }
-
-  level1file = metadata[level1index].name;
-  int startkey = atoi(metadata[level1index].smallestkey.c_str());
-  int endkey = atoi(metadata[level1index].largestkey.c_str());
-  level1keycount = (endkey - startkey + 1);
-  level2file = metadata[level2index].name;
-  startkey = atoi(metadata[level2index].smallestkey.c_str());
-  endkey = atoi(metadata[level2index].largestkey.c_str());
-  level2keycount = (endkey - startkey + 1);
-
-  // COntrolled setup. Levels 1 and 2 should both have 50K files.
-  // This is a little fragile as it depends on the current
-  // compaction heuristics.
-  ASSERT_EQ(level1keycount, 50000);
-  ASSERT_EQ(level2keycount, 50000);
-
-  Status status = db_->DeleteFile("0.sst");
-  ASSERT_TRUE(status.IsInvalidArgument());
-
-  // intermediate level files cannot be deleted.
-  status = db_->DeleteFile(level1file);
-  ASSERT_TRUE(status.IsInvalidArgument());
-
-  // Lowest level file deletion should succeed.
-  status = db_->DeleteFile(level2file);
-  ASSERT_OK(status);
-}
-
 TEST_F(DeleteFileTest, PurgeObsoleteFilesTest) {
   Options options = CurrentOptions();
   SetOptions(&options);
@@ -220,6 +170,49 @@ TEST_F(DeleteFileTest, PurgeObsoleteFilesTest) {
   CheckFileTypeCounts(dbname_, 0, 3, 1);
   delete itr;
   // 1 sst after iterator deletion
+  CheckFileTypeCounts(dbname_, 0, 1, 1);
+}
+
+TEST_F(DeleteFileTest, WaitForCompactWithWaitForPurgeOptionTest) {
+  Options options = CurrentOptions();
+  SetOptions(&options);
+  Destroy(options);
+  options.create_if_missing = true;
+  Reopen(options);
+
+  std::string first("0"), last("999999");
+  CompactRangeOptions compact_options;
+  compact_options.change_level = true;
+  compact_options.target_level = 2;
+  Slice first_slice(first), last_slice(last);
+
+  CreateTwoLevels();
+  Iterator* itr = nullptr;
+  ReadOptions read_options;
+  read_options.background_purge_on_iterator_cleanup = true;
+  itr = db_->NewIterator(read_options);
+  ASSERT_OK(itr->status());
+  ASSERT_OK(db_->CompactRange(compact_options, &first_slice, &last_slice));
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkPurge:start", "DeleteFileTest::WaitForPurgeTest"},
+       {"DBImpl::WaitForCompact:InsideLoop",
+        "DBImpl::BackgroundCallPurge:beforeMutexLock"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  delete itr;
+
+  TEST_SYNC_POINT("DeleteFileTest::WaitForPurgeTest");
+  // At this point, purge got started, but can't finish due to sync points
+  // not purged yet
+  CheckFileTypeCounts(dbname_, 0, 3, 1);
+
+  // The sync point in WaitForCompact should unblock the purge
+  WaitForCompactOptions wait_for_compact_options;
+  wait_for_compact_options.wait_for_purge = true;
+  Status s = dbfull()->WaitForCompact(wait_for_compact_options);
+  ASSERT_OK(s);
+
+  // Now files should be purged
   CheckFileTypeCounts(dbname_, 0, 1, 1);
 }
 
@@ -264,6 +257,108 @@ TEST_F(DeleteFileTest, BackgroundPurgeIteratorTest) {
   sleeping_task_after.WaitUntilDone();
   // 1 sst after iterator deletion
   CheckFileTypeCounts(dbname_, 0, 1, 1);
+}
+
+// Regression test for a use-after-free where an obsolete-file purge started
+// DURING DB close -- after CloseHelper's early purge drain -- continued using
+// DBImpl after ~DBImpl destroyed mutex_. Seen as a vhost-user-blk SIGABRT when
+// many RocksDB instances closed concurrently under a Warm Storage fault, with
+// avoid_unnecessary_blocking_io=true on a shared, process-wide Env.
+//
+// Here we make the straggler deterministic: keep a dropped column family handle
+// alive, delete it only after CloseHelper has passed its early purge drain,
+// then park that cleanup after FindObsoleteFiles() has incremented
+// pending_purge_obsolete_files_ but before PurgeObsoleteFiles(..., true)
+// schedules BGWorkPurge. Without the fix, the final drain sees
+// bg_purge_scheduled_ == 0 and can destroy DBImpl while the pending cleanup is
+// still about to lock/use it. With the fix, CloseHelper waits through the
+// pending handoff and then through the scheduled purge.
+TEST_F(DeleteFileTest, CloseWaitsForPurgeScheduledDuringClose) {
+  Options options = CurrentOptions();
+  SetOptions(&options);
+  Destroy(options);
+  options.create_if_missing = true;
+  // Route obsolete-file deletion through the background purge queue, matching
+  // the production config that hit the bug.
+  options.avoid_unnecessary_blocking_io = true;
+  Reopen(options);
+
+  // A dropped CF whose handle we keep alive: deleting the handle schedules a
+  // *background* purge (the dropped-CF teardown path).
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db_->CreateColumnFamily(ColumnFamilyOptions(), "dropme", &cfh));
+  ASSERT_OK(db_->Put(WriteOptions(), cfh, "key", "value"));
+  ASSERT_OK(db_->Flush(FlushOptions(), cfh));
+  ASSERT_OK(db_->DropColumnFamily(cfh));
+  ASSERT_OK(dbfull()->TEST_WaitForPurge());  // settle setup purges
+
+  std::atomic<bool> block_pending_handoff{false};
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::PurgeObsoleteFiles:BeforePendingPurgeFinished", [&](void*) {
+        if (!block_pending_handoff.exchange(false)) {
+          return;
+        }
+        TEST_SYNC_POINT(
+            "DeleteFileTest::CloseWaitsForPurge:PendingHandoffReady");
+        TEST_SYNC_POINT(
+            "DeleteFileTest::CloseWaitsForPurge:PendingHandoffBlocked");
+      });
+  SyncPoint::GetInstance()->LoadDependency({
+      // Delete the dropped CF handle only after CloseHelper has passed its
+      // early purge drain and entered a mutex-unlocked close window.
+      {"DBImpl::CloseHelper:CFHandleCleanupUnlocked",
+       "DeleteFileTest::CloseWaitsForPurge:DropDuringCloseUnlock"},
+      // Let the test thread observe that the deleter is parked in the pending
+      // handoff window.
+      {"DeleteFileTest::CloseWaitsForPurge:PendingHandoffReady",
+       "DeleteFileTest::CloseWaitsForPurge:WaitForPendingHandoff"},
+      // Keep CloseHelper in the mutex-unlocked close window until the
+      // dropped-CF cleanup reaches the pending-to-scheduled handoff.
+      {"DeleteFileTest::CloseWaitsForPurge:PendingHandoffReady",
+       "DBImpl::CloseHelper:CFHandleCleanupAllowed"},
+      // Observe that CloseHelper is actually waiting in the final purge drain
+      // while the dropped-CF cleanup is still parked in the pending handoff.
+      {"DBImpl::CloseHelper:FinalPurgeDrainWait",
+       "DeleteFileTest::CloseWaitsForPurge:WaitForFinalPurgeDrain"},
+      // Keep the dropped-CF cleanup parked in the pending handoff window until
+      // the test releases it.
+      {"DeleteFileTest::CloseWaitsForPurge:ReleasePendingHandoff",
+       "DeleteFileTest::CloseWaitsForPurge:PendingHandoffBlocked"},
+      // Park the scheduled BGWorkPurge before it locks mutex_ until we release
+      // it, so CloseHelper also has to wait for bg_purge_scheduled_.
+      {"DeleteFileTest::CloseWaitsForPurge:ReleaseBackgroundPurge",
+       "DBImpl::BackgroundCallPurge:beforeMutexLock"},
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  port::Thread closer([&]() { db_.reset(); });
+
+  // Unblocks once CloseHelper is in a mutex-unlocked close window; then
+  // deleting the dropped CF handle starts purge work the early drain missed.
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:DropDuringCloseUnlock");
+  block_pending_handoff.store(true);
+  ColumnFamilyHandle* dropped_cfh = cfh;
+  cfh = nullptr;
+  port::Thread dropped_cf_deleter([dropped_cfh]() { delete dropped_cfh; });
+
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:WaitForPendingHandoff");
+
+  // Wait until CloseHelper is blocked in the final drain with no scheduled
+  // purge yet. Without the fix, it would proceed while the dropped-CF cleanup
+  // is still pending. With the fix, it waits for pending_purge_obsolete_files_.
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:WaitForFinalPurgeDrain");
+
+  // Release the pending cleanup, then the BGWorkPurge it schedules. With the
+  // fix, the closer waits for both transitions and completes cleanly.
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:ReleasePendingHandoff");
+  dropped_cf_deleter.join();
+  TEST_SYNC_POINT("DeleteFileTest::CloseWaitsForPurge:ReleaseBackgroundPurge");
+  closer.join();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(DeleteFileTest, PurgeDuringOpen) {
@@ -323,6 +418,15 @@ TEST_F(DeleteFileTest, BackgroundPurgeCFDropTest) {
     // Expect 1 sst file.
     CheckFileTypeCounts(dbname_, 0, 1, 1);
 
+    if (bg_purge) {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      SyncPoint::GetInstance()->LoadDependency(
+          {{"DeleteFileTest::BackgroundPurgeCFDropTest:1",
+            "DBImpl::BGWorkPurge:start"}});
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+
     ASSERT_OK(db_->DropColumnFamily(cfh));
     // Still 1 file, it won't be deleted while ColumnFamilyHandle is alive.
     CheckFileTypeCounts(dbname_, 0, 1, 1);
@@ -351,13 +455,6 @@ TEST_F(DeleteFileTest, BackgroundPurgeCFDropTest) {
   options.create_if_missing = false;
   Reopen(options);
   ASSERT_OK(dbfull()->TEST_WaitForPurge());
-
-  SyncPoint::GetInstance()->DisableProcessing();
-  SyncPoint::GetInstance()->ClearAllCallBacks();
-  SyncPoint::GetInstance()->LoadDependency(
-      {{"DeleteFileTest::BackgroundPurgeCFDropTest:1",
-        "DBImpl::BGWorkPurge:start"}});
-  SyncPoint::GetInstance()->EnableProcessing();
 
   {
     SCOPED_TRACE("avoid_unnecessary_blocking_io = true");
@@ -453,145 +550,6 @@ TEST_F(DeleteFileTest, BackgroundPurgeTestMultipleJobs) {
   CheckFileTypeCounts(dbname_, 0, 1, 1);
 }
 
-TEST_F(DeleteFileTest, DeleteFileWithIterator) {
-  Options options = CurrentOptions();
-  SetOptions(&options);
-  Destroy(options);
-  options.create_if_missing = true;
-  Reopen(options);
-
-  CreateTwoLevels();
-  ReadOptions read_options;
-  Iterator* it = db_->NewIterator(read_options);
-  ASSERT_OK(it->status());
-  std::vector<LiveFileMetaData> metadata;
-  db_->GetLiveFilesMetaData(&metadata);
-
-  std::string level2file;
-
-  ASSERT_EQ(metadata.size(), static_cast<size_t>(2));
-  if (metadata[0].level == 1) {
-    level2file = metadata[1].name;
-  } else {
-    level2file = metadata[0].name;
-  }
-
-  Status status = db_->DeleteFile(level2file);
-  fprintf(stdout, "Deletion status %s: %s\n", level2file.c_str(),
-          status.ToString().c_str());
-  ASSERT_OK(status);
-  it->SeekToFirst();
-  int numKeysIterated = 0;
-  while (it->Valid()) {
-    numKeysIterated++;
-    it->Next();
-  }
-  ASSERT_EQ(numKeysIterated, 50000);
-  delete it;
-}
-
-TEST_F(DeleteFileTest, DeleteLogFiles) {
-  Options options = CurrentOptions();
-  SetOptions(&options);
-  Destroy(options);
-  options.create_if_missing = true;
-  Reopen(options);
-
-  AddKeys(10, 0);
-  VectorLogPtr logfiles;
-  ASSERT_OK(db_->GetSortedWalFiles(logfiles));
-  ASSERT_GT(logfiles.size(), 0UL);
-  // Take the last log file which is expected to be alive and try to delete it
-  // Should not succeed because live logs are not allowed to be deleted
-  std::unique_ptr<LogFile> alive_log = std::move(logfiles.back());
-  ASSERT_EQ(alive_log->Type(), kAliveLogFile);
-  ASSERT_OK(env_->FileExists(wal_dir_ + "/" + alive_log->PathName()));
-  fprintf(stdout, "Deleting alive log file %s\n",
-          alive_log->PathName().c_str());
-  ASSERT_NOK(db_->DeleteFile(alive_log->PathName()));
-  ASSERT_OK(env_->FileExists(wal_dir_ + "/" + alive_log->PathName()));
-  logfiles.clear();
-
-  // Call Flush to bring about a new working log file and add more keys
-  // Call Flush again to flush out memtable and move alive log to archived log
-  // and try to delete the archived log file
-  FlushOptions fopts;
-  ASSERT_OK(db_->Flush(fopts));
-  AddKeys(10, 0);
-  ASSERT_OK(db_->Flush(fopts));
-  ASSERT_OK(db_->GetSortedWalFiles(logfiles));
-  ASSERT_GT(logfiles.size(), 0UL);
-  std::unique_ptr<LogFile> archived_log = std::move(logfiles.front());
-  ASSERT_EQ(archived_log->Type(), kArchivedLogFile);
-  ASSERT_OK(env_->FileExists(wal_dir_ + "/" + archived_log->PathName()));
-  fprintf(stdout, "Deleting archived log file %s\n",
-          archived_log->PathName().c_str());
-  ASSERT_OK(db_->DeleteFile(archived_log->PathName()));
-  ASSERT_TRUE(
-      env_->FileExists(wal_dir_ + "/" + archived_log->PathName()).IsNotFound());
-}
-
-TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
-  Options options = CurrentOptions();
-  SetOptions(&options);
-  Destroy(options);
-  options.create_if_missing = true;
-  Reopen(options);
-  CreateAndReopenWithCF({"new_cf"}, options);
-
-  Random rnd(5);
-  for (int i = 0; i < 1000; ++i) {
-    ASSERT_OK(db_->Put(WriteOptions(), handles_[1], test::RandomKey(&rnd, 10),
-                       test::RandomKey(&rnd, 10)));
-  }
-  ASSERT_OK(db_->Flush(FlushOptions(), handles_[1]));
-  for (int i = 0; i < 1000; ++i) {
-    ASSERT_OK(db_->Put(WriteOptions(), handles_[1], test::RandomKey(&rnd, 10),
-                       test::RandomKey(&rnd, 10)));
-  }
-  ASSERT_OK(db_->Flush(FlushOptions(), handles_[1]));
-
-  std::vector<LiveFileMetaData> metadata;
-  db_->GetLiveFilesMetaData(&metadata);
-  ASSERT_EQ(2U, metadata.size());
-  ASSERT_EQ("new_cf", metadata[0].column_family_name);
-  ASSERT_EQ("new_cf", metadata[1].column_family_name);
-  auto old_file = metadata[0].smallest_seqno < metadata[1].smallest_seqno
-                      ? metadata[0].name
-                      : metadata[1].name;
-  auto new_file = metadata[0].smallest_seqno > metadata[1].smallest_seqno
-                      ? metadata[0].name
-                      : metadata[1].name;
-  ASSERT_TRUE(db_->DeleteFile(new_file).IsInvalidArgument());
-  ASSERT_OK(db_->DeleteFile(old_file));
-
-  {
-    std::unique_ptr<Iterator> itr(db_->NewIterator(ReadOptions(), handles_[1]));
-    ASSERT_OK(itr->status());
-    int count = 0;
-    for (itr->SeekToFirst(); itr->Valid(); itr->Next()) {
-      ASSERT_OK(itr->status());
-      ++count;
-    }
-    ASSERT_OK(itr->status());
-    ASSERT_EQ(count, 1000);
-  }
-
-  Close();
-  ReopenWithColumnFamilies({kDefaultColumnFamilyName, "new_cf"}, options);
-
-  {
-    std::unique_ptr<Iterator> itr(db_->NewIterator(ReadOptions(), handles_[1]));
-    int count = 0;
-    for (itr->SeekToFirst(); itr->Valid(); itr->Next()) {
-      ASSERT_OK(itr->status());
-      ++count;
-    }
-    ASSERT_OK(itr->status());
-    ASSERT_EQ(count, 1000);
-  }
-}
-
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -600,4 +558,3 @@ int main(int argc, char** argv) {
   RegisterCustomObjects(argc, argv);
   return RUN_ALL_TESTS();
 }
-

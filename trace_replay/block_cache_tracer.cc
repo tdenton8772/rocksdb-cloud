@@ -135,26 +135,7 @@ Status BlockCacheTraceWriterImpl::WriteBlockAccess(
   if (BlockCacheTraceHelper::IsGetOrMultiGet(record.caller)) {
     PutFixed64(&trace.payload, record.get_id);
     trace.payload.push_back(record.get_from_user_specified_snapshot);
-    Slice rk = referenced_key;
-    std::string rkStorage;
-#if 0
-    // This check no longer works, we always filter out user data temporarily
-    if ((trace_options_.filter & kTraceFilterReferencedKey) != 0) {
-#endif
-    {
-      ParsedInternalKey pk;
-      Status st = ParseInternalKey(rk, &pk, false);
-      if (!st.ok()) {
-        return st;
-      }
-      if (pk.user_key.size() > 4) {
-        // first 4 is TableId
-        pk.user_key = Slice(pk.user_key.data(), 4);
-      }
-      AppendInternalKey(&rkStorage, pk);
-      rk = rkStorage;
-    }
-    PutLengthPrefixedSlice(&trace.payload, rk);
+    PutLengthPrefixedSlice(&trace.payload, referenced_key);
   }
   if (BlockCacheTraceHelper::IsGetOrMultiGetOnDataBlock(record.block_type,
                                                         record.caller)) {

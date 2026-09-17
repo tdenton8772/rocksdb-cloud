@@ -185,6 +185,13 @@ public class PerfContext extends RocksObject {
   }
 
   /**
+   * @return total number of bytes read from blob cache
+   */
+  public long getBlobCacheReadByte() {
+    return getBlobCacheReadByte(nativeHandle_);
+  }
+
+  /**
    * @return total number of blob reads (with IO)
    */
   public long getBlobReadCount() {
@@ -652,6 +659,15 @@ public class PerfContext extends RocksObject {
   }
 
   @Override
+  public String toString() {
+    return toString(true);
+  }
+
+  public String toString(final boolean excludeZeroCounters) {
+    return toString(nativeHandle_, excludeZeroCounters);
+  }
+
+  @Override
   protected void disposeInternal(long handle) {
     // Nothing to do. Perf context is valid for all the time of application is running.
   }
@@ -684,6 +700,7 @@ public class PerfContext extends RocksObject {
   private native long getMultigetReadBytes(final long handle);
   private native long getIterReadBytes(final long handle);
   private native long getBlobCacheHitCount(final long handle);
+  private native long getBlobCacheReadByte(final long handle);
   private native long getBlobReadCount(final long handle);
   private native long getBlobReadByte(final long handle);
   private native long getBlobReadTime(final long handle);
@@ -758,4 +775,6 @@ public class PerfContext extends RocksObject {
   private native long getEncryptDataNanos(long nativeHandle_);
   private native long getDecryptDataNanos(long nativeHandle_);
   private native long getNumberAsyncSeek(long nativeHandle_);
+
+  private native String toString(final long nativeHandle, final boolean excludeZeroCounters);
 }

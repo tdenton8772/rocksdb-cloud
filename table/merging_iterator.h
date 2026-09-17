@@ -70,12 +70,18 @@ class MergeIteratorBuilder {
   // point iterators are not LevelIterator, then range tombstone iterator is
   // only added to the merging iter if there is a non-null `tombstone_iter`.
   void AddPointAndTombstoneIterator(
-      InternalIterator* point_iter, TruncatedRangeDelIterator* tombstone_iter,
-      TruncatedRangeDelIterator*** tombstone_iter_ptr = nullptr);
+      InternalIterator* point_iter,
+      std::unique_ptr<TruncatedRangeDelIterator>&& tombstone_iter,
+      std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
+          nullptr);
 
   // Get arena used to build the merging iterator. It is called one a child
   // iterator needs to be allocated.
   Arena* GetArena() { return arena; }
+
+  void SetMemtablePruned(bool memtable_pruned) {
+    memtable_pruned_ = memtable_pruned;
+  }
 
   // Return the result merging iterator.
   // If db_iter is not nullptr, then db_iter->SetMemtableRangetombstoneIter()
@@ -91,8 +97,11 @@ class MergeIteratorBuilder {
   Arena* arena;
   // Used to set LevelIterator.range_tombstone_iter_.
   // See AddRangeTombstoneIterator() implementation for more detail.
-  std::vector<std::pair<size_t, TruncatedRangeDelIterator***>>
+  std::vector<std::pair<size_t, std::unique_ptr<TruncatedRangeDelIterator>**>>
       range_del_iter_ptrs_;
+  // if supplying multiscan ranges allowed us to prune the memtable range delete
+  // iterator, we need to handle this in Finish()
+  bool memtable_pruned_ = false;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

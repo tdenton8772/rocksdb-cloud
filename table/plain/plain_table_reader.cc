@@ -3,7 +3,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include "table/plain/plain_table_reader.h"
 
 #include <string>
@@ -121,7 +120,9 @@ Status PlainTableReader::Open(
     bool full_scan_mode, const bool immortal_table,
     const SliceTransform* prefix_extractor) {
   if (file_size > PlainTableIndex::kMaxFileSize) {
-    return Status::NotSupported("File is too large for PlainTableReader!");
+    return Status::NotSupported("File size " + std::to_string(file_size) +
+                                " exceeds PlainTableReader max file size " +
+                                std::to_string(PlainTableIndex::kMaxFileSize));
   }
 
   std::unique_ptr<TableProperties> props;
@@ -201,8 +202,10 @@ InternalIterator* PlainTableReader::NewIterator(
   assert(table_properties_);
 
   // Auto prefix mode is not implemented in PlainTable.
-  bool use_prefix_seek = !IsTotalOrderMode() && !options.total_order_seek &&
-                         !options.auto_prefix_mode;
+  bool use_prefix_seek =
+      !IsTotalOrderMode() &&
+      (options.prefix_same_as_start ||
+       (!options.total_order_seek && !options.auto_prefix_mode));
   if (arena == nullptr) {
     return new PlainTableIterator(this, use_prefix_seek);
   } else {

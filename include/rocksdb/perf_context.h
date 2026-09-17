@@ -20,6 +20,12 @@ namespace ROCKSDB_NAMESPACE {
  * add/remove fields to this structure, builds would fail. The way to fix the
  * builds would be to add the appropriate fields to the
  * DEF_PERF_CONTEXT_LEVEL_METRICS() macro in the perf_context.cc file.
+ *
+ * If you plan to add new metrics, please read documentation in perf_level.h and
+ * try to come up with a metric name that follows the naming conventions
+ * mentioned there. It helps to indicate the metric's starting enabling P
+ * erfLevel. Document this starting PerfLevel if the metric name cannot meet the
+ * naming conventions.
  */
 
 // Break down performance counters by level and store per-level perf context in
@@ -54,6 +60,7 @@ struct PerfContextByLevelBase {
 // PerfContextByLevel
 struct PerfContextByLevel : public PerfContextByLevelBase {
   void Reset();  // reset all performance counters to zero
+  void Merge(const PerfContextByLevel& other);
 };
 
 /*
@@ -70,7 +77,8 @@ struct PerfContextBase {
   uint64_t block_read_count;           // total number of block reads (with IO)
   uint64_t block_read_byte;            // total number of bytes from block reads
   uint64_t block_read_time;            // total nanos spent on block reads
-  // total cpu time in nanos spent on block reads
+  // total cpu time in nanos spent on block reads. Not supported for async read
+  // requests.
   uint64_t block_read_cpu_time;
   uint64_t block_cache_index_hit_count;  // total number of index block hits
   // total number of standalone handles lookup from secondary cache
@@ -89,15 +97,6 @@ struct PerfContextBase {
   uint64_t block_cache_compression_dict_read_byte;
   uint64_t block_cache_read_byte;
 
-  // RocksDB-Cloud contribution begin
-
-  // Total number of files read in MultiGet operations
-  uint64_t multiget_sst_file_read_count;
-  // Number of times file reads were serialized behind other reads
-  uint64_t multiget_sst_serialized_file_read_count;
-
-  // RocksDB-Cloud contribution end
-
   uint64_t secondary_cache_hit_count;  // total number of secondary cache hits
   // total number of real handles inserted into secondary cache
   uint64_t compressed_sec_cache_insert_real_count;
@@ -108,14 +107,16 @@ struct PerfContextBase {
   // bytes for vals after compression in secondary cache
   uint64_t compressed_sec_cache_compressed_bytes;
 
-  uint64_t block_checksum_time;    // total nanos spent on block checksum
-  uint64_t block_decompress_time;  // total nanos spent on block decompression
+  uint64_t block_checksum_time;     // total nanos spent on block checksum
+  uint64_t block_decompress_time;   // total nanos spent on block decompression
+  uint64_t block_decompress_count;  // total number of block decompressions
 
   uint64_t get_read_bytes;       // bytes for vals returned by Get
   uint64_t multiget_read_bytes;  // bytes for vals returned by MultiGet
   uint64_t iter_read_bytes;      // bytes for keys/vals decoded by iterator
 
   uint64_t blob_cache_hit_count;  // total number of blob cache hits
+  uint64_t blob_cache_read_byte;  // total bytes read from blob cache
   uint64_t blob_read_count;       // total number of blob reads (with IO)
   uint64_t blob_read_byte;        // total number of bytes from blob reads
   uint64_t blob_read_time;        // total nanos spent on blob reads
@@ -198,6 +199,7 @@ struct PerfContextBase {
   // total nanos spent on writing to WAL
   uint64_t write_wal_time;
   // total nanos spent on writing to mem tables
+  // This metric gets collected starting from PerfLevel::kEnableWait
   uint64_t write_memtable_time;
   // total nanos spent on delaying or throttling write
   uint64_t write_delay_time;
@@ -239,6 +241,8 @@ struct PerfContextBase {
   uint64_t bloom_sst_miss_count;
 
   // Time spent waiting on key locks in transaction lock manager.
+  // This metric gets collected starting from
+  // PerfLevel::kEnableTimeExceptForMutex
   uint64_t key_lock_wait_time;
   // number of times acquiring a lock was blocked by another transaction.
   uint64_t key_lock_wait_count;
@@ -284,18 +288,52 @@ struct PerfContextBase {
   uint64_t decrypt_data_nanos;
 
   uint64_t number_async_seek;
+
+  // Metrics for file ingestion
+  // Time spent end to end in an IngestExternalFile call.
+  uint64_t file_ingestion_nanos;
+  // Time IngestExternalFile blocked live writes.
+  uint64_t file_ingestion_blocking_live_writes_nanos;
+
+  // Bytes read from storage for each block category. These add up to
+  // block_read_byte.
+  uint64_t data_block_read_byte;
+  uint64_t index_block_read_byte;
+  uint64_t filter_block_read_byte;
+  uint64_t compression_dict_block_read_byte;
+  uint64_t metadata_block_read_byte;
+
+  // MultiScan (scan Prepare) prefetch metrics. Populated by
+  // BlockBasedTableIterator::Prepare and its IODispatcher prefetch path. These
+  // mirror the rocksdb.multiscan.* tickers but are scoped to the current
+  // thread/operation. Average blocks per prepare is derivable as
+  // (multiscan_blocks_prefetched + multiscan_blocks_from_cache) /
+  // multiscan_prepare_count.
+  uint64_t multiscan_prepare_count;
+  // Blocks for which a prefetch IO was dispatched (read from disk).
+  uint64_t multiscan_blocks_prefetched;
+  // Blocks that were already in the block cache at Prepare time.
+  uint64_t multiscan_blocks_from_cache;
+  // Total bytes spanned by the (coalesced) prefetch IO requests.
+  uint64_t multiscan_prefetch_bytes;
+  // Number of (coalesced) IO requests issued for the prefetch.
+  uint64_t multiscan_io_requests;
+  // Blocks coalesced into an IO request across a non-adjacent gap.
+  uint64_t multiscan_io_coalesced_nonadjacent;
 };
 
 struct PerfContext : public PerfContextBase {
   ~PerfContext();
 
-  PerfContext() {}
+  PerfContext() { Reset(); }
 
   PerfContext(const PerfContext&);
   PerfContext& operator=(const PerfContext&);
   PerfContext(PerfContext&&) noexcept;
+  PerfContext& operator=(PerfContext&&) noexcept;
 
   void Reset();  // reset all performance counters to zero
+  void Merge(const PerfContext& other);
 
   std::string ToString(bool exclude_zero_counters = false) const;
 

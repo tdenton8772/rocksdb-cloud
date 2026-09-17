@@ -9,10 +9,17 @@
 
 #pragma once
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "db/blob/blob_fetcher.h"
+#include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl.h"
-#include "db/range_del_aggregator.h"
+#include "db/wide/read_path_blob_resolver.h"
+#include "db/wide/wide_columns_helper.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
@@ -20,9 +27,14 @@
 #include "rocksdb/wide_columns.h"
 #include "table/iterator_wrapper.h"
 #include "util/autovector.h"
+#include "util/dirty_tracked.h"
 
 namespace ROCKSDB_NAMESPACE {
+class BlobFileCache;
 class Version;
+namespace port {
+class RWMutex;
+}
 
 // This file declares the factory functions of DBIter, in its original form
 // or a wrapped form with class ArenaWrappedDBIter, which is defined here.
@@ -57,6 +69,39 @@ class Version;
 // numbers, deletion markers, overwrites, etc.
 class DBIter final : public Iterator {
  public:
+  // Return a new DBIter that reads from `internal_iter` at the specified
+  // `sequence` number.
+  //
+  // @param active_mem Pointer to the active memtable that `internal_iter`
+  // is reading from. If not null, the memtable can be marked for flush
+  // according to options mutable_cf_options.memtable_op_scan_flush_trigger
+  // and mutable_cf_options.memtable_avg_op_scan_flush_trigger.
+  // @param arena_mode If true, the DBIter will be allocated from the arena.
+  static DBIter* NewIter(Env* env, const ReadOptions& read_options,
+                         const ImmutableOptions& ioptions,
+                         const MutableCFOptions& mutable_cf_options,
+                         const Comparator* user_key_comparator,
+                         InternalIterator* internal_iter,
+                         const Version* version, const SequenceNumber& sequence,
+                         ReadCallback* read_callback,
+                         ReadOnlyMemTable* active_mem,
+                         ColumnFamilyHandleImpl* cfh = nullptr,
+                         bool expose_blob_index = false, Arena* arena = nullptr,
+                         DBImpl* db_impl = nullptr,
+                         ColumnFamilyData* cfd = nullptr) {
+    if (cfh != nullptr) {
+      db_impl = cfh->db();
+      cfd = cfh->cfd();
+    }
+    void* mem = arena ? arena->AllocateAligned(sizeof(DBIter))
+                      : operator new(sizeof(DBIter));
+    DBIter* db_iter = new (mem)
+        DBIter(env, read_options, ioptions, mutable_cf_options,
+               user_key_comparator, internal_iter, version, sequence, arena,
+               read_callback, db_impl, cfd, expose_blob_index, active_mem);
+    return db_iter;
+  }
+
   // The following is grossly complicated. TODO: clean it up
   // Which direction is the iterator currently moving?
   // (1) When moving forward:
@@ -113,19 +158,12 @@ class DBIter final : public Iterator {
     uint64_t skip_count_;
   };
 
-  DBIter(Env* _env, const ReadOptions& read_options,
-         const ImmutableOptions& ioptions,
-         const MutableCFOptions& mutable_cf_options, const Comparator* cmp,
-         InternalIterator* iter, const Version* version, SequenceNumber s,
-         bool arena_mode, uint64_t max_sequential_skip_in_iterations,
-         ReadCallback* read_callback, ColumnFamilyHandleImpl* cfh,
-         bool expose_blob_index);
-
   // No copying allowed
   DBIter(const DBIter&) = delete;
   void operator=(const DBIter&) = delete;
 
   ~DBIter() override {
+    MarkMemtableForFlushForAvgTrigger();
     ThreadStatus::OperationType cur_op_type =
         ThreadStatusUtil::GetThreadOperation();
     ThreadStatusUtil::SetThreadOperation(
@@ -166,17 +204,18 @@ class DBIter final : public Iterator {
   Slice value() const override {
     assert(valid_);
 
-    return value_;
+    return value_columns_state_->value();
   }
 
   const WideColumns& columns() const override {
     assert(valid_);
-
-    return wide_columns_;
+    assert(!value_columns_state_->HasLazyEntityColumns() ||
+           value_columns_state_->HasMaterializedColumns());
+    return value_columns_state_->wide_columns();
   }
 
   Status status() const override {
-    if (status_.ok()) {
+    if (status_.ok() && iter_.iter() != nullptr) {
       return iter_.status();
     } else {
       assert(!valid_);
@@ -195,7 +234,7 @@ class DBIter final : public Iterator {
   }
   bool IsBlob() const {
     assert(valid_);
-    return is_blob_;
+    return blob_state_->is_blob;
   }
 
   Status GetProperty(std::string prop_name, std::string* prop) override;
@@ -216,11 +255,193 @@ class DBIter final : public Iterator {
     }
     iter_.SetRangeDelReadSeqno(s);
   }
-  SequenceNumber get_sequence() const { return sequence_; }
-
   void set_valid(bool v) { valid_ = v; }
+  void set_status(Status s) { status_ = std::move(s); }
+
+  bool PrepareValue() override;
+
+  void Prepare(const MultiScanArgs& scan_opts) override;
+  Status ValidateScanOptions(const MultiScanArgs& multiscan_opts) const;
+  Status SetScanOptionsForPrepare(const MultiScanArgs& scan_opts);
+  void PrepareInternalChildren();
 
  private:
+  DBIter(Env* _env, const ReadOptions& read_options,
+         const ImmutableOptions& ioptions,
+         const MutableCFOptions& mutable_cf_options, const Comparator* cmp,
+         InternalIterator* iter, const Version* version, SequenceNumber s,
+         bool arena_mode, ReadCallback* read_callback, DBImpl* db_impl,
+         ColumnFamilyData* cfd, bool expose_blob_index,
+         ReadOnlyMemTable* active_mem);
+
+  class BlobReader {
+   public:
+    BlobReader(const Version* version, const ReadOptions& read_options,
+               BlobFileCache* blob_file_cache, bool allow_write_path_fallback)
+        : blob_fetcher_(version, ReadOptions(read_options), blob_file_cache,
+                        allow_write_path_fallback) {}
+
+    const Slice& GetBlobValue() const { return blob_value_; }
+    Status RetrieveAndSetBlobValue(const Slice& user_key,
+                                   const Slice& blob_index);
+    void ResetBlobValue() { blob_value_.Reset(); }
+    // The blob fetcher backing this reader, for resolving wide-column entity
+    // blob references (the merge path). Valid for this BlobReader's lifetime.
+    const BlobFetcher& blob_fetcher() const { return blob_fetcher_; }
+
+   private:
+    PinnableSlice blob_value_;
+    OwningVersionBlobFetcher blob_fetcher_;
+  };
+  struct BlobState {
+    BlobReader reader;
+    Slice lazy_blob_index;
+    bool is_blob = false;
+
+    template <typename... Args>
+    explicit BlobState(Args&&... args) : reader(std::forward<Args>(args)...) {}
+
+    void Reset() {
+      reader.ResetBlobValue();
+      lazy_blob_index.clear();
+      is_blob = false;
+    }
+  };
+
+  // Groups the current iterator result together with the backing storage and
+  // lazy entity-resolution metadata it depends on. Resetting this object drops
+  // all aliases into the saved entity buffer and resolver cache at once.
+  class ValueColumnsState {
+   public:
+    ValueColumnsState(const Version* version, const ReadOptions& read_options,
+                      ColumnFamilyData* cfd)
+        : entity_blob_resolver_(
+              version, read_options, cfd ? cfd->blob_file_cache() : nullptr,
+              cfd != nullptr && cfd->blob_partition_manager() != nullptr) {}
+
+    Slice& value() { return value_; }
+    const Slice& value() const { return value_; }
+    WideColumns& wide_columns() { return wide_columns_; }
+    const WideColumns& wide_columns() const { return wide_columns_; }
+    bool HasMaterializedColumns() const { return !wide_columns_.empty(); }
+    bool HasLazyEntityColumns() const { return !lazy_entity_columns_.empty(); }
+
+    std::string& saved_value() { return saved_value_; }
+    const std::string& saved_value() const { return saved_value_; }
+
+    std::vector<WideColumn>& lazy_entity_columns() {
+      return lazy_entity_columns_;
+    }
+    const std::vector<WideColumn>& lazy_entity_columns() const {
+      return lazy_entity_columns_;
+    }
+
+    std::vector<std::pair<size_t, BlobIndex>>& lazy_blob_columns() {
+      return lazy_blob_columns_;
+    }
+    const std::vector<std::pair<size_t, BlobIndex>>& lazy_blob_columns() const {
+      return lazy_blob_columns_;
+    }
+
+    ReadPathBlobResolver& entity_blob_resolver() {
+      return entity_blob_resolver_;
+    }
+    const ReadPathBlobResolver& entity_blob_resolver() const {
+      return entity_blob_resolver_;
+    }
+
+    std::mutex& lazy_entity_columns_mutex() const {
+      return lazy_entity_columns_mutex_;
+    }
+
+    // DBIter calls this after ResetValueAndColumns() before repopulating the
+    // current entry from a serialized wide-column entity.
+    void AssertReadyForEntity() const {
+      assert(value_.empty());
+      assert(wide_columns_.empty());
+      assert(lazy_entity_columns_.empty());
+      assert(lazy_blob_columns_.empty());
+    }
+
+    inline void ClearSavedValue() {
+      if (saved_value_.capacity() > 1048576) {
+        std::string empty;
+        swap(empty, saved_value_);
+      } else {
+        saved_value_.clear();
+      }
+    }
+
+    // Preserve the serialized entity bytes when DBIter needs stable backing
+    // storage for lazy column slices across iterator movement.
+    void SaveEntitySliceIfNeeded(const Slice& slice) {
+      if (slice.data() != saved_value_.data() ||
+          slice.size() != saved_value_.size()) {
+        saved_value_.assign(slice.data(), slice.size());
+      }
+    }
+
+    // Clears the previous lazy entity metadata and returns the saved entity
+    // buffer as input for Deserialize().
+    Slice PrepareForLazyEntityDeserialize() {
+      ClearLazyEntity();
+      return Slice(saved_value_);
+    }
+
+    // Publishes the deserialized lazy entity metadata to the blob resolver.
+    void BindLazyEntity(const Slice& user_key) {
+      entity_blob_resolver_.Reset(user_key, &lazy_entity_columns_,
+                                  &lazy_blob_columns_);
+    }
+
+    // Drops the lazy entity metadata and any resolver aliases into it.
+    void ClearLazyEntity() {
+      lazy_entity_columns_.clear();
+      lazy_blob_columns_.clear();
+      entity_blob_resolver_.Reset(Slice(), nullptr, nullptr);
+    }
+
+    // Clears materialized wide columns on error before DBIter invalidates
+    // itself.
+    void ClearWideColumns() { wide_columns_.clear(); }
+
+    // Fast path for inline entities whose default column is already
+    // materialized in wide_columns_.
+    void MaybeSetValueFromMaterializedDefaultColumn() {
+      if (WideColumnsHelper::HasDefaultColumn(wide_columns_)) {
+        value_ = WideColumnsHelper::GetDefaultColumn(wide_columns_);
+      }
+    }
+
+    void SetFromPlain(const Slice& slice) {
+      assert(value_.empty());
+      assert(wide_columns_.empty());
+      assert(lazy_entity_columns_.empty());
+      assert(lazy_blob_columns_.empty());
+
+      value_ = slice;
+      wide_columns_.emplace_back(kDefaultWideColumnName, slice);
+    }
+
+    void Reset() {
+      value_.clear();
+      wide_columns_.clear();
+      ClearLazyEntity();
+    }
+
+   private:
+    std::string saved_value_;
+    // Value of the default column.
+    Slice value_;
+    // All columns (i.e. name-value pairs).
+    WideColumns wide_columns_;
+    // Lazy resolution state for V2 entities with blob columns.
+    ReadPathBlobResolver entity_blob_resolver_;
+    std::vector<WideColumn> lazy_entity_columns_;
+    std::vector<std::pair<size_t, BlobIndex>> lazy_blob_columns_;
+    mutable std::mutex lazy_entity_columns_mutex_;
+  };
+
   // For all methods in this block:
   // PRE: iter_->Valid() && status_.ok()
   // Return false if there was an error, and status() is non-ok, valid_ = false;
@@ -235,22 +456,22 @@ class DBIter final : public Iterator {
   // It might get adjusted if the seek key is larger than iterator upper bound.
   // target does not have timestamp.
   void SetSavedKeyToSeekForPrevTarget(const Slice& target);
-  bool FindValueForCurrentKey();
+  bool FindValueForCurrentKey(bool& found_visible);
   bool FindValueForCurrentKeyUsingSeek();
   bool FindUserKeyBeforeSavedKey();
   // If `skipping_saved_key` is true, the function will keep iterating until it
   // finds a user key that is larger than `saved_key_`.
-  // If `prefix` is not null, the iterator needs to stop when all keys for the
-  // prefix are exhausted and the iterator is set to invalid.
-  bool FindNextUserEntry(bool skipping_saved_key, const Slice* prefix);
+  // When prefix_ is set, the iterator stops when all keys for the prefix are
+  // exhausted and the iterator is set to invalid.
+  bool FindNextUserEntry(bool skipping_saved_key);
   // Internal implementation of FindNextUserEntry().
-  bool FindNextUserEntryInternal(bool skipping_saved_key, const Slice* prefix);
+  bool FindNextUserEntryInternal(bool skipping_saved_key);
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
 
-  // If prefix is not null, we need to set the iterator to invalid if no more
+  // When prefix_ is set, we need to set the iterator to invalid if no more
   // entry can be found within the prefix.
-  void PrevInternal(const Slice* prefix);
+  void PrevInternal();
   bool TooManyInternalKeysSkipped(bool increment = true);
   bool IsVisible(SequenceNumber sequence, const Slice& ts,
                  bool* more_recent = nullptr);
@@ -271,12 +492,7 @@ class DBIter final : public Iterator {
   }
 
   inline void ClearSavedValue() {
-    if (saved_value_.capacity() > 1048576) {
-      std::string empty;
-      swap(empty, saved_value_);
-    } else {
-      saved_value_.clear();
-    }
+    value_columns_state_.mut()->ClearSavedValue();
   }
 
   inline void ResetInternalKeysSkippedCounter() {
@@ -301,41 +517,40 @@ class DBIter final : public Iterator {
                : user_comparator_.CompareWithoutTimestamp(a, b);
   }
 
-  // Retrieves the blob value for the specified user key using the given blob
-  // index when using the integrated BlobDB implementation.
-  bool SetBlobValueIfNeeded(const Slice& user_key, const Slice& blob_index);
-
-  void ResetBlobValue() {
-    is_blob_ = false;
-    blob_value_.Reset();
-  }
-
   void SetValueAndColumnsFromPlain(const Slice& slice) {
-    assert(value_.empty());
-    assert(wide_columns_.empty());
-
-    value_ = slice;
-    wide_columns_.emplace_back(kDefaultWideColumnName, slice);
+    value_columns_state_.mut()->SetFromPlain(slice);
   }
+
+  bool SetValueAndColumnsFromBlobImpl(const Slice& user_key,
+                                      const Slice& blob_index);
+  bool SetValueAndColumnsFromBlob(const Slice& user_key,
+                                  const Slice& blob_index);
 
   bool SetValueAndColumnsFromEntity(Slice slice);
+  bool MaterializeLazyEntityColumns() const;
 
   bool SetValueAndColumnsFromMergeResult(const Status& merge_status,
                                          ValueType result_type);
 
-  void ResetValueAndColumns() {
-    value_.clear();
-    wide_columns_.clear();
-  }
+  void ResetValueAndColumns() { value_columns_state_.Reset(); }
+
+  void ResetBlobData() { blob_state_.Reset(); }
 
   // The following methods perform the actual merge operation for the
-  // no base value/plain base value/wide-column base value cases.
+  // no/plain/blob/wide-column base value cases.
   // If user-defined timestamp is enabled, `user_key` includes timestamp.
   bool MergeWithNoBaseValue(const Slice& user_key);
   bool MergeWithPlainBaseValue(const Slice& value, const Slice& user_key);
+  bool MergeWithBlobBaseValue(const Slice& blob_index, const Slice& user_key);
   bool MergeWithWideColumnBaseValue(const Slice& entity, const Slice& user_key);
 
-  bool PrepareValue() {
+  bool PrepareValueInternal() {
+    // Capture this before PrepareValue(): PrepareValue() updates the wrapper
+    // state to "prepared" on success. We still call PrepareValue()
+    // unconditionally to preserve its contract/error handling, but only need
+    // to re-parse ikey_ when this call may have actually materialized the
+    // underlying iterator value/key.
+    const bool value_was_prepared = iter_.IsValuePrepared();
     if (!iter_.PrepareValue()) {
       assert(!iter_.status().ok());
       valid_ = false;
@@ -345,10 +560,93 @@ class DBIter final : public Iterator {
     // lookup and index_iter_ could point to different block resulting
     // in ikey_ pointing to wrong key. So ikey_ needs to be updated in
     // case of Seek/Next calls to point to right key again.
-    if (!ParseKey(&ikey_)) {
+    if (!value_was_prepared && !ParseKey(&ikey_)) {
       return false;
     }
     return true;
+  }
+
+  // Record a deletion into the current contiguous tombstone run.
+  // In forward iteration, first_key is set only for the first tombstone
+  // (always_update_first_key=false). In reverse, keys arrive in decreasing
+  // order so first_key is updated every time (always_update_first_key=true).
+  void TrackContiguousTombstone(const Slice& user_key,
+                                bool always_update_first_key);
+
+  // If a contiguous tombstone run is pending, insert a range tombstone
+  // (if threshold is met) and reset tracking state.  When
+  // check_prefix_match is true, the insertion is skipped (but tracking is
+  // still reset) if end_key is outside the seek prefix.
+  void FlushPendingTombstoneRun(const Slice& end_key,
+                                bool check_prefix_match = false);
+
+  // If enough contiguous tombstones have been tracked, insert a range
+  // tombstone [first_key, end_key) into the mutable memtable.
+  // end_key is the exclusive upper bound -- typically the next live key.
+  void MaybeInsertRangeTombstone(const Slice& end_key);
+  void ResetContiguousTombstoneTracking() {
+    contiguous_tombstone_count_ = 0;
+    range_tomb_first_key_.Clear();
+    range_tomb_end_key_.Clear();
+  }
+
+  // Returns true if there is no prefix constraint (prefix_ not set) or
+  // if `key` is in the prefix extractor's domain and its prefix matches.
+  // Out-of-domain keys return false when a prefix is set.
+  bool PrefixCheck(const Slice& key) const {
+    return !prefix_.has_value() || (prefix_extractor_->InDomain(key) &&
+                                    prefix_extractor_->Transform(key).compare(
+                                        prefix_->GetUserKey()) == 0);
+  }
+
+  // Returns true if a prefix should be extracted from the seek target and
+  // used for prefix boundary tracking. True when prefix_same_as_start is
+  // set, or when range tombstone conversion is enabled during a legacy
+  // prefix seek. If target is out of domain then false is returned.
+  bool ShouldSetPrefix(const Slice& target) const {
+    return (prefix_same_as_start_ ||
+            (min_tombstones_for_range_conversion_ > 0 &&
+             !expect_total_order_inner_iter_)) &&
+           prefix_extractor_->InDomain(target);
+  }
+
+  void ResetSeekState() {
+    ReleaseTempPinnedData();
+    ResetBlobData();
+    ResetValueAndColumns();
+    ResetInternalKeysSkippedCounter();
+    ResetContiguousTombstoneTracking();
+    prefix_.reset();
+  }
+
+  void MarkMemtableForFlushForAvgTrigger() {
+    if (avg_op_scan_flush_trigger_ &&
+        mem_hidden_op_scanned_since_seek_ >= memtable_op_scan_flush_trigger_ &&
+        mem_hidden_op_scanned_since_seek_ >=
+            static_cast<uint64_t>(iter_step_since_seek_) *
+                avg_op_scan_flush_trigger_) {
+      assert(memtable_op_scan_flush_trigger_ > 0);
+      active_mem_->MarkForFlush();
+      avg_op_scan_flush_trigger_ = 0;
+      memtable_op_scan_flush_trigger_ = 0;
+    }
+    iter_step_since_seek_ = 1;
+    mem_hidden_op_scanned_since_seek_ = 0;
+  }
+
+  void MarkMemtableForFlushForPerOpTrigger(uint64_t& mem_hidden_op_scanned) {
+    if (memtable_op_scan_flush_trigger_ &&
+        ikey_.sequence >= memtable_seqno_lb_) {
+      if (++mem_hidden_op_scanned >= memtable_op_scan_flush_trigger_) {
+        active_mem_->MarkForFlush();
+        // Turn off the flush trigger checks.
+        memtable_op_scan_flush_trigger_ = 0;
+        avg_op_scan_flush_trigger_ = 0;
+      }
+      if (avg_op_scan_flush_trigger_) {
+        ++mem_hidden_op_scanned_since_seek_;
+      }
+    }
   }
 
   const SliceTransform* prefix_extractor_;
@@ -358,7 +656,15 @@ class DBIter final : public Iterator {
   UserComparatorWrapper user_comparator_;
   const MergeOperator* const merge_operator_;
   IteratorWrapper iter_;
-  const Version* version_;
+  // TODO: blob_state_'s BlobReader (whole-value blob reads + the merge entity
+  // path) and value_columns_state_'s ReadPathBlobResolver (lazy per-column
+  // entity resolution) each own a Version-backed blob fetcher with the same
+  // {version, read_options, blob_file_cache, allow_write_path_fallback}, so an
+  // iterator holds two ReadOptions copies. Collapse to a single shared fetcher.
+  // Deferred because the resolver must keep owning its fetcher for the planned
+  // lazy entity read path, where the result outlives the read call and owns the
+  // SuperVersion pin; unifying is best done together with that work.
+  DirtyTracked<BlobState> blob_state_;
   ReadCallback* read_callback_;
   // Max visible sequence number. It is normally the snapshot seq unless we have
   // uncommitted data in db as in WriteUnCommitted.
@@ -375,14 +681,8 @@ class DBIter final : public Iterator {
   // kTypeValuePreferredSeqno entry, this is the write time specified by the
   // user.
   uint64_t saved_write_unix_time_;
-  std::string saved_value_;
+  DirtyTracked<ValueColumnsState> value_columns_state_;
   Slice pinned_value_;
-  // for prefix seek mode to support prev()
-  PinnableSlice blob_value_;
-  // Value of the default column
-  Slice value_;
-  // All columns (i.e. name-value pairs)
-  WideColumns wide_columns_;
   Statistics* statistics_;
   uint64_t max_skip_;
   uint64_t max_skippable_internal_keys_;
@@ -390,14 +690,40 @@ class DBIter final : public Iterator {
   const Slice* iterate_lower_bound_;
   const Slice* iterate_upper_bound_;
 
-  // The prefix of the seek key. It is only used when prefix_same_as_start_
-  // is true and prefix extractor is not null. In Next() or Prev(), current keys
-  // will be checked against this prefix, so that the iterator can be
-  // invalidated if the keys in this prefix has been exhausted. Set it using
-  // SetUserKey() and use it using GetUserKey().
-  IterKey prefix_;
+  // The prefix of the seek key. Set during Seek/SeekForPrev when either
+  // prefix_same_as_start_ is true or the iterator uses prefix filtering
+  // (!expect_total_order_inner_iter_ && InDomain(target)). Used in Next()
+  // and Prev() to:
+  //  - invalidate the iterator when prefix_same_as_start_ is true and keys
+  //    in this prefix have been exhausted.
+  //  - bound range tombstone tracking to the seek prefix when
+  //    min_tombstones_for_range_conversion_ > 0.
+  // Set via SetUserKey(), read via GetUserKey().
+  std::optional<IterKey> prefix_;
 
   Status status_;
+
+  // List of operands for merge operator.
+  MergeContext merge_context_;
+  LocalStatistics local_stats_;
+  PinnedIteratorsManager pinned_iters_mgr_;
+  DBImpl* trace_db_;
+  uint32_t trace_cf_id_;
+  bool has_trace_state_;
+  port::RWMutex* ingest_sst_lock_;
+  const Slice* const timestamp_ub_;
+  const Slice* const timestamp_lb_;
+  const size_t timestamp_size_;
+  std::string saved_timestamp_;
+  std::optional<MultiScanArgs> scan_opts_;
+  size_t scan_index_{0};
+  ReadOnlyMemTable* const active_mem_;
+  SequenceNumber memtable_seqno_lb_;
+  uint32_t memtable_op_scan_flush_trigger_;
+  uint32_t avg_op_scan_flush_trigger_;
+  uint32_t iter_step_since_seek_;
+  uint32_t mem_hidden_op_scanned_since_seek_;
+  uint32_t contiguous_tombstone_count_;
   Direction direction_;
   bool valid_;
   bool current_entry_is_merged_;
@@ -412,35 +738,14 @@ class DBIter final : public Iterator {
   // Expect the inner iterator to maintain a total order.
   // prefix_extractor_ must be non-NULL if the value is false.
   const bool expect_total_order_inner_iter_;
-  ReadTier read_tier_;
-  bool fill_cache_;
-  bool verify_checksums_;
+  const uint32_t min_tombstones_for_range_conversion_;
   // Whether the iterator is allowed to expose blob references. Set to true when
   // the stacked BlobDB implementation is used, false otherwise.
   bool expose_blob_index_;
-  bool is_blob_;
+  bool allow_unprepared_value_;
   bool arena_mode_;
-  const Env::IOActivity io_activity_;
-  // List of operands for merge operator.
-  MergeContext merge_context_;
-  LocalStatistics local_stats_;
-  PinnedIteratorsManager pinned_iters_mgr_;
-  ColumnFamilyHandleImpl* cfh_;
-  const Slice* const timestamp_ub_;
-  const Slice* const timestamp_lb_;
-  const size_t timestamp_size_;
-  std::string saved_timestamp_;
+
+  IterKey range_tomb_first_key_;
+  IterKey range_tomb_end_key_;
 };
-
-// Return a new iterator that converts internal keys (yielded by
-// "*internal_iter") that were live at the specified `sequence` number
-// into appropriate user keys.
-Iterator* NewDBIterator(
-    Env* env, const ReadOptions& read_options, const ImmutableOptions& ioptions,
-    const MutableCFOptions& mutable_cf_options,
-    const Comparator* user_key_comparator, InternalIterator* internal_iter,
-    const Version* version, const SequenceNumber& sequence,
-    uint64_t max_sequential_skip_in_iterations, ReadCallback* read_callback,
-    ColumnFamilyHandleImpl* cfh = nullptr, bool expose_blob_index = false);
-
 }  // namespace ROCKSDB_NAMESPACE

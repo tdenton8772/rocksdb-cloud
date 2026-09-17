@@ -2047,7 +2047,7 @@ TEST_F(DBRangeDelTest, IteratorReseek) {
   // Immutable memtable
   ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(1),
                              Key(2)));
-  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
   std::string value;
   ASSERT_TRUE(dbfull()->GetProperty(db_->DefaultColumnFamily(),
                                     "rocksdb.num-immutable-mem-table", &value));
@@ -3559,6 +3559,79 @@ TEST_F(DBRangeDelTest, MemtableMaxRangeDeletions) {
   ASSERT_EQ(3, NumTableFilesAtLevel(0));
 }
 
+TEST_F(DBRangeDelTest, FlushReasonStatsMemtableMaxRangeDeletions) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.disable_auto_compactions = true;
+  options.memtable_max_range_deletions = 1;
+
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  flush_listener->expected_flush_reason =
+      FlushReason::kMemtableMaxRangeDeletions;
+  options.listeners.push_back(flush_listener);
+
+  DestroyAndReopen(options);
+
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(0),
+                             Key(10)));
+  // The next write observes the pending flush request.
+  ASSERT_OK(Put(Key(0), "value"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+  const uint64_t range_delete_flushes =
+      TestGetTickerCount(options, FLUSH_REASON_MEMTABLE_MAX_RANGE_DELETIONS);
+  ASSERT_GT(range_delete_flushes, 0);
+  EXPECT_EQ(0, TestGetTickerCount(options, FLUSH_REASON_WRITE_BUFFER_FULL));
+  EXPECT_EQ(0, TestGetTickerCount(options, FLUSH_REASON_WRITE_BUFFER_MANAGER));
+  EXPECT_EQ(0, TestGetTickerCount(
+                   options,
+                   ATOMIC_FLUSH_REQUEST_REASON_MEMTABLE_MAX_RANGE_DELETIONS));
+  EXPECT_EQ(0, TestGetTickerCount(options, ATOMIC_FLUSH_REQUEST_REASON_OTHER));
+  EXPECT_EQ(range_delete_flushes,
+            static_cast<uint64_t>(flush_listener->count.load()));
+}
+
+TEST_F(DBRangeDelTest, AtomicFlushReasonStatsMemtableMaxRangeDeletions) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.atomic_flush = true;
+  options.disable_auto_compactions = true;
+  options.memtable_max_range_deletions = 1;
+
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  flush_listener->expected_flush_reason =
+      FlushReason::kMemtableMaxRangeDeletions;
+  options.listeners.push_back(flush_listener);
+
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  ASSERT_OK(Put(1, Key(0), "value"));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), Key(0),
+                             Key(10)));
+  // The next write observes the pending flush request.
+  ASSERT_OK(Put(Key(0), "value"));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+  const uint64_t range_delete_flushes =
+      TestGetTickerCount(options, FLUSH_REASON_MEMTABLE_MAX_RANGE_DELETIONS);
+  ASSERT_GE(range_delete_flushes, 2);
+  EXPECT_EQ(1, TestGetTickerCount(
+                   options,
+                   ATOMIC_FLUSH_REQUEST_REASON_MEMTABLE_MAX_RANGE_DELETIONS));
+  EXPECT_EQ(0, TestGetTickerCount(options, FLUSH_REASON_WRITE_BUFFER_FULL));
+  EXPECT_EQ(0, TestGetTickerCount(
+                   options, ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_FULL));
+  EXPECT_EQ(0, TestGetTickerCount(
+                   options, ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_MANAGER));
+  EXPECT_EQ(0, TestGetTickerCount(options, ATOMIC_FLUSH_REQUEST_REASON_OTHER));
+  EXPECT_EQ(range_delete_flushes,
+            static_cast<uint64_t>(flush_listener->count.load()));
+}
+
 TEST_F(DBRangeDelTest, RangeDelReseekAfterFileReadError) {
   // This is to test a bug that is fixed in
   // https://github.com/facebook/rocksdb/pull/11786.
@@ -3806,6 +3879,108 @@ TEST_F(DBRangeDelTest, RefreshWithSnapshot) {
   iter.reset();
   db_->ReleaseSnapshot(snapshot);
 }
+
+TEST_F(DBRangeDelTest, RowCache) {
+  Options options = CurrentOptions();
+  options.row_cache = NewLRUCache(8 << 10);
+  DestroyAndReopen(options);
+  ASSERT_OK(Put(Key(3), "val"));
+  ASSERT_TRUE(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(),
+                               Key(3), Key(5))
+                  .IsNotSupported());
+  WriteBatch wb;
+  ASSERT_OK(wb.Put(Key(6), "abc"));
+  ASSERT_OK(wb.DeleteRange(Key(1), Key(5)));
+  ASSERT_TRUE(db_->Write(WriteOptions(), &wb).IsNotSupported());
+  ASSERT_EQ(Get(Key(3)), "val");
+  // By default, memtable insertion failure will turn the DB to read-only mode.
+  // The check for delete range should happen before that to fail early
+  // and should not turn db into read-only mdoe.
+  ASSERT_OK(Put(Key(5), "foo"));
+}
+
+TEST_F(DBRangeDelTest, SeekForPrevTest) {
+  // open db
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.compaction_style = kCompactionStyleUniversal;
+
+  // add SST partitioner, split sst file with prefix length 2
+  options.sst_partitioner_factory = NewSstPartitionerFixedPrefixFactory(2);
+  Reopen(options);
+
+  // File uses SST partitioner, so it will be split into 3 files
+  // SST file 1: ka1, ka2
+  // SST file 2: kb1
+  // SST file 3: kc1, kc2
+  // Delete range covers from ka2 to kc2, which means record ka2 and kb1, kc1
+  // are covered by the delete range
+
+  std::vector<std::pair<std::string, std::string>> kv = {{"ka1", "value_1"},
+                                                         {"ka2", "value_2"},
+                                                         {"kb1", "value_3"},
+                                                         {"kc1", "value_4"},
+                                                         {"kc2", "value_5"}};
+  for (auto& p : kv) {
+    ASSERT_OK(Put(p.first, p.second));
+  }
+
+  ASSERT_OK(Flush());
+  // Compact to Lmax, it should have seq 0 now.
+  ASSERT_OK(CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Open an iterator and create a snapshot, so that keys are not deleted
+  // completely by delete range in SST
+  ReadOptions read_opts;
+  read_opts.snapshot = db_->GetSnapshot();
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_opts));
+  iter->SeekToFirst();
+  // iterate all the keys and validate the value
+  for (int i = 0; iter->Valid(); iter->Next()) {
+    ASSERT_EQ(kv[i].first, iter->key().ToString());
+    ASSERT_EQ(kv[i].second, iter->value().ToString());
+    i++;
+  }
+
+  // use delete range to delete the record
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), db_->DefaultColumnFamily(), "ka2",
+                             "kc2"));
+  // Flush
+  ASSERT_OK(Flush());
+  // Compact to Lmax
+  ASSERT_OK(CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Close the iterator and release the snapshot.
+  ASSERT_OK(iter->status());
+  iter.reset();
+  db_->ReleaseSnapshot(read_opts.snapshot);
+
+  // create second iterator, seek each key and validate result
+  std::unique_ptr<Iterator> iter2(db_->NewIterator(ReadOptions()));
+  // Validate keys are deleted
+  iter2->SeekToFirst();
+  ASSERT_TRUE(iter2->Valid());
+  ASSERT_EQ("ka1", iter2->key().ToString());
+  iter2->Next();
+  ASSERT_TRUE(iter2->Valid());
+  ASSERT_EQ("kc2", iter2->key().ToString());
+  iter2->Next();
+  ASSERT_FALSE(iter2->Valid());
+
+  // Validate seek for prev result
+  for (auto& p : kv) {
+    iter2->SeekForPrev(p.first);
+    ASSERT_TRUE(iter2->Valid());
+    if (p.first == "kc2") {
+      ASSERT_EQ("kc2", iter2->key().ToString());
+    } else {
+      ASSERT_EQ("ka1", iter2->key().ToString());
+    }
+  }
+  ASSERT_OK(iter2->status());
+  iter2.reset();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

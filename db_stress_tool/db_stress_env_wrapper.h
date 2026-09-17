@@ -9,10 +9,27 @@
 
 #ifdef GFLAGS
 #pragma once
+
 #include "db_stress_tool/db_stress_common.h"
+#include "file/filename.h"
 #include "monitoring/thread_status_util.h"
+#include "rocksdb/file_checksum.h"
 
 namespace ROCKSDB_NAMESPACE {
+namespace {
+void CheckIOActivity(const IOOptions& options) {
+#ifndef NDEBUG
+  const ThreadStatus::OperationType thread_op =
+      ThreadStatusUtil::GetThreadOperation();
+  Env::IOActivity io_activity =
+      ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
+  assert(io_activity == Env::IOActivity::kUnknown ||
+         io_activity == options.io_activity);
+#else
+  (void)options;
+#endif
+}
+}  // namespace
 class DbStressRandomAccessFileWrapper : public FSRandomAccessFileOwnerWrapper {
  public:
   explicit DbStressRandomAccessFileWrapper(
@@ -74,6 +91,13 @@ class DbStressRandomAccessFileWrapper : public FSRandomAccessFileOwnerWrapper {
     return target()->ReadAsync(req, options, cb, cb_arg, io_handle, del_fn,
                                dbg);
   }
+
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& options,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* dbg) override {
+    CheckIOActivity(options);
+    return target()->SubmitReadAsync(req, options, std::move(cb), dbg);
+  }
 };
 
 class DbStressWritableFileWrapper : public FSWritableFileOwnerWrapper {
@@ -83,144 +107,67 @@ class DbStressWritableFileWrapper : public FSWritableFileOwnerWrapper {
 
   IOStatus Append(const Slice& data, const IOOptions& options,
                   IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Append(data, options, dbg);
   }
   IOStatus Append(const Slice& data, const IOOptions& options,
                   const DataVerificationInfo& verification_info,
                   IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Append(data, options, verification_info, dbg);
   }
   IOStatus PositionedAppend(const Slice& data, uint64_t offset,
                             const IOOptions& options,
                             IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->PositionedAppend(data, offset, options, dbg);
   }
   IOStatus PositionedAppend(const Slice& data, uint64_t offset,
                             const IOOptions& options,
                             const DataVerificationInfo& verification_info,
                             IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->PositionedAppend(data, offset, options, verification_info,
                                       dbg);
   }
 
   IOStatus Truncate(uint64_t size, const IOOptions& options,
                     IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Truncate(size, options, dbg);
   }
 
   IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Close(options, dbg);
   }
 
   IOStatus Flush(const IOOptions& options, IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Flush(options, dbg);
   }
 
   IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Sync(options, dbg);
   }
 
   IOStatus Fsync(const IOOptions& options, IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Fsync(options, dbg);
   }
 
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   IOStatus Allocate(uint64_t offset, uint64_t len, const IOOptions& options,
                     IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->Allocate(offset, len, options, dbg);
   }
 #endif
 
   IOStatus RangeSync(uint64_t offset, uint64_t nbytes, const IOOptions& options,
                      IODebugContext* dbg) override {
-#ifndef NDEBUG
-    const ThreadStatus::OperationType thread_op =
-        ThreadStatusUtil::GetThreadOperation();
-    Env::IOActivity io_activity =
-        ThreadStatusUtil::TEST_GetExpectedIOActivity(thread_op);
-    assert(io_activity == Env::IOActivity::kUnknown ||
-           io_activity == options.io_activity);
-#endif
+    CheckIOActivity(options);
     return target()->RangeSync(offset, nbytes, options, dbg);
   }
 };
@@ -236,6 +183,35 @@ class DbStressFSWrapper : public FileSystemWrapper {
                                const FileOptions& file_opts,
                                std::unique_ptr<FSRandomAccessFile>* r,
                                IODebugContext* dbg) override {
+    // verify that file checksums are propagated through FileOptions
+    // for SST file opens.
+
+    std::string basename = f.substr(f.rfind('/') + 1);
+    uint64_t file_number;
+    FileType file_type;
+    if (ParseFileName(basename, &file_number, &file_type) &&
+        file_type == kTableFile) {
+      // file_checksum_func_name must always be populated to be sure each call
+      // site within RocksDB is intentional about populating the fields with the
+      // best available information:
+      //  - kNoFileChecksumFuncName: no checksum context available
+      //    (e.g., SstFileDumper, SstFileReader, checksum generation),
+      //    always paired with empty checksum
+      //  - kUnknownFileChecksumFuncName: file created without a
+      //    checksum factory (from MANIFEST), always paired with
+      //    empty checksum
+      //  - a real name (e.g., "FileChecksumCrc32c"): checksum exists
+      assert(!file_opts.file_checksum_func_name.empty());
+      if (file_opts.file_checksum_func_name == kUnknownFileChecksumFuncName ||
+          file_opts.file_checksum_func_name == kNoFileChecksumFuncName) {
+        // No checksum available -- checksum value must be empty
+        assert(file_opts.file_checksum.empty());
+      } else {
+        // A real checksum function -- checksum value must be present
+        assert(!file_opts.file_checksum.empty());
+      }
+    }
+
     std::unique_ptr<FSRandomAccessFile> file;
     IOStatus s = target()->NewRandomAccessFile(f, file_opts, &file, dbg);
     if (s.ok()) {

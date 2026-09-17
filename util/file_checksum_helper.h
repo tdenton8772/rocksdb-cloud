@@ -4,18 +4,24 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #pragma once
-#include <cassert>
+
 #include <unordered_map>
 
-#include "port/port.h"
-#include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
-#include "rocksdb/status.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/math.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Converts a 32-bit checksum value (e.g. a CRC32C) to its hex string
+// representation, matching the on-disk/backup-metadata encoding. Shared by the
+// backup and copy engines.
+inline std::string ChecksumInt32ToHex(uint32_t checksum_value) {
+  std::string checksum_str;
+  PutFixed32(&checksum_str, EndianSwapValue(checksum_value));
+  return Slice(checksum_str).ToString(/*hex=*/true);
+}
 
 // This is the class to generate the file checksum based on Crc32. It
 // will be used as the default checksum method for SST file checksum
@@ -91,11 +97,5 @@ class FileChecksumListImpl : public FileChecksumList {
   std::unordered_map<uint64_t, std::pair<std::string, std::string>>
       checksum_map_;
 };
-
-// If manifest_file_size < std::numeric_limits<uint64_t>::max(), only use
-// that length prefix of the manifest file.
-Status GetFileChecksumsFromManifest(Env* src_env, const std::string& abs_path,
-                                    uint64_t manifest_file_size,
-                                    FileChecksumList* checksum_list);
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -6,7 +6,7 @@
 #pragma once
 
 #if defined(__clang__) && defined(__GLIBC__)
-// glibc's `posix_memalign()` declaration specifies `throw()` while clang's
+// glibc's `posix_memalign()` declaration specifies `noexcept` while clang's
 // declaration does not. There is a hack in clang to make its re-declaration
 // compatible with glibc's if they are declared consecutively. That hack breaks
 // if yet another `posix_memalign()` declaration comes between glibc's and
@@ -14,7 +14,7 @@
 // declarations both come before "jemalloc.h"'s `posix_memalign()` declaration.
 //
 // This problem could also be avoided if "jemalloc.h"'s `posix_memalign()`
-// declaration did not specify `throw()` when built with clang.
+// declaration did not specify `noexcept` when built with clang.
 #include <mm_malloc.h>
 #endif
 
@@ -59,33 +59,31 @@ static inline bool HasJemalloc() { return true; }
 
 // Declare non-standard jemalloc APIs as weak symbols. We can null-check these
 // symbols to detect whether jemalloc is linked with the binary.
-extern "C" JEMALLOC_ALLOCATOR JEMALLOC_RESTRICT_RETURN void JEMALLOC_NOTHROW *
+extern "C" JEMALLOC_ALLOCATOR JEMALLOC_RESTRICT_RETURN void JEMALLOC_NOTHROW*
 mallocx(size_t, int) JEMALLOC_ATTR(malloc) JEMALLOC_ALLOC_SIZE(1)
     __attribute__((__weak__));
-extern "C" JEMALLOC_ALLOCATOR JEMALLOC_RESTRICT_RETURN void JEMALLOC_NOTHROW *
-rallocx(void *, size_t, int) JEMALLOC_ALLOC_SIZE(2) __attribute__((__weak__));
-extern "C" size_t JEMALLOC_NOTHROW xallocx(void *, size_t, size_t, int)
+extern "C" JEMALLOC_ALLOCATOR JEMALLOC_RESTRICT_RETURN void JEMALLOC_NOTHROW*
+rallocx(void*, size_t, int) JEMALLOC_ALLOC_SIZE(2) __attribute__((__weak__));
+extern "C" size_t JEMALLOC_NOTHROW xallocx(void*, size_t, size_t, int)
     __attribute__((__weak__));
-extern "C" size_t JEMALLOC_NOTHROW sallocx(const void *, int)
-    JEMALLOC_ATTR(pure) __attribute__((__weak__));
-extern "C" void JEMALLOC_NOTHROW dallocx(void *, int) __attribute__((__weak__));
-extern "C" void JEMALLOC_NOTHROW sdallocx(void *, size_t, int)
+extern "C" size_t JEMALLOC_NOTHROW sallocx(const void*, int) JEMALLOC_ATTR(pure)
+    __attribute__((__weak__));
+extern "C" void JEMALLOC_NOTHROW dallocx(void*, int) __attribute__((__weak__));
+extern "C" void JEMALLOC_NOTHROW sdallocx(void*, size_t, int)
     __attribute__((__weak__));
 extern "C" size_t JEMALLOC_NOTHROW nallocx(size_t, int) JEMALLOC_ATTR(pure)
     __attribute__((__weak__));
-extern "C" int JEMALLOC_NOTHROW mallctl(const char *, void *, size_t *, void *,
+extern "C" int JEMALLOC_NOTHROW mallctl(const char*, void*, size_t*, void*,
                                         size_t) __attribute__((__weak__));
-extern "C" int JEMALLOC_NOTHROW mallctlnametomib(const char *, size_t *,
-                                                 size_t *)
+extern "C" int JEMALLOC_NOTHROW mallctlnametomib(const char*, size_t*, size_t*)
     __attribute__((__weak__));
-extern "C" int JEMALLOC_NOTHROW mallctlbymib(const size_t *, size_t, void *,
-                                             size_t *, void *, size_t)
+extern "C" int JEMALLOC_NOTHROW mallctlbymib(const size_t*, size_t, void*,
+                                             size_t*, void*, size_t)
     __attribute__((__weak__));
-extern "C" void JEMALLOC_NOTHROW
-malloc_stats_print(void (*)(void *, const char *), void *, const char *)
-    __attribute__((__weak__));
+extern "C" void JEMALLOC_NOTHROW malloc_stats_print(
+    void (*)(void*, const char*), void*, const char*) __attribute__((__weak__));
 extern "C" size_t JEMALLOC_NOTHROW
-malloc_usable_size(JEMALLOC_USABLE_SIZE_CONST void *) JEMALLOC_CXX_THROW
+malloc_usable_size(JEMALLOC_USABLE_SIZE_CONST void*) JEMALLOC_CXX_THROW
     __attribute__((__weak__));
 
 // Check if Jemalloc is linked with the binary. Note the main program might be

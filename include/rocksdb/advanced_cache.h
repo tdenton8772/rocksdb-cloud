@@ -41,7 +41,7 @@ class Statistics;
 //
 // INTERNAL: See typed_cache.h for convenient wrappers on top of this API.
 // New virtual functions must also be added to CacheWrapper below.
-class Cache {
+class Cache : public Customizable {
  public:  // types hidden from API client
   // Opaque handle to an entry stored in the cache.
   struct Handle {};
@@ -152,7 +152,12 @@ class Cache {
 
     // For helpers without SecondaryCache support
     explicit CacheItemHelper(CacheEntryRole _role, DeleterFn _del_cb = nullptr)
-        : CacheItemHelper(_role, _del_cb, nullptr, nullptr, nullptr, this) {}
+        : del_cb(_del_cb),
+          size_cb(nullptr),
+          saveto_cb(nullptr),
+          create_cb(nullptr),
+          role(_role),
+          without_secondary_compat(this) {}
 
     // For helpers with SecondaryCache support
     explicit CacheItemHelper(CacheEntryRole _role, DeleterFn _del_cb,
@@ -189,6 +194,8 @@ class Cache {
 
   // Destroys all remaining entries by calling the associated "deleter"
   virtual ~Cache() {}
+
+  static const char* Type() { return "Cache"; }
 
   // Creates a new Cache based on the input value string and returns the result.
   // Currently, this method can be used to create LRUCaches only
@@ -316,7 +323,7 @@ class Cache {
   // REQUIRES: handle must have been returned by a method on *this.
   virtual bool Release(Handle* handle, bool erase_if_last_ref = false) = 0;
 
-  // Return the object assiciated with a handle returned by a successful
+  // Return the object associated with a handle returned by a successful
   // Lookup(). For historical reasons, this is also known at the "value"
   // associated with the key.
   // REQUIRES: handle must not have been released yet.
@@ -411,6 +418,14 @@ class Cache {
                                const CacheItemHelper* helper)>& callback,
       const ApplyToAllEntriesOptions& opts) = 0;
 
+  // Apply a callback to a cache handle. The Cache must ensure the lifetime
+  // of the key passed to the callback is valid for the duration of the
+  // callback. The handle may not belong to the cache, but is guaranteed to
+  // be type compatible.
+  virtual void ApplyToHandle(
+      Cache* cache, Handle* handle,
+      const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
+                               const CacheItemHelper* helper)>& callback) = 0;
   // Remove all entries.
   // Prerequisite: no entry is referenced.
   virtual void EraseUnRefEntries() = 0;
@@ -634,6 +649,15 @@ class CacheWrapper : public Cache {
                                const CacheItemHelper* helper)>& callback,
       const ApplyToAllEntriesOptions& opts) override {
     target_->ApplyToAllEntries(callback, opts);
+  }
+
+  virtual void ApplyToHandle(
+      Cache* cache, Handle* handle,
+      const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
+                               const CacheItemHelper* helper)>& callback)
+      override {
+    auto cache_ptr = static_cast<CacheWrapper*>(cache);
+    target_->ApplyToHandle(cache_ptr->target_.get(), handle, callback);
   }
 
   void EraseUnRefEntries() override { target_->EraseUnRefEntries(); }

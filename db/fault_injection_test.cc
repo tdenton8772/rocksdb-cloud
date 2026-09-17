@@ -12,6 +12,7 @@
 // file data (or entire files) not protected by a "sync".
 
 #include "db/db_impl/db_impl.h"
+#include "db/db_test_util.h"
 #include "db/log_format.h"
 #include "db/version_set.h"
 #include "env/mock_env.h"
@@ -75,7 +76,7 @@ class FaultInjectionTest
   std::string dbname_;
   std::shared_ptr<Cache> tiny_cache_;
   Options options_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
 
   FaultInjectionTest()
       : option_config_(std::get<1>(GetParam())),
@@ -259,15 +260,15 @@ class FaultInjectionTest
     return Slice(*storage);
   }
 
-  void CloseDB() {
-    delete db_;
-    db_ = nullptr;
-  }
+  void CloseDB() { db_.reset(); }
 
   Status OpenDB() {
     CloseDB();
     env_->ResetState();
     Status s = DB::Open(options_, dbname_, &db_);
+    if (!s.ok()) {
+      return s;
+    }
     assert(db_ != nullptr);
     return s;
   }
@@ -347,7 +348,8 @@ class FaultInjectionTest
   }
 
   void WaitCompactionFinish() {
-    ASSERT_OK(static_cast<DBImpl*>(db_->GetRootDB())->TEST_WaitForCompact());
+    ASSERT_OK(static_cast_with_check<DBImpl>(db_->GetRootDB())
+                  ->TEST_WaitForCompact());
     ASSERT_OK(db_->Put(WriteOptions(), "", ""));
   }
 
@@ -545,76 +547,6 @@ TEST_P(FaultInjectionTest, WriteBatchWalTerminationTest) {
   ASSERT_EQ(db_->Get(ro, "boys", &val), Status::NotFound());
 }
 
-TEST_P(FaultInjectionTest, NoDuplicateTrailingEntries) {
-  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
-  fault_fs->EnableWriteErrorInjection();
-  fault_fs->SetFilesystemDirectWritable(false);
-  const std::string file_name = NormalizePath(dbname_ + "/test_file");
-  std::unique_ptr<log::Writer> log_writer = nullptr;
-  constexpr uint64_t log_number = 0;
-  {
-    std::unique_ptr<FSWritableFile> file;
-    const Status s =
-        fault_fs->NewWritableFile(file_name, FileOptions(), &file, nullptr);
-    ASSERT_OK(s);
-    std::unique_ptr<WritableFileWriter> fwriter(
-        new WritableFileWriter(std::move(file), file_name, FileOptions()));
-    log_writer.reset(new log::Writer(std::move(fwriter), log_number,
-                                     /*recycle_log_files=*/false));
-  }
-
-  fault_fs->SetRandomWriteError(
-      0xdeadbeef, /*one_in=*/1, IOStatus::IOError("Injected IOError"),
-      /*inject_for_all_file_types=*/true, /*types=*/{});
-
-  {
-    VersionEdit edit;
-    edit.SetColumnFamily(0);
-    std::string buf;
-    assert(edit.EncodeTo(&buf));
-    const Status s = log_writer->AddRecord(WriteOptions(), buf);
-    ASSERT_NOK(s);
-  }
-
-  fault_fs->DisableWriteErrorInjection();
-
-  // Closing the log writer will cause WritableFileWriter::Close() and flush
-  // remaining data from its buffer to underlying file.
-  log_writer.reset();
-
-  {
-    std::unique_ptr<FSSequentialFile> file;
-    Status s =
-        fault_fs->NewSequentialFile(file_name, FileOptions(), &file, nullptr);
-    ASSERT_OK(s);
-    std::unique_ptr<SequentialFileReader> freader(
-        new SequentialFileReader(std::move(file), file_name));
-    Status log_read_s;
-    class LogReporter : public log::Reader::Reporter {
-     public:
-      Status* status_;
-      explicit LogReporter(Status* _s) : status_(_s) {}
-      void Corruption(size_t /*bytes*/, const Status& _s) override {
-        if (status_->ok()) {
-          *status_ = _s;
-        }
-      }
-    } reporter(&log_read_s);
-    std::unique_ptr<log::Reader> log_reader(new log::Reader(
-        nullptr, std::move(freader), &reporter, /*checksum=*/true, log_number));
-    Slice record;
-    std::string data;
-    size_t count = 0;
-    while (log_reader->ReadRecord(&record, &data) && log_read_s.ok()) {
-      VersionEdit edit;
-      ASSERT_OK(edit.DecodeFrom(data));
-      ++count;
-    }
-    // Verify that only one version edit exists in the file.
-    ASSERT_EQ(1, count);
-  }
-}
-
 INSTANTIATE_TEST_CASE_P(
     FaultTest, FaultInjectionTest,
     ::testing::Values(std::make_tuple(false, kDefault, kEnd),
@@ -627,6 +559,165 @@ INSTANTIATE_TEST_CASE_P(
                       std::make_tuple(false, kSyncWal, kEnd),
                       std::make_tuple(true, kSyncWal, kEnd)));
 
+class FaultInjectionDBTest : public DBTestBase {
+ public:
+  FaultInjectionDBTest()
+      : DBTestBase("fault_injection_fs_test", /*env_do_fsync=*/false) {}
+};
+
+TEST(FaultInjectionFSTest, ReadUnsyncedData) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  fault_fs->SetInjectUnsyncedDataLoss(true);
+  ASSERT_TRUE(fault_fs->ReadUnsyncedData());
+  ASSERT_TRUE(fault_fs->InjectUnsyncedDataLoss());
+
+  // This is a randomized mini-stress test, to reduce the chances of bugs in
+  // FaultInjectionTestFS being caught only in db_stress, where they are
+  // difficult to debug. ~1000 iterations might be needed to debug relevant
+  // code changes. Limiting to 10 for each regular unit test run.
+  auto seed = Random::GetTLSInstance()->Next();
+  for (int i = 0; i < 10; i++, seed++) {
+    Random rnd(seed);
+    uint32_t len = rnd.Uniform(10000) + 1;
+
+    std::string f =
+        test::PerThreadDBPath("read_unsynced." + std::to_string(seed));
+    std::string data = rnd.RandomString(len);
+
+    // Create partially synced file
+    std::unique_ptr<FSWritableFile> w;
+    ASSERT_OK(fault_fs->NewWritableFile(f, {}, &w, nullptr));
+    uint32_t synced_len = rnd.Uniform(len + 1);
+    ASSERT_OK(w->Append(Slice(data.data(), synced_len), {}, nullptr));
+    if (synced_len > 0) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+    ASSERT_OK(w->Append(Slice(data.data() + synced_len, len - synced_len), {},
+                        nullptr));
+
+    // Test file size includes unsynced data
+    {
+      uint64_t file_size;
+      ASSERT_OK(fault_fs->GetFileSize(f, {}, &file_size, nullptr));
+      ASSERT_EQ(len, file_size);
+    }
+
+    // Test read file contents, with two reads that probably don't
+    // align with the unsynced split. And maybe a sync or write between
+    // the two reads.
+    std::unique_ptr<FSSequentialFile> r;
+    ASSERT_OK(fault_fs->NewSequentialFile(f, {}, &r, nullptr));
+    uint32_t first_read_len = rnd.Uniform(len + 1);
+    Slice sl;
+    std::unique_ptr<char[]> scratch(new char[first_read_len]);
+    ASSERT_OK(r->Read(first_read_len, {}, &sl, scratch.get(), nullptr));
+    ASSERT_EQ(first_read_len, sl.size());
+    ASSERT_EQ(0, sl.compare(Slice(data.data(), first_read_len)));
+
+    // Maybe a sync and/or write and/or close between the two reads.
+    if (rnd.OneIn(2)) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+    if (rnd.OneIn(2)) {
+      uint32_t more_len = rnd.Uniform(1000) + 1;
+      std::string more_data = rnd.RandomString(more_len);
+      ASSERT_OK(w->Append(more_data, {}, nullptr));
+      data += more_data;
+      len += more_len;
+    }
+    if (rnd.OneIn(2)) {
+      ASSERT_OK(w->Sync({}, nullptr));
+    }
+    if (rnd.OneIn(2)) {
+      ASSERT_OK(w->Close({}, nullptr));
+      w.reset();
+    }
+
+    // Second read some of, all of, or more than rest of file
+    uint32_t second_read_len = rnd.Uniform(len + 1);
+    scratch.reset(new char[second_read_len]);
+    ASSERT_OK(r->Read(second_read_len, {}, &sl, scratch.get(), nullptr));
+    if (len - first_read_len < second_read_len) {
+      ASSERT_EQ(len - first_read_len, sl.size());
+    } else {
+      ASSERT_EQ(second_read_len, sl.size());
+    }
+    ASSERT_EQ(0, sl.compare(Slice(data.data() + first_read_len, sl.size())));
+  }
+}
+
+TEST(FaultInjectionFSTest, FileOpenContractRejectsReadersWhileOpenForWrite) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  const std::string fname = test::PerThreadDBPath(
+      "file_open_contract_no_readers_while_open_for_write");
+
+  FileOptions writer_options;
+  writer_options.open_contract = FileOpenContract::kNoReadersWhileOpenForWrite;
+
+  std::unique_ptr<FSWritableFile> writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &writer, nullptr));
+
+  std::unique_ptr<FSRandomAccessFile> reader;
+  IOStatus s =
+      fault_fs->NewRandomAccessFile(fname, FileOptions(), &reader, nullptr);
+  ASSERT_TRUE(s.IsNotSupported());
+
+  ASSERT_OK(writer->Close(IOOptions(), nullptr));
+  ASSERT_OK(
+      fault_fs->NewRandomAccessFile(fname, FileOptions(), &reader, nullptr));
+}
+
+TEST(FaultInjectionFSTest,
+     FileOpenContractAllowsSyncFileButRejectsReopenedWrite) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  const std::string fname =
+      test::PerThreadDBPath("file_open_contract_no_reopen_for_write");
+
+  FileOptions writer_options;
+  writer_options.open_contract = FileOpenContract::kNoReopenForWrite;
+
+  std::unique_ptr<FSWritableFile> writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &writer, nullptr));
+  ASSERT_OK(writer->Append("abc", IOOptions(), nullptr));
+  ASSERT_OK(writer->Close(IOOptions(), nullptr));
+
+  ASSERT_OK(fault_fs->SyncFile(fname, FileOptions(), IOOptions(),
+                               /*use_fsync=*/false, nullptr));
+
+  std::unique_ptr<FSWritableFile> reopened_writer;
+  ASSERT_OK(fault_fs->ReopenWritableFile(fname, FileOptions(), &reopened_writer,
+                                         nullptr));
+  IOStatus s = reopened_writer->Append("d", IOOptions(), nullptr);
+  ASSERT_TRUE(s.IsNotSupported());
+  ASSERT_OK(reopened_writer->Close(IOOptions(), nullptr));
+}
+
+TEST(FaultInjectionFSTest, FileOpenContractAllowsCreateAfterDelete) {
+  std::shared_ptr<FaultInjectionTestFS> fault_fs =
+      std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  const std::string fname =
+      test::PerThreadDBPath("file_open_contract_recreate_after_delete");
+
+  FileOptions writer_options;
+  writer_options.open_contract = FileOpenContract::kNoReopenForWrite;
+
+  std::unique_ptr<FSWritableFile> writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &writer, nullptr));
+  ASSERT_OK(writer->Append("abc", IOOptions(), nullptr));
+  ASSERT_OK(writer->Close(IOOptions(), nullptr));
+
+  ASSERT_OK(FileSystem::Default()->DeleteFile(fname, IOOptions(), nullptr));
+
+  std::unique_ptr<FSWritableFile> recreated_writer;
+  ASSERT_OK(fault_fs->NewWritableFile(fname, writer_options, &recreated_writer,
+                                      nullptr));
+  ASSERT_OK(recreated_writer->Append("def", IOOptions(), nullptr));
+  ASSERT_OK(recreated_writer->Close(IOOptions(), nullptr));
+  ASSERT_OK(fault_fs->DeleteFile(fname, IOOptions(), nullptr));
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

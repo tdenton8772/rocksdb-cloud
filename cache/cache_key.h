@@ -44,13 +44,13 @@ class CacheKey {
   inline Slice AsSlice() const {
     static_assert(sizeof(*this) == 16, "Standardized on 16-byte cache key");
     assert(!IsEmpty());
-    return Slice(reinterpret_cast<const char *>(this), sizeof(*this));
+    return Slice(reinterpret_cast<const char*>(this), sizeof(*this));
   }
 
   // Create a CacheKey that is unique among others associated with this Cache
   // instance. Depends on Cache::NewId. This is useful for block cache
   // "reservations".
-  static CacheKey CreateUniqueForCacheLifetime(Cache *cache);
+  static CacheKey CreateUniqueForCacheLifetime(Cache* cache);
 
   // Create a CacheKey that is unique among others for the lifetime of this
   // process. This is useful for saving in a static data member so that
@@ -87,7 +87,7 @@ class OffsetableCacheKey : private CacheKey {
 
   // Constructs an OffsetableCacheKey with the given information about a file.
   // This constructor never generates an "empty" base key.
-  OffsetableCacheKey(const std::string &db_id, const std::string &db_session_id,
+  OffsetableCacheKey(const std::string& db_id, const std::string& db_session_id,
                      uint64_t file_number);
 
   // Creates an OffsetableCacheKey from an SST unique ID, so that cache keys
@@ -127,6 +127,24 @@ class OffsetableCacheKey : private CacheKey {
     return CacheKey(file_num_etc64_, offset_etc64_ ^ offset);
   }
 
+  // Construct a CacheKey for a record located at byte `offset` within a file in
+  // which every distinct cached region is at least 5 bytes long. The low two
+  // offset bits are dropped, which is collision-free under that >= 5-byte (>= 4
+  // would suffice) guarantee and lets different kinds of records in the same
+  // file share a single keyspace without colliding.
+  //
+  // This is the canonical cache-key scheme for byte-offset records that carry
+  // the block-based "min 5 byte" guarantee: block-based SST blocks (see
+  // BlockBasedTable::GetCacheKey) and SimpleGen2Blob records (which always
+  // include a >= 5-byte trailer; see db/blob/blob_gen2_format.h). Because both
+  // use this same function, an SST's data blocks and its embedded blob records
+  // never collide even when the block cache and blob cache are the same cache.
+  // Keeping a single implementation here avoids a divergence bug that would
+  // silently alias the two keyspaces.
+  inline CacheKey WithOffsetForMinSizeRecord(uint64_t offset) const {
+    return WithOffset(offset >> 2);
+  }
+
   // The "common prefix" is a shared prefix for all the returned CacheKeys.
   // It is specific to the file but the same for all offsets within the file.
   static constexpr size_t kCommonPrefixSize = 8;
@@ -134,9 +152,9 @@ class OffsetableCacheKey : private CacheKey {
     static_assert(sizeof(file_num_etc64_) == kCommonPrefixSize,
                   "8 byte common prefix expected");
     assert(!IsEmpty());
-    assert(&this->file_num_etc64_ == static_cast<const void *>(this));
+    assert(&this->file_num_etc64_ == static_cast<const void*>(this));
 
-    return Slice(reinterpret_cast<const char *>(this), kCommonPrefixSize);
+    return Slice(reinterpret_cast<const char*>(this), kCommonPrefixSize);
   }
 };
 

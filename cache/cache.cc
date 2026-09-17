@@ -54,11 +54,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct CompressedSecondaryCacheOptions, compression_type),
           OptionType::kCompressionType, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
-        {"compress_format_version",
-         {offsetof(struct CompressedSecondaryCacheOptions,
-                   compress_format_version),
-          OptionType::kUInt32T, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
         {"enable_custom_split_merge",
          {offsetof(struct CompressedSecondaryCacheOptions,
                    enable_custom_split_merge),
@@ -118,7 +113,6 @@ Status SecondaryCache::CreateFromString(
       sec_cache = NewCompressedSecondaryCache(sec_cache_opts);
     }
 
-
     if (status.ok()) {
       result->swap(sec_cache);
     }
@@ -133,19 +127,25 @@ Status Cache::CreateFromString(const ConfigOptions& config_options,
                                std::shared_ptr<Cache>* result) {
   Status status;
   std::shared_ptr<Cache> cache;
-  if (value.find('=') == std::string::npos) {
-    cache = NewLRUCache(ParseSizeT(value));
-  } else {
-    LRUCacheOptions cache_opts;
-    status = OptionTypeInfo::ParseStruct(config_options, "",
-                                         &lru_cache_options_type_info, "",
-                                         value, &cache_opts);
-    if (status.ok()) {
-      cache = NewLRUCache(cache_opts);
+  if (StartsWith(value, "null")) {
+    cache = nullptr;
+  } else if (value.find("://") == std::string::npos) {
+    if (value.find('=') == std::string::npos) {
+      cache = NewLRUCache(ParseSizeT(value));
+    } else {
+      LRUCacheOptions cache_opts;
+      status = OptionTypeInfo::ParseStruct(config_options, "",
+                                           &lru_cache_options_type_info, "",
+                                           value, &cache_opts);
+      if (status.ok()) {
+        cache = NewLRUCache(cache_opts);
+      }
     }
-  }
-  if (status.ok()) {
-    result->swap(cache);
+    if (status.ok()) {
+      result->swap(cache);
+    }
+  } else {
+    status = LoadSharedObject<Cache>(config_options, value, result);
   }
   return status;
 }

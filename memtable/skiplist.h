@@ -34,10 +34,9 @@
 #include <assert.h>
 #include <stdlib.h>
 
-#include <atomic>
-
 #include "memory/allocator.h"
 #include "port/port.h"
+#include "util/atomic.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -64,8 +63,9 @@ class SkipList {
   // Returns true iff an entry that compares equal to key is in the list.
   bool Contains(const Key& key) const;
 
-  // Return estimated number of entries smaller than `key`.
-  uint64_t EstimateCount(const Key& key) const;
+  // Return estimated number of entries from `start_ikey` to `end_ikey`.
+  uint64_t ApproximateNumEntries(const Slice& start_ikey,
+                                 const Slice& end_ikey) const;
 
   // Iteration over the contents of a skip list
   class Iterator {
@@ -127,18 +127,16 @@ class SkipList {
 
   // Modified only by Insert().  Read racily by readers, but stale
   // values are ok.
-  std::atomic<int> max_height_;  // Height of the entire list
+  RelaxedAtomic<int> max_height_;  // Height of the entire list
 
   // Used for optimizing sequential insert patterns.  Tricky.  prev_[i] for
   // i up to max_height_ is the predecessor of prev_[0] and prev_height_
   // is the height of prev_[0].  prev_[0] can only be equal to head before
   // insertion, in which case max_height_ and prev_height_ are 1.
-  Node** prev_;
   int32_t prev_height_;
+  Node** prev_;
 
-  inline int GetMaxHeight() const {
-    return max_height_.load(std::memory_order_relaxed);
-  }
+  inline int GetMaxHeight() const { return max_height_.LoadRelaxed(); }
 
   Node* NewNode(const Key& key, int height);
   int RandomHeight();
@@ -178,35 +176,35 @@ struct SkipList<Key, Comparator>::Node {
     assert(n >= 0);
     // Use an 'acquire load' so that we observe a fully initialized
     // version of the returned Node.
-    return (next_[n].load(std::memory_order_acquire));
+    return (next_[n].Load());
   }
   void SetNext(int n, Node* x) {
     assert(n >= 0);
     // Use a 'release store' so that anybody who reads through this
     // pointer observes a fully initialized version of the inserted node.
-    next_[n].store(x, std::memory_order_release);
+    next_[n].Store(x);
   }
 
   // No-barrier variants that can be safely used in a few locations.
   Node* NoBarrier_Next(int n) {
     assert(n >= 0);
-    return next_[n].load(std::memory_order_relaxed);
+    return next_[n].LoadRelaxed();
   }
   void NoBarrier_SetNext(int n, Node* x) {
     assert(n >= 0);
-    next_[n].store(x, std::memory_order_relaxed);
+    next_[n].StoreRelaxed(x);
   }
 
  private:
   // Array of length equal to the node height.  next_[0] is lowest level link.
-  std::atomic<Node*> next_[1];
+  Atomic<Node*> next_[1];
 };
 
 template <typename Key, class Comparator>
 typename SkipList<Key, Comparator>::Node* SkipList<Key, Comparator>::NewNode(
     const Key& key, int height) {
-  char* mem = allocator_->AllocateAligned(
-      sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1));
+  char* mem = allocator_->AllocateAligned(sizeof(Node) +
+                                          sizeof(Atomic<Node*>) * (height - 1));
   return new (mem) Node(key);
 }
 
@@ -383,27 +381,49 @@ typename SkipList<Key, Comparator>::Node* SkipList<Key, Comparator>::FindLast()
 }
 
 template <typename Key, class Comparator>
-uint64_t SkipList<Key, Comparator>::EstimateCount(const Key& key) const {
+uint64_t SkipList<Key, Comparator>::ApproximateNumEntries(
+    const Slice& start_ikey, const Slice& end_ikey) const {
+  // See InlineSkipList<Comparator>::ApproximateNumEntries() (copy-paste)
+  Node* lb = head_;
+  Node* ub = nullptr;
   uint64_t count = 0;
-
-  Node* x = head_;
-  int level = GetMaxHeight() - 1;
-  while (true) {
-    assert(x == head_ || compare_(x->key, key) < 0);
-    Node* next = x->Next(level);
-    if (next == nullptr || compare_(next->key, key) >= 0) {
-      if (level == 0) {
-        return count;
-      } else {
-        // Switch to next list
-        count *= kBranching_;
-        level--;
+  for (int level = GetMaxHeight() - 1; level >= 0; level--) {
+    auto sufficient_samples = static_cast<uint64_t>(level) * kBranching_ + 10U;
+    if (count >= sufficient_samples) {
+      // No more counting; apply powers of kBranching and avoid floating point
+      count *= kBranching_;
+      continue;
+    }
+    count = 0;
+    Node* next;
+    // Get a more precise lower bound (for start key)
+    for (;;) {
+      next = lb->Next(level);
+      if (next == ub) {
+        break;
       }
-    } else {
-      x = next;
+      assert(next != nullptr);
+      if (compare_(next->Key(), start_ikey) >= 0) {
+        break;
+      }
+      lb = next;
+    }
+    // Count entries on this level until upper bound (for end key)
+    for (;;) {
+      if (next == ub) {
+        break;
+      }
+      assert(next != nullptr);
+      if (compare_(next->Key(), end_ikey) >= 0) {
+        // Save refined upper bound to potentially save key comparison
+        ub = next;
+        break;
+      }
       count++;
+      next = next->Next(level);
     }
   }
+  return count;
 }
 
 template <typename Key, class Comparator>
@@ -415,7 +435,7 @@ SkipList<Key, Comparator>::SkipList(const Comparator cmp, Allocator* allocator,
       kScaledInverseBranching_((Random::kMaxNext + 1) / kBranching_),
       compare_(cmp),
       allocator_(allocator),
-      head_(NewNode(0 /* any key will do */, max_height)),
+      head_(NewNode({} /* any key will do */, max_height)),
       max_height_(1),
       prev_height_(1) {
   assert(max_height > 0 && kMaxHeight_ == static_cast<uint32_t>(max_height));
@@ -471,7 +491,7 @@ void SkipList<Key, Comparator>::Insert(const Key& key) {
     // the loop below.  In the former case the reader will
     // immediately drop to the next level since nullptr sorts after all
     // keys.  In the latter case the reader will use the new node.
-    max_height_.store(height, std::memory_order_relaxed);
+    max_height_.StoreRelaxed(height);
   }
 
   Node* x = NewNode(key, height);

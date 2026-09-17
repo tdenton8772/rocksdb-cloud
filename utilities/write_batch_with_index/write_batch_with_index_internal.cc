@@ -22,10 +22,13 @@ namespace ROCKSDB_NAMESPACE {
 BaseDeltaIterator::BaseDeltaIterator(ColumnFamilyHandle* column_family,
                                      Iterator* base_iterator,
                                      WBWIIteratorImpl* delta_iterator,
-                                     const Comparator* comparator)
+                                     const Comparator* comparator,
+                                     const ReadOptions* read_options)
     : forward_(true),
       current_at_base_(true),
       equal_keys_(false),
+      allow_unprepared_value_(
+          read_options ? read_options->allow_unprepared_value : false),
       status_(Status::OK()),
       column_family_(column_family),
       base_iterator_(base_iterator),
@@ -39,7 +42,8 @@ BaseDeltaIterator::BaseDeltaIterator(ColumnFamilyHandle* column_family,
 BaseDeltaIterator::~BaseDeltaIterator() = default;
 
 bool BaseDeltaIterator::Valid() const {
-  return status_.ok() ? (current_at_base_ ? BaseValid() : DeltaValid()) : false;
+  return status().ok() ? (current_at_base_ ? BaseValid() : DeltaValid())
+                       : false;
 }
 
 void BaseDeltaIterator::SeekToFirst() {
@@ -86,14 +90,22 @@ void BaseDeltaIterator::Next() {
     equal_keys_ = false;
     if (!BaseValid()) {
       assert(DeltaValid());
+      // During reverse scan, base iter was exhausted. This means the
+      // base iter has no smaller key than the current key at delta iter.
+      // So seeking to the first key of base iter will point to base iter's
+      // first key that is at least the current key.
       base_iterator_->SeekToFirst();
     } else if (!DeltaValid()) {
+      // Similar to the base iter case above, position delta iter to the first
+      // entry that is at least the current key.
       delta_iterator_->SeekToFirst();
     } else if (current_at_base_) {
-      // Change delta from larger than base to smaller
+      // current_at_base_ means delta iter is at its first key that is less
+      // than current key. So advance delta one step moves it to the first
+      // key that is at least the current key.
       AdvanceDelta();
     } else {
-      // Change base from larger than delta to smaller
+      // Similar to the case above.
       AdvanceBase();
     }
     if (DeltaValid() && BaseValid()) {
@@ -262,6 +274,17 @@ void BaseDeltaIterator::SetValueAndColumnsFromBase() {
   assert(value_.empty());
   assert(columns_.empty());
 
+  if (!base_iterator_->PrepareValue()) {
+    assert(!BaseValid());
+    assert(!base_iterator_->status().ok());
+
+    Invalidate(base_iterator_->status());
+
+    assert(!Valid());
+    assert(!status().ok());
+    return;
+  }
+
   value_ = base_iterator_->value();
   columns_ = base_iterator_->columns();
 }
@@ -275,14 +298,19 @@ void BaseDeltaIterator::SetValueAndColumnsFromDelta() {
   WriteEntry delta_entry = delta_iterator_->Entry();
 
   if (merge_context_.GetNumOperands() == 0) {
+    // delete case is handled at callsites, see UpdateCurrent().
+    assert(delta_entry.type == kPutRecord ||
+           delta_entry.type == kPutEntityRecord);
     if (delta_entry.type == kPutRecord) {
       value_ = delta_entry.value;
       columns_.emplace_back(kDefaultWideColumnName, value_);
     } else if (delta_entry.type == kPutEntityRecord) {
       Slice value_copy(delta_entry.value);
 
-      status_ = WideColumnSerialization::Deserialize(value_copy, columns_);
+      status_ =
+          WideColumnSerialization::DeserializeSimple(value_copy, columns_);
       if (!status_.ok()) {
+        columns_.clear();
         return;
       }
 
@@ -313,6 +341,17 @@ void BaseDeltaIterator::SetValueAndColumnsFromDelta() {
         /* result_operand */ nullptr, &result_type);
   } else if (delta_entry.type == kMergeRecord) {
     if (equal_keys_) {
+      if (!base_iterator_->PrepareValue()) {
+        assert(!BaseValid());
+        assert(!base_iterator_->status().ok());
+
+        Invalidate(base_iterator_->status());
+
+        assert(!Valid());
+        assert(!status().ok());
+        return;
+      }
+
       if (WideColumnsHelper::HasDefaultColumnOnly(base_iterator_->columns())) {
         status_ = WriteBatchWithIndexInternal::MergeKeyWithBaseValue(
             column_family_, delta_entry.key, MergeHelper::kPlainBaseValue,
@@ -340,8 +379,9 @@ void BaseDeltaIterator::SetValueAndColumnsFromDelta() {
   if (result_type == kTypeWideColumnEntity) {
     Slice entity(merge_result_);
 
-    status_ = WideColumnSerialization::Deserialize(entity, columns_);
+    status_ = WideColumnSerialization::DeserializeSimple(entity, columns_);
     if (!status_.ok()) {
+      columns_.clear();
       return;
     }
 
@@ -384,13 +424,14 @@ void BaseDeltaIterator::UpdateCurrent() {
         return;
       }
 
-      // Base has finished.
       if (!DeltaValid()) {
-        // Finished
+        // Finished, neither base nor delta is valid.
         return;
       }
+      // Base is done, delta has value.
       if (delta_result == WBWIIteratorImpl::kDeleted &&
           merge_context_.GetNumOperands() == 0) {
+        // This key is deleted and no Merge is done after Delete.
         AdvanceDelta();
       } else {
         current_at_base_ = false;
@@ -398,11 +439,14 @@ void BaseDeltaIterator::UpdateCurrent() {
         return;
       }
     } else if (!DeltaValid()) {
-      // Delta has finished.
+      // Delta is done, base has value.
       current_at_base_ = true;
-      SetValueAndColumnsFromBase();
+      if (!allow_unprepared_value_) {
+        SetValueAndColumnsFromBase();
+      }
       return;
     } else {
+      // Both are valid.
       int compare =
           (forward_ ? 1 : -1) * comparator_->CompareWithoutTimestamp(
                                     delta_entry.key, /*a_has_ts=*/false,
@@ -413,6 +457,7 @@ void BaseDeltaIterator::UpdateCurrent() {
         }
         if (delta_result != WBWIIteratorImpl::kDeleted ||
             merge_context_.GetNumOperands() > 0) {
+          // delta is visible
           current_at_base_ = false;
           SetValueAndColumnsFromDelta();
           return;
@@ -423,17 +468,23 @@ void BaseDeltaIterator::UpdateCurrent() {
           AdvanceBase();
         }
       } else {
+        // base smaller than delta
         current_at_base_ = true;
-        SetValueAndColumnsFromBase();
+        if (!allow_unprepared_value_) {
+          SetValueAndColumnsFromBase();
+        }
         return;
       }
     }
+    // delta <= base and is not visible (most recent update is delete)
+    // move on to the next key
   }
 
   AssertInvariants();
 #endif  // __clang_analyzer__
 }
 
+// Move forward/backward until the iterator is at a different key.
 void WBWIIteratorImpl::AdvanceKey(bool forward) {
   if (Valid()) {
     Slice key = Entry().key;
@@ -484,18 +535,17 @@ WBWIIteratorImpl::Result WBWIIteratorImpl::FindLatestUpdate(
              0) {
     return result;
   } else {
-    // We want to iterate in the reverse order that the writes were added to the
-    // batch.  Since we don't have a reverse iterator, we must seek past the
-    // end. We do this by seeking to the next key, and then back one step
-    NextKey();
+    // Need to move to the first entry of the current key
+    // We may not always be at the first entry, e.g., after SeekToLast() or a
+    // SeekForPrev().
+    AdvanceKey(false);
     if (Valid()) {
-      Prev();
+      Next();
     } else {
-      SeekToLast();
+      SeekToFirst();
     }
-
-    // We are at the end of the iterator for this key.  Search backwards for the
-    // last Put or Delete, accumulating merges along the way.
+    // We are at the first and most recent entry for this key, search forward
+    // until a non-Merge entry, accumulating merges along the way.
     while (Valid()) {
       const WriteEntry entry = Entry();
       if (comparator_->CompareKey(column_family_id_, entry.key, key) != 0) {
@@ -520,18 +570,21 @@ WBWIIteratorImpl::Result WBWIIteratorImpl::FindLatestUpdate(
         case kPutEntityRecord:
           return WBWIIteratorImpl::kFound;
         default:
+          assert(false);
           return WBWIIteratorImpl::kError;
       }  // end switch statement
-      Prev();
+      Next();
     }  // End while Valid()
     // At this point, we have been through the whole list and found no Puts or
-    // Deletes. The iterator points to the previous key.  Move the iterator back
-    // onto this one.
+    // Deletes. The iterator points to the next key.  Move the iterator back
+    // to the last entry of this key (see comment for FindLatestUpdate()).
     if (Valid()) {
-      Next();
+      Prev();
     } else {
-      SeekToFirst();
+      SeekToLast();
     }
+    assert(Valid());
+    assert(comparator_->CompareKey(column_family_id_, Entry().key, key) == 0);
   }
   return result;
 }
@@ -619,7 +672,8 @@ Status ReadableWriteBatch::GetEntryFromDataOffset(size_t data_offset,
 // 2. Inside the same CF, we first decode the entry to find the key of the entry
 //    and the entry with larger key will be larger;
 // 3. If two entries are of the same CF and key, the one with larger offset
-//    will be larger.
+//    will be smaller. This follows the internal key order where keys
+//    with larger sequence number (larger offset here) will be ordered first.
 // Some times either `entry1` or `entry2` is dummy entry, which is actually
 // a search key. In this case, in step 2, we don't go ahead and decode the
 // entry but use the value in WriteBatchIndexEntry::search_key.
@@ -660,9 +714,9 @@ int WriteBatchEntryComparator::operator()(
   int cmp = CompareKey(entry1->column_family, key1, key2);
   if (cmp != 0) {
     return cmp;
-  } else if (entry1->offset > entry2->offset) {
-    return 1;
   } else if (entry1->offset < entry2->offset) {
+    return 1;
+  } else if (entry1->offset > entry2->offset) {
     return -1;
   }
   return 0;
@@ -840,6 +894,9 @@ WBWIIteratorImpl::Result WriteBatchWithIndexInternal::GetFromBatchImpl(
         Traits::ClearOutput(output);
         result = WBWIIteratorImpl::Result::kError;
       }
+    } else {
+      Traits::ClearOutput(output);
+      *s = Status::OK();
     }
 
     return result;
@@ -873,10 +930,17 @@ WBWIIteratorImpl::Result WriteBatchWithIndexInternal::GetFromBatch(
     static Status SetWideColumnValue(const Slice& entity, OutputType* output) {
       assert(output);
 
-      Slice entity_copy = entity;
       Slice value_of_default;
-      const Status s = WideColumnSerialization::GetValueOfDefaultColumn(
-          entity_copy, value_of_default);
+      bool is_blob_reference = false;
+      Status s = WideColumnSerialization::GetValueOfDefaultColumn(
+          entity, value_of_default, is_blob_reference);
+      if (s.ok() && is_blob_reference) {
+        // WriteBatchWithIndex entities are written via PutEntity (V1, no blob
+        // references); a blob-backed default column is unexpected here and this
+        // in-memory path cannot resolve it.
+        s = Status::NotSupported(
+            "Blob-backed default column not supported in WriteBatchWithIndex");
+      }
       if (!s.ok()) {
         ClearOutput(output);
         return s;

@@ -29,12 +29,12 @@ class UserComparatorWrapper {
   const Comparator* user_comparator() const { return user_comparator_; }
 
   int Compare(const Slice& a, const Slice& b) const {
-    // PERF_COUNTER_ADD(user_key_comparison_count, 1); // RocksDB-Cloud disabled
+    PERF_COUNTER_ADD(user_key_comparison_count, 1);
     return user_comparator_->Compare(a, b);
   }
 
   bool Equal(const Slice& a, const Slice& b) const {
-    // PERF_COUNTER_ADD(user_key_comparison_count, 1); // RocksDB-Cloud disabled
+    PERF_COUNTER_ADD(user_key_comparison_count, 1);
     return user_comparator_->Equal(a, b);
   }
 
@@ -43,13 +43,13 @@ class UserComparatorWrapper {
   }
 
   int CompareWithoutTimestamp(const Slice& a, const Slice& b) const {
-    // PERF_COUNTER_ADD(user_key_comparison_count, 1); // RocksDB-Cloud disabled
+    PERF_COUNTER_ADD(user_key_comparison_count, 1);
     return user_comparator_->CompareWithoutTimestamp(a, b);
   }
 
   int CompareWithoutTimestamp(const Slice& a, bool a_has_ts, const Slice& b,
                               bool b_has_ts) const {
-    // PERF_COUNTER_ADD(user_key_comparison_count, 1); // RocksDB-Cloud disabled
+    PERF_COUNTER_ADD(user_key_comparison_count, 1);
     return user_comparator_->CompareWithoutTimestamp(a, a_has_ts, b, b_has_ts);
   }
 

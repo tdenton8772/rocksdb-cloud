@@ -10,8 +10,18 @@
 
 #include "rocksdb/perf_level.h"
 
+/*
+ * NOTE:
+ * If you plan to add new metrics, please read documentation in perf_level.h and
+ * try to come up with a metric name that follows the naming conventions
+ * mentioned there. It helps to indicate the metric's starting enabling P
+ * erfLevel. Document this starting PerfLevel if the metric name cannot meet the
+ * naming conventions.
+ */
+
 // A thread local context for gathering io-stats efficiently and transparently.
 // Use SetPerfLevel(PerfLevel::kEnableTime) to enable time stats.
+//
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -22,28 +32,56 @@ struct FileIOByTemperature {
   uint64_t hot_file_bytes_read;
   // the number of bytes read to Temperature::kWarm file
   uint64_t warm_file_bytes_read;
+  // the number of bytes read to Temperature::kCool file
+  uint64_t cool_file_bytes_read;
   // the number of bytes read to Temperature::kCold file
   uint64_t cold_file_bytes_read;
+  // the number of bytes read to Temperature::kIce file
+  uint64_t ice_file_bytes_read;
+  // the number of bytes read to Temperature::kUnknown file not in last level
+  uint64_t unknown_non_last_level_bytes_read;
+  // the number of bytes read to Temperature::kUnknown file in last level
+  uint64_t unknown_last_level_bytes_read;
   // total number of reads to Temperature::kHot file
   uint64_t hot_file_read_count;
   // total number of reads to Temperature::kWarm file
   uint64_t warm_file_read_count;
+  // total number of reads to Temperature::kCool file
+  uint64_t cool_file_read_count;
   // total number of reads to Temperature::kCold file
   uint64_t cold_file_read_count;
+  // total number of reads to Temperature::kIce file
+  uint64_t ice_file_read_count;
+  // total number of reads to Temperature::kUnknown file not in last level
+  uint64_t unknown_non_last_level_read_count;
+  // total number of reads to Temperature::kUnknown file in last level
+  uint64_t unknown_last_level_read_count;
+
   // reset all the statistics to 0.
   void Reset() {
     hot_file_bytes_read = 0;
     warm_file_bytes_read = 0;
+    cool_file_bytes_read = 0;
     cold_file_bytes_read = 0;
+    ice_file_bytes_read = 0;
+    unknown_non_last_level_bytes_read = 0;
+    unknown_last_level_bytes_read = 0;
     hot_file_read_count = 0;
     warm_file_read_count = 0;
+    cool_file_read_count = 0;
     cold_file_read_count = 0;
+    ice_file_read_count = 0;
+    unknown_non_last_level_read_count = 0;
+    unknown_last_level_read_count = 0;
   }
+
+  void Merge(const FileIOByTemperature& other);
 };
 
 struct IOStatsContext {
   // reset all io-stats counter to zero
   void Reset();
+  void Merge(const IOStatsContext& other);
 
   std::string ToString(bool exclude_zero_counters = false) const;
 
@@ -73,7 +111,8 @@ struct IOStatsContext {
   uint64_t logger_nanos;
   // CPU time spent in write() and pwrite()
   uint64_t cpu_write_nanos;
-  // CPU time spent in read() and pread()
+  // CPU time spent in read() and pread(). Not supported for async read
+  // requests.
   uint64_t cpu_read_nanos;
 
   FileIOByTemperature file_io_stats_by_temperature;

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <climits>
 #include <cstdint>
 #include <forward_list>
 #include <functional>
@@ -21,6 +22,7 @@
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
+#include "rocksdb/utilities/checkpoint.h"
 
 namespace ROCKSDB_NAMESPACE {
 class BackupEngineReadOnlyBase;
@@ -31,7 +33,7 @@ constexpr char kDbFileChecksumFuncName[] = "FileChecksumCrc32c";
 // The default BackupEngine file checksum function name.
 constexpr char kBackupFileChecksumFuncName[] = "crc32c";
 
-struct BackupEngineOptions {
+struct BackupEngineOptions : public CheckpointOrBackupEngineOptions {
   // Where to keep the backup files. Has to be different than dbname_
   // Best to set this to dbname_ + "/backups"
   // Required
@@ -54,11 +56,6 @@ struct BackupEngineOptions {
   // default: true
   bool share_table_files;
 
-  // Backup info and error messages will be written to info_log
-  // if non-nullptr.
-  // Default: nullptr
-  Logger* info_log;
-
   // If sync == true, we can guarantee you'll get consistent backup and
   // restore even on a machine crash/reboot. Backup and restore processes are
   // slower with sync enabled. If sync == false, we can only guarantee that
@@ -76,19 +73,6 @@ struct BackupEngineOptions {
   // memory.
   // Default: true
   bool backup_log_files;
-
-  // Max bytes that can be transferred in a second during backup.
-  // If 0, go as fast as you can
-  // This limit only applies to writes. To also limit reads,
-  // a rate limiter able to also limit reads (e.g, its mode = kAllIo)
-  // have to be passed in through the option "backup_rate_limiter"
-  // Default: 0
-  uint64_t backup_rate_limit;
-
-  // Backup rate limiter. Used to control transfer speed for backup. If this is
-  // not null, backup_rate_limit is ignored.
-  // Default: nullptr
-  std::shared_ptr<RateLimiter> backup_rate_limiter{nullptr};
 
   // Max bytes that can be transferred in a second during restore.
   // If 0, go as fast as you can
@@ -116,11 +100,6 @@ struct BackupEngineOptions {
   //
   // Default: true
   bool share_files_with_checksum;
-
-  // Up to this many background threads will copy files for CreateNewBackup()
-  // and RestoreDBFromBackup()
-  // Default: 1
-  int max_background_operations;
 
   // During backup user can get callback every time next
   // callback_trigger_interval_size bytes being copied.
@@ -228,23 +207,25 @@ struct BackupEngineOptions {
       const std::string& _backup_dir, Env* _backup_env = nullptr,
       bool _share_table_files = true, Logger* _info_log = nullptr,
       bool _sync = true, bool _destroy_old_data = false,
-      bool _backup_log_files = true, uint64_t _backup_rate_limit = 0,
-      uint64_t _restore_rate_limit = 0, int _max_background_operations = 1,
+      bool _backup_log_files = true, uint64_t _io_buffer_size = 0,
+      uint64_t _backup_rate_limit = 0, uint64_t _restore_rate_limit = 0,
+      int _max_background_operations = 1,
       uint64_t _callback_trigger_interval_size = 4 * 1024 * 1024,
       int _max_valid_backups_to_open = INT_MAX,
       ShareFilesNaming _share_files_with_checksum_naming =
           static_cast<ShareFilesNaming>(kUseDbSessionId | kFlagIncludeFileSize))
-      : backup_dir(_backup_dir),
+      : CheckpointOrBackupEngineOptions{_info_log, _io_buffer_size,
+                                        _backup_rate_limit,
+                                        /*backup_rate_limiter=*/nullptr,
+                                        _max_background_operations},
+        backup_dir(_backup_dir),
         backup_env(_backup_env),
         share_table_files(_share_table_files),
-        info_log(_info_log),
         sync(_sync),
         destroy_old_data(_destroy_old_data),
         backup_log_files(_backup_log_files),
-        backup_rate_limit(_backup_rate_limit),
         restore_rate_limit(_restore_rate_limit),
         share_files_with_checksum(true),
-        max_background_operations(_max_background_operations),
         callback_trigger_interval_size(_callback_trigger_interval_size),
         max_valid_backups_to_open(_max_valid_backups_to_open),
         share_files_with_checksum_naming(_share_files_with_checksum_naming) {
@@ -294,10 +275,13 @@ struct MaybeExcludeBackupFile {
   bool exclude_decision = false;
 };
 
-struct CreateBackupOptions {
+struct CreateBackupOptions : public CreateCheckpointOrBackupOptions {
   // Flush will always trigger if 2PC is enabled.
   // If write-ahead logs are disabled, set flush_before_backup=true to
   // avoid losing unflushed key/value pairs from the memtable.
+  //
+  // NOTE: If LockWAL() is active and WAL-disabled writes left unpersisted data,
+  // backup may wait for UnlockWAL() before it can flush.
   bool flush_before_backup = false;
 
   // Callback for reporting progress, based on callback_trigger_interval_size.
@@ -328,16 +312,50 @@ struct CreateBackupOptions {
                      MaybeExcludeBackupFile* files_end)>
       exclude_files_callback = {};
 
-  // If false, background_thread_cpu_priority is ignored.
-  // Otherwise, the cpu priority can be decreased,
-  // if you try to increase the priority, the priority will not change.
-  // The initial priority of the threads is CpuPriority::kNormal,
-  // so you can decrease to priorities lower than kNormal.
-  bool decrease_background_thread_cpu_priority = false;
-  CpuPriority background_thread_cpu_priority = CpuPriority::kNormal;
+  // If true, use atomic flush to flush all column families atomically
+  // before creating the backup. This ensures cross-CF consistency without
+  // needing WAL files. When combined with
+  // BackupEngineOptions::backup_log_files=false, this allows skipping WAL
+  // backup safely for multi-CF databases.
+  // Only takes effect when flush_before_backup is also true.
+  // Default: false
+  bool atomic_flush = false;
 };
 
 struct RestoreOptions {
+  // Enum reflecting tiered approach to restores.
+  //
+  // Options `kKeepLatestDbSessionIdFiles`, `kVerifyChecksum` introduce
+  // incremental restore capability and are intended to be used separately.
+  enum Mode : uint32_t {
+    // Most efficient way to restore a healthy / non-corrupted DB from
+    // the backup(s). This mode can almost always successfully recover from
+    // incomplete / missing files, as in an incomplete copy of a DB.
+    // This mode is also integrated with `exclude_files_callback` feature
+    // and will opportunistically try to find excluded files in existing db
+    // filesystem if missing in all supplied backup directories.
+    //
+    // Effective on data files following modern share files naming schemes.
+    kKeepLatestDbSessionIdFiles = 1U,
+
+    // Recommended when db is suspected to be unhealthy, ex. we want to retain
+    // most of the files (therefore saving on write I/O) with an exception of
+    // a few corrupted ones.
+    //
+    // When opted-in, restore engine will scan the db file, compute the
+    // checksum and compare it against the checksum hardened in the backup file
+    // metadata. If checksums match, existing file will be retained as-is.
+    // Otherwise, it will be deleted and replaced it with its' restored backup
+    // counterpart. If backup file doesn't have a checksum hardened in the
+    // metadata, we'll schedule an async task to compute it.
+    kVerifyChecksum = 2U,
+
+    // Zero trust. Least efficient.
+    //
+    // Purge all the destination files and restores all files from the backup.
+    kPurgeAllFiles = 0xffffU,
+  };
+
   // If true, restore won't overwrite the existing log files in wal_dir. It will
   // also move all log files from archive directory to wal_dir. Use this option
   // in combination with BackupEngineOptions::backup_log_files = false for
@@ -350,8 +368,13 @@ struct RestoreOptions {
   // directories known to contain the required files.
   std::forward_list<BackupEngineReadOnlyBase*> alternate_dirs;
 
-  explicit RestoreOptions(bool _keep_log_files = false)
-      : keep_log_files(_keep_log_files) {}
+  // Specifies the level of incremental restore. 'kPurgeAllFiles' by default.
+  Mode mode;
+
+  // FIXME(https://github.com/facebook/rocksdb/issues/13293)
+  explicit RestoreOptions(bool _keep_log_files = false,
+                          Mode _mode = Mode::kPurgeAllFiles)
+      : keep_log_files(_keep_log_files), mode(_mode) {}
 };
 
 using BackupID = uint32_t;
@@ -572,7 +595,14 @@ class BackupEngineAppendOnlyBase {
   // The backup will stop ASAP and the call to CreateNewBackup will
   // return Status::Incomplete(). It will not clean up after itself, but
   // the state will remain consistent. The state will be cleaned up the
-  // next time you call CreateNewBackup or GarbageCollect.
+  // next time you call CreateNewBackup or GarbageCollect for the same backup
+  // directory on a new BackupEngine object.
+  //
+  // NOTE: This is a one-way operation. Once StopBackup() is called on a
+  // BackupEngine instance, all subsequent backup requests (CreateNewBackup,
+  // CreateNewBackupWithMetadata) will fail with Status::Incomplete().
+  // To create new backups after calling StopBackup(), you must open a new
+  // BackupEngine instance.
   virtual void StopBackup() = 0;
 
   // Will delete any files left over from incomplete creation or deletion of

@@ -3,17 +3,29 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
 #include <array>
+#include <set>
 #include <sstream>
 #include <string>
 
 #include "cache/compressed_secondary_cache.h"
+#include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
+#include "db/blob/blob_log_sequential_reader.h"
+#include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/db_with_timestamp_test_util.h"
+#include "file/filename.h"
+#include "file/random_access_file_reader.h"
 #include "port/stack_trace.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/trace_reader_writer.h"
+#include "rocksdb/trace_record.h"
+#include "rocksdb/utilities/replayer.h"
 #include "test_util/sync_point.h"
+#include "util/compression.h"
 #include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -48,6 +60,43 @@ TEST_F(DBBlobBasicTest, GetBlob) {
 
   PinnableSlice result;
   ASSERT_TRUE(db_->Get(read_options, db_->DefaultColumnFamily(), key, &result)
+                  .IsIncomplete());
+}
+
+TEST_F(DBBlobBasicTest, EmptyValueNotStoredAsBlob) {
+  // Regression test for crash when empty blob value is evicted to
+  // CompressedSecondaryCache (T261142690). Empty values should always be
+  // stored inline in the SST, never as blobs, even with min_blob_size=0.
+  // A BlobIndex for an empty value is strictly larger than the value itself,
+  // so storing it as a blob is pure overhead.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+
+  Reopen(options);
+
+  // Write an empty value and a non-empty value.
+  ASSERT_OK(Put("empty_key", ""));
+  constexpr char blob_value[] = "blob_value";
+  ASSERT_OK(Put("nonempty_key", blob_value));
+  ASSERT_OK(Flush());
+
+  // Both values should be readable.
+  ASSERT_EQ(Get("empty_key"), "");
+  ASSERT_EQ(Get("nonempty_key"), blob_value);
+
+  // The empty value should be stored inline (readable from block cache
+  // without blob file I/O), while the non-empty value requires blob I/O.
+  ReadOptions ro;
+  ro.read_tier = kBlockCacheTier;
+
+  PinnableSlice result;
+  ASSERT_OK(db_->Get(ro, db_->DefaultColumnFamily(), "empty_key", &result));
+  ASSERT_EQ(result, "");
+
+  result.Reset();
+  ASSERT_TRUE(db_->Get(ro, db_->DefaultColumnFamily(), "nonempty_key", &result)
                   .IsIncomplete());
 }
 
@@ -371,6 +420,115 @@ TEST_F(DBBlobBasicTest, IterateBlobsFromCachePinning) {
     ASSERT_FALSE(iter->Valid());
     ASSERT_OK(iter->status());
     ASSERT_EQ(options.blob_cache->GetPinnedUsage(), 0);
+  }
+}
+
+TEST_F(DBBlobBasicTest, IterateBlobsAllowUnpreparedValue) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+
+  Reopen(options);
+
+  constexpr size_t num_blobs = 5;
+  std::vector<std::string> keys;
+  std::vector<std::string> blobs;
+
+  for (size_t i = 0; i < num_blobs; ++i) {
+    keys.emplace_back("key" + std::to_string(i));
+    blobs.emplace_back("blob" + std::to_string(i));
+    ASSERT_OK(Put(keys[i], blobs[i]));
+  }
+
+  ASSERT_OK(Flush());
+
+  ReadOptions read_options;
+  read_options.allow_unprepared_value = true;
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+
+  {
+    size_t i = 0;
+
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      ASSERT_EQ(iter->key(), keys[i]);
+      ASSERT_TRUE(iter->value().empty());
+      ASSERT_OK(iter->status());
+
+      ASSERT_TRUE(iter->PrepareValue());
+
+      ASSERT_EQ(iter->key(), keys[i]);
+      ASSERT_EQ(iter->value(), blobs[i]);
+      ASSERT_OK(iter->status());
+
+      ++i;
+    }
+
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(i, num_blobs);
+  }
+
+  {
+    size_t i = 0;
+
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      ASSERT_EQ(iter->key(), keys[num_blobs - 1 - i]);
+      ASSERT_TRUE(iter->value().empty());
+      ASSERT_OK(iter->status());
+
+      ASSERT_TRUE(iter->PrepareValue());
+
+      ASSERT_EQ(iter->key(), keys[num_blobs - 1 - i]);
+      ASSERT_EQ(iter->value(), blobs[num_blobs - 1 - i]);
+      ASSERT_OK(iter->status());
+
+      ++i;
+    }
+
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(i, num_blobs);
+  }
+
+  {
+    size_t i = 1;
+
+    for (iter->Seek(keys[i]); iter->Valid(); iter->Next()) {
+      ASSERT_EQ(iter->key(), keys[i]);
+      ASSERT_TRUE(iter->value().empty());
+      ASSERT_OK(iter->status());
+
+      ASSERT_TRUE(iter->PrepareValue());
+
+      ASSERT_EQ(iter->key(), keys[i]);
+      ASSERT_EQ(iter->value(), blobs[i]);
+      ASSERT_OK(iter->status());
+
+      ++i;
+    }
+
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(i, num_blobs);
+  }
+
+  {
+    size_t i = 1;
+
+    for (iter->SeekForPrev(keys[num_blobs - 1 - i]); iter->Valid();
+         iter->Prev()) {
+      ASSERT_EQ(iter->key(), keys[num_blobs - 1 - i]);
+      ASSERT_TRUE(iter->value().empty());
+      ASSERT_OK(iter->status());
+
+      ASSERT_TRUE(iter->PrepareValue());
+
+      ASSERT_EQ(iter->key(), keys[num_blobs - 1 - i]);
+      ASSERT_EQ(iter->value(), blobs[num_blobs - 1 - i]);
+      ASSERT_OK(iter->status());
+
+      ++i;
+    }
+
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(i, num_blobs);
   }
 }
 
@@ -1462,6 +1620,47 @@ TEST_P(DBBlobBasicIOErrorTest, GetBlob_IOError) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
+TEST_P(DBBlobBasicIOErrorTest, GetEntityMergeWithBlobBaseIOError) {
+  // Goal: verify GetEntity preserves injected blob-read IOErrors when merge
+  // reads a blob-backed base value, instead of laundering them into Corruption.
+  // The test writes a blob-backed base value plus a merge operand, then injects
+  // an IOError at blob read time and checks both GetEntity and Get see it.
+  Options options;
+  options.env = fault_injection_env_.get();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+
+  Reopen(options);
+
+  constexpr char key[] = "key";
+  constexpr char base_value[] = "base_value";
+
+  ASSERT_OK(Put(key, base_value));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Merge(key, "merge_operand"));
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->SetCallBack(sync_point_, [this](void* /* arg */) {
+    fault_injection_env_->SetFilesystemActive(false,
+                                              Status::IOError(sync_point_));
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  PinnableWideColumns entity_result;
+  Status s = db_->GetEntity(ReadOptions(), db_->DefaultColumnFamily(), key,
+                            &entity_result);
+  ASSERT_TRUE(s.IsIOError()) << "Expected IOError but got: " << s.ToString();
+
+  PinnableSlice get_result;
+  s = db_->Get(ReadOptions(), db_->DefaultColumnFamily(), key, &get_result);
+  ASSERT_TRUE(s.IsIOError()) << "Expected IOError but got: " << s.ToString();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
 TEST_P(DBBlobBasicIOErrorMultiGetTest, MultiGetBlobs_IOError) {
   Options options = GetDefaultOptions();
   options.env = fault_injection_env_.get();
@@ -1551,6 +1750,57 @@ TEST_P(DBBlobBasicIOErrorMultiGetTest, MultipleBlobFiles) {
   ASSERT_TRUE(statuses[1].IsIOError());
 }
 
+TEST_F(DBBlobBasicTest, MultiGetFindTable_IOError) {
+  // Repro test for a specific bug where `MultiGet()` would fail to open a table
+  // in `FindTable()` and then proceed to return raw blob handles for the other
+  // keys.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+
+  // Force no table cache so every read will preload the SST file.
+  dbfull()->TEST_table_cache()->SetCapacity(0);
+
+  constexpr size_t num_keys = 2;
+
+  constexpr char key1[] = "key1";
+  constexpr char value1[] = "blob1";
+
+  ASSERT_OK(Put(key1, value1));
+  ASSERT_OK(Flush());
+
+  constexpr char key2[] = "key2";
+  constexpr char value2[] = "blob2";
+
+  ASSERT_OK(Put(key2, value2));
+  ASSERT_OK(Flush());
+
+  std::atomic<int> num_files_opened = 0;
+  // This test would be more realistic if we injected an `IOError` from the
+  // `FileSystem`
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::MultiGet:FindTable", [&](void* status) {
+        num_files_opened++;
+        if (num_files_opened == 2) {
+          Status* s = static_cast<Status*>(status);
+          *s = Status::IOError();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::array<Slice, num_keys> keys{{key1, key2}};
+  std::array<PinnableSlice, num_keys> values;
+  std::array<Status, num_keys> statuses;
+  db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), num_keys,
+                keys.data(), values.data(), statuses.data());
+
+  ASSERT_TRUE(statuses[0].IsIOError());
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(value2, values[1]);
+}
+
 namespace {
 
 class ReadBlobCompactionFilter : public CompactionFilter {
@@ -1599,6 +1849,46 @@ TEST_P(DBBlobBasicIOErrorTest, CompactionFilterReadBlob_IOError) {
   ASSERT_TRUE(db_->CompactRange(CompactRangeOptions(), /*begin=*/nullptr,
                                 /*end=*/nullptr)
                   .IsIOError());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_P(DBBlobBasicIOErrorTest, IterateBlobsAllowUnpreparedValue_IOError) {
+  Options options;
+  options.env = fault_injection_env_.get();
+  options.enable_blob_files = true;
+
+  Reopen(options);
+
+  constexpr char key[] = "key";
+  constexpr char blob_value[] = "blob_value";
+
+  ASSERT_OK(Put(key, blob_value));
+
+  ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->SetCallBack(sync_point_, [this](void* /* arg */) {
+    fault_injection_env_->SetFilesystemActive(false,
+                                              Status::IOError(sync_point_));
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ReadOptions read_options;
+  read_options.allow_unprepared_value = true;
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+  iter->SeekToFirst();
+
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(iter->key(), key);
+  ASSERT_TRUE(iter->value().empty());
+  ASSERT_OK(iter->status());
+
+  ASSERT_FALSE(iter->PrepareValue());
+
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_TRUE(iter->status().IsIOError());
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
@@ -2256,6 +2546,138 @@ TEST_F(DBBlobWithTimestampTest, IterateBlobs) {
       }
     }
     ASSERT_OK(iter->status());
+  }
+}
+
+TEST_F(DBBlobBasicTest, GetApproximateSizesIncludingBlobFiles) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+
+  // Write some key-value pairs with blob values and flush to create blob files.
+  constexpr int kNumKeys = 1000;
+  constexpr int kValueSize = 1024;
+
+  Random rnd(301);
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(kValueSize)));
+  }
+  ASSERT_OK(Flush());
+
+  // Verify blob files exist.
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  bool has_blob_files = false;
+  for (const auto& f : files) {
+    if (f.size() > 5 && f.substr(f.size() - 5) == ".blob") {
+      has_blob_files = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(has_blob_files);
+
+  // Query the full range - all keys are covered.
+  std::string start = Key(0);
+  std::string end = Key(kNumKeys);
+  Range r(start, end);
+
+  // Without include_blob_files (default behavior): should not include blob
+  // file sizes.
+  uint64_t size_without_blobs = 0;
+  {
+    SizeApproximationOptions size_approx_options;
+    size_approx_options.include_files = true;
+    size_approx_options.include_blob_files = false;
+    ASSERT_OK(db_->GetApproximateSizes(size_approx_options,
+                                       db_->DefaultColumnFamily(), &r, 1,
+                                       &size_without_blobs));
+    ASSERT_GT(size_without_blobs, 0);
+  }
+
+  // With include_blob_files: should be strictly larger.
+  {
+    SizeApproximationOptions size_approx_options;
+    size_approx_options.include_files = true;
+    size_approx_options.include_blob_files = true;
+    uint64_t size_with_blobs = 0;
+    ASSERT_OK(db_->GetApproximateSizes(size_approx_options,
+                                       db_->DefaultColumnFamily(), &r, 1,
+                                       &size_with_blobs));
+    ASSERT_GT(size_with_blobs, size_without_blobs);
+  }
+
+  // Range that doesn't overlap any data should return 0.
+  {
+    std::string no_start = Key(kNumKeys + 100);
+    std::string no_end = Key(kNumKeys + 200);
+    Range no_r(no_start, no_end);
+    SizeApproximationOptions size_approx_options;
+    size_approx_options.include_files = true;
+    size_approx_options.include_blob_files = true;
+    uint64_t no_size = 0;
+    ASSERT_OK(db_->GetApproximateSizes(
+        size_approx_options, db_->DefaultColumnFamily(), &no_r, 1, &no_size));
+    ASSERT_EQ(no_size, 0);
+  }
+
+  // Partial range should return proportionally less blob size than full range.
+  {
+    SizeApproximationOptions size_approx_options;
+    size_approx_options.include_files = true;
+    size_approx_options.include_blob_files = true;
+
+    uint64_t full_size = 0;
+    ASSERT_OK(db_->GetApproximateSizes(
+        size_approx_options, db_->DefaultColumnFamily(), &r, 1, &full_size));
+
+    // Query roughly the first half of keys.
+    std::string half_end = Key(kNumKeys / 2);
+    Range half_r(start, half_end);
+    uint64_t half_size = 0;
+    ASSERT_OK(db_->GetApproximateSizes(size_approx_options,
+                                       db_->DefaultColumnFamily(), &half_r, 1,
+                                       &half_size));
+    ASSERT_GT(half_size, 0);
+    ASSERT_LT(half_size, full_size);
+  }
+
+  // Via SizeApproximationFlags API.
+  {
+    uint64_t size_flags = 0;
+    ASSERT_OK(db_->GetApproximateSizes(
+        db_->DefaultColumnFamily(), &r, 1, &size_flags,
+        DB::SizeApproximationFlags::INCLUDE_FILES |
+            DB::SizeApproximationFlags::INCLUDE_BLOB_FILES));
+    ASSERT_GT(size_flags, size_without_blobs);
+  }
+
+  // Multi-range query: two non-overlapping sub-ranges should sum to
+  // approximately the full-range result.
+  {
+    SizeApproximationOptions size_approx_options;
+    size_approx_options.include_files = true;
+    size_approx_options.include_blob_files = true;
+
+    std::string mid = Key(kNumKeys / 2);
+    std::string r1_start = Key(0);
+    std::string r1_end = mid;
+    std::string r2_start = mid;
+    std::string r2_end = Key(kNumKeys);
+    Range ranges[2] = {Range(r1_start, r1_end), Range(r2_start, r2_end)};
+    uint64_t sizes[2] = {0, 0};
+    ASSERT_OK(db_->GetApproximateSizes(
+        size_approx_options, db_->DefaultColumnFamily(), ranges, 2, sizes));
+    // Each sub-range should return a positive size.
+    ASSERT_GT(sizes[0], 0);
+    ASSERT_GT(sizes[1], 0);
+    // Sum of sub-ranges should be close to the full-range result.
+    uint64_t full_size = 0;
+    ASSERT_OK(db_->GetApproximateSizes(
+        size_approx_options, db_->DefaultColumnFamily(), &r, 1, &full_size));
+    ASSERT_NEAR(static_cast<double>(sizes[0] + sizes[1]),
+                static_cast<double>(full_size), full_size * 0.1);
   }
 }
 

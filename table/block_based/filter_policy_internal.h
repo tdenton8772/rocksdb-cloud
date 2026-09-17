@@ -31,10 +31,22 @@ class FilterBitsBuilder {
   // added.
   virtual void AddKey(const Slice& key) = 0;
 
+  // Add two entries to the filter, typically a key and, as the alternate,
+  // its prefix. This differs from AddKey(key); AddKey(alt); in that there
+  // is extra state for de-duplicating successive `alt` entries, as well
+  // as successive `key` entries. And there is de-duplication between `key`
+  // and `alt` entries, even in adjacent calls, because a whole key might
+  // be its own prefix. More specifically,
+  //  AddKey(k1);
+  //  AddKeyAndAlt(k2, a2);  // de-dup k2<>k1, k2<>a2, a2<>k1
+  //  AddKeyAndAlt(k3, a3);  // de-dup k3<>k2, a3<>a2, k3<>a2, a3<>k2
+  //  AddKey(k4);            // de-dup k4<>k3 BUT NOT k4<>a3
+  virtual void AddKeyAndAlt(const Slice& key, const Slice& alt) = 0;
+
   // Called by RocksDB before Finish to populate
   // TableProperties::num_filter_entries, so should represent the
-  // number of unique keys (and/or prefixes) added, but does not have
-  // to be exact. `return 0;` may be used to conspicuously indicate "unknown".
+  // number of unique keys (and/or prefixes) added. MUST return 0
+  // if and only if none have been added, but otherwise can be estimated.
   virtual size_t EstimateEntriesAdded() = 0;
 
   // Generate the filter using the keys that are added
@@ -78,6 +90,19 @@ class FilterBitsBuilder {
   // <= the specified number of bytes. Callers (including RocksDB) should
   // only use this result for optimizing performance and not as a guarantee.
   virtual size_t ApproximateNumEntries(size_t bytes) = 0;
+
+  // Calculate number of bytes needed for a new filter, including
+  // metadata. Passing the result to ApproximateNumEntries should
+  // (ideally, usually) return >= the num_entry passed in.
+  // When optimize_filters_for_memory is enabled, this function
+  // is not authoritative but represents a target size that should
+  // be close to the average size.
+  virtual size_t CalculateSpace(size_t num_entries) = 0;
+
+  // Returns an estimate of the FP rate of the returned filter if
+  // `num_entries` keys are added and the filter returned by Finish
+  // is `bytes` bytes.
+  virtual double EstimatedFpRate(size_t num_entries, size_t bytes) = 0;
 };
 
 // A class that checks if a key can be in filter
@@ -95,24 +120,6 @@ class FilterBitsReader {
       may_match[i] = MayMatch(*keys[i]);
     }
   }
-};
-
-// Exposes any extra information needed for testing built-in
-// FilterBitsBuilders
-class BuiltinFilterBitsBuilder : public FilterBitsBuilder {
- public:
-  // Calculate number of bytes needed for a new filter, including
-  // metadata. Passing the result to ApproximateNumEntries should
-  // (ideally, usually) return >= the num_entry passed in.
-  // When optimize_filters_for_memory is enabled, this function
-  // is not authoritative but represents a target size that should
-  // be close to the average size.
-  virtual size_t CalculateSpace(size_t num_entries) = 0;
-
-  // Returns an estimate of the FP rate of the returned filter if
-  // `num_entries` keys are added and the filter returned by Finish
-  // is `bytes` bytes.
-  virtual double EstimatedFpRate(size_t num_entries, size_t bytes) = 0;
 };
 
 // Base class for RocksDB built-in filter reader with
@@ -137,7 +144,6 @@ class BuiltinFilterPolicy : public FilterPolicy {
   bool IsInstanceOf(const std::string& id) const override;
   // All variants of BuiltinFilterPolicy can read each others filters.
   const char* CompatibilityName() const override;
-  static const char* kCompatibilityName();
 
  public:  // new
   // An internal function for the implementation of

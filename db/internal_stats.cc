@@ -16,6 +16,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,7 +34,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-
 const std::map<LevelStatType, LevelStat> InternalStats::compaction_level_stats =
     {
         {LevelStatType::NUM_FILES, LevelStat{"NumFiles", "Files"}},
@@ -45,6 +45,8 @@ const std::map<LevelStatType, LevelStat> InternalStats::compaction_level_stats =
         {LevelStatType::RN_GB, LevelStat{"RnGB", "Rn(GB)"}},
         {LevelStatType::RNP1_GB, LevelStat{"Rnp1GB", "Rnp1(GB)"}},
         {LevelStatType::WRITE_GB, LevelStat{"WriteGB", "Write(GB)"}},
+        {LevelStatType::WRITE_PRE_COMP_GB,
+         LevelStat{"WPreCompGB", "WPreComp(GB)"}},
         {LevelStatType::W_NEW_GB, LevelStat{"WnewGB", "Wnew(GB)"}},
         {LevelStatType::MOVED_GB, LevelStat{"MovedGB", "Moved(GB)"}},
         {LevelStatType::WRITE_AMP, LevelStat{"WriteAmp", "W-Amp"}},
@@ -100,19 +102,20 @@ void PrintLevelStatsHeader(char* buf, size_t len, const std::string& cf_name,
   int line_size = snprintf(
       buf + written_size, len - written_size,
       "%s    %s   %s     %s %s  %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s "
+      "%s "
       "%s\n",
       // Note that we skip COMPACTED_FILES and merge it with Files column
       group_by.c_str(), hdr(LevelStatType::NUM_FILES),
       hdr(LevelStatType::SIZE_BYTES), hdr(LevelStatType::SCORE),
       hdr(LevelStatType::READ_GB), hdr(LevelStatType::RN_GB),
       hdr(LevelStatType::RNP1_GB), hdr(LevelStatType::WRITE_GB),
-      hdr(LevelStatType::W_NEW_GB), hdr(LevelStatType::MOVED_GB),
-      hdr(LevelStatType::WRITE_AMP), hdr(LevelStatType::READ_MBPS),
-      hdr(LevelStatType::WRITE_MBPS), hdr(LevelStatType::COMP_SEC),
-      hdr(LevelStatType::COMP_CPU_SEC), hdr(LevelStatType::COMP_COUNT),
-      hdr(LevelStatType::AVG_SEC), hdr(LevelStatType::KEY_IN),
-      hdr(LevelStatType::KEY_DROP), hdr(LevelStatType::R_BLOB_GB),
-      hdr(LevelStatType::W_BLOB_GB));
+      hdr(LevelStatType::WRITE_PRE_COMP_GB), hdr(LevelStatType::W_NEW_GB),
+      hdr(LevelStatType::MOVED_GB), hdr(LevelStatType::WRITE_AMP),
+      hdr(LevelStatType::READ_MBPS), hdr(LevelStatType::WRITE_MBPS),
+      hdr(LevelStatType::COMP_SEC), hdr(LevelStatType::COMP_CPU_SEC),
+      hdr(LevelStatType::COMP_COUNT), hdr(LevelStatType::AVG_SEC),
+      hdr(LevelStatType::KEY_IN), hdr(LevelStatType::KEY_DROP),
+      hdr(LevelStatType::R_BLOB_GB), hdr(LevelStatType::W_BLOB_GB));
 
   written_size += line_size;
   written_size = std::min(written_size, static_cast<int>(len));
@@ -140,6 +143,8 @@ void PrepareLevelStats(std::map<LevelStatType, double>* level_stats,
       stats.bytes_read_non_output_levels / kGB;
   (*level_stats)[LevelStatType::RNP1_GB] = stats.bytes_read_output_level / kGB;
   (*level_stats)[LevelStatType::WRITE_GB] = stats.bytes_written / kGB;
+  (*level_stats)[LevelStatType::WRITE_PRE_COMP_GB] =
+      stats.bytes_written_pre_comp / kGB;
   (*level_stats)[LevelStatType::W_NEW_GB] = bytes_new / kGB;
   (*level_stats)[LevelStatType::MOVED_GB] = stats.bytes_moved / kGB;
   (*level_stats)[LevelStatType::WRITE_AMP] = w_amp;
@@ -164,12 +169,13 @@ void PrintLevelStats(char* buf, size_t len, const std::string& name,
       buf, len,
       "%4s "      /*  Level */
       "%6d/%-3d " /*  Files */
-      "%8s "      /*  Size */
+      "%10s "     /*  Size */
       "%5.1f "    /*  Score */
       "%8.1f "    /*  Read(GB) */
       "%7.1f "    /*  Rn(GB) */
       "%8.1f "    /*  Rnp1(GB) */
       "%9.1f "    /*  Write(GB) */
+      "%9.1f "    /*  WPreComp(GB) */
       "%8.1f "    /*  Wnew(GB) */
       "%9.1f "    /*  Moved(GB) */
       "%5.1f "    /*  W-Amp */
@@ -193,6 +199,7 @@ void PrintLevelStats(char* buf, size_t len, const std::string& name,
       stat_value.at(LevelStatType::RN_GB),
       stat_value.at(LevelStatType::RNP1_GB),
       stat_value.at(LevelStatType::WRITE_GB),
+      stat_value.at(LevelStatType::WRITE_PRE_COMP_GB),
       stat_value.at(LevelStatType::W_NEW_GB),
       stat_value.at(LevelStatType::MOVED_GB),
       stat_value.at(LevelStatType::WRITE_AMP),
@@ -290,8 +297,6 @@ static const std::string min_obsolete_sst_number_to_keep_str =
     "min-obsolete-sst-number-to-keep";
 static const std::string base_level_str = "base-level";
 static const std::string total_sst_files_size = "total-sst-files-size";
-static const std::string live_non_bottommost_sst_files_size =
-    "live-non-bottommost-sst-files-size";
 static const std::string live_sst_files_size = "live-sst-files-size";
 static const std::string obsolete_sst_files_size = "obsolete-sst-files-size";
 static const std::string live_sst_files_size_at_temperature =
@@ -303,6 +308,9 @@ static const std::string aggregated_table_properties =
 static const std::string aggregated_table_properties_at_level =
     aggregated_table_properties + "-at-level";
 static const std::string num_running_compactions = "num-running-compactions";
+static const std::string num_running_compaction_sorted_runs =
+    "num-running-compaction-sorted-runs";
+static const std::string compaction_abort_count = "compaction-abort-count";
 static const std::string num_running_flushes = "num-running-flushes";
 static const std::string actual_delayed_write_rate =
     "actual-delayed-write-rate";
@@ -353,6 +361,10 @@ const std::string DB::Properties::kCompactionPending =
     rocksdb_prefix + compaction_pending;
 const std::string DB::Properties::kNumRunningCompactions =
     rocksdb_prefix + num_running_compactions;
+const std::string DB::Properties::kNumRunningCompactionSortedRuns =
+    rocksdb_prefix + num_running_compaction_sorted_runs;
+const std::string DB::Properties::kCompactionAbortCount =
+    rocksdb_prefix + compaction_abort_count;
 const std::string DB::Properties::kNumRunningFlushes =
     rocksdb_prefix + num_running_flushes;
 const std::string DB::Properties::kBackgroundErrors =
@@ -395,8 +407,6 @@ const std::string DB::Properties::kMinObsoleteSstNumberToKeep =
     rocksdb_prefix + min_obsolete_sst_number_to_keep_str;
 const std::string DB::Properties::kTotalSstFilesSize =
     rocksdb_prefix + total_sst_files_size;
-const std::string DB::Properties::kLiveNonBottommostSstFilesSize =
-    rocksdb_prefix + live_non_bottommost_sst_files_size;
 const std::string DB::Properties::kLiveSstFilesSize =
     rocksdb_prefix + live_sst_files_size;
 const std::string DB::Properties::kObsoleteSstFilesSize =
@@ -569,9 +579,6 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kLiveSstFilesSize,
          {false, nullptr, &InternalStats::HandleLiveSstFilesSize, nullptr,
           nullptr}},
-        {DB::Properties::kLiveNonBottommostSstFilesSize,
-         {false, nullptr, &InternalStats::HandleLiveNonBottommostSstFilesSize, nullptr,
-          nullptr}},
         {DB::Properties::kLiveSstFilesSizeAtTemperature,
          {false, &InternalStats::HandleLiveSstFilesSizeAtTemperature, nullptr,
           nullptr, nullptr}},
@@ -586,6 +593,12 @@ const UnorderedMap<std::string, DBPropertyInfo>
           nullptr}},
         {DB::Properties::kNumRunningCompactions,
          {false, nullptr, &InternalStats::HandleNumRunningCompactions, nullptr,
+          nullptr}},
+        {DB::Properties::kNumRunningCompactionSortedRuns,
+         {false, nullptr, &InternalStats::HandleNumRunningCompactionSortedRuns,
+          nullptr, nullptr}},
+        {DB::Properties::kCompactionAbortCount,
+         {false, nullptr, &InternalStats::HandleCompactionAbortCount, nullptr,
           nullptr}},
         {DB::Properties::kActualDelayedWriteRate,
          {false, nullptr, &InternalStats::HandleActualDelayedWriteRate, nullptr,
@@ -643,6 +656,7 @@ InternalStats::InternalStats(int num_levels, SystemClock* clock,
       file_read_latency_(num_levels),
       has_cf_change_since_dump_(true),
       bg_error_count_(0),
+      num_running_compaction_sorted_runs_(0),
       number_levels_(num_levels),
       clock_(clock),
       cfd_(cfd),
@@ -931,7 +945,7 @@ bool InternalStats::HandleLiveBlobFileGarbageSize(uint64_t* value,
 }
 
 Cache* InternalStats::GetBlobCacheForStats() {
-  return cfd_->ioptions()->blob_cache.get();
+  return cfd_->ioptions().blob_cache.get();
 }
 
 bool InternalStats::HandleBlobCacheCapacity(uint64_t* value, DBImpl* /*db*/,
@@ -1272,6 +1286,25 @@ bool InternalStats::HandleNumRunningCompactions(uint64_t* value, DBImpl* db,
   return true;
 }
 
+bool InternalStats::HandleNumRunningCompactionSortedRuns(uint64_t* value,
+                                                         DBImpl* db,
+                                                         Version* /*version*/) {
+  db->mutex()->AssertHeld();
+  uint64_t sorted_runs = 0;
+  for (auto* cfd : *db->versions_->GetColumnFamilySet()) {
+    sorted_runs += cfd->internal_stats()->NumRunningCompactionSortedRuns();
+  }
+  *value = sorted_runs;
+  return true;
+}
+
+bool InternalStats::HandleCompactionAbortCount(uint64_t* value, DBImpl* db,
+                                               Version* /*version*/) {
+  *value = static_cast<uint64_t>(
+      db->compaction_aborted_.load(std::memory_order_acquire));
+  return true;
+}
+
 bool InternalStats::HandleBackgroundErrors(uint64_t* value, DBImpl* /*db*/,
                                            Version* /*version*/) {
   // Accumulated number of  errors in background flushes or compactions.
@@ -1308,7 +1341,7 @@ bool InternalStats::HandleNumEntriesActiveMemTable(uint64_t* value,
                                                    DBImpl* /*db*/,
                                                    Version* /*version*/) {
   // Current number of entires in the active memtable
-  *value = cfd_->mem()->num_entries();
+  *value = cfd_->mem()->NumEntries();
   return true;
 }
 
@@ -1324,7 +1357,7 @@ bool InternalStats::HandleNumDeletesActiveMemTable(uint64_t* value,
                                                    DBImpl* /*db*/,
                                                    Version* /*version*/) {
   // Current number of entires in the active memtable
-  *value = cfd_->mem()->num_deletes();
+  *value = cfd_->mem()->NumDeletion();
   return true;
 }
 
@@ -1341,11 +1374,11 @@ bool InternalStats::HandleEstimateNumKeys(uint64_t* value, DBImpl* /*db*/,
   // Estimate number of entries in the column family:
   // Use estimated entries in tables + total entries in memtables.
   const auto* vstorage = cfd_->current()->storage_info();
-  uint64_t estimate_keys = cfd_->mem()->num_entries() +
+  uint64_t estimate_keys = cfd_->mem()->NumEntries() +
                            cfd_->imm()->current()->GetTotalNumEntries() +
                            vstorage->GetEstimatedActiveKeys();
   uint64_t estimate_deletes =
-      cfd_->mem()->num_deletes() + cfd_->imm()->current()->GetTotalNumDeletes();
+      cfd_->mem()->NumDeletion() + cfd_->imm()->current()->GetTotalNumDeletes();
   *value = estimate_keys > estimate_deletes * 2
                ? estimate_keys - (estimate_deletes * 2)
                : 0;
@@ -1405,13 +1438,6 @@ bool InternalStats::HandleTotalSstFilesSize(uint64_t* value, DBImpl* /*db*/,
 bool InternalStats::HandleLiveSstFilesSize(uint64_t* value, DBImpl* /*db*/,
                                            Version* /*version*/) {
   *value = cfd_->GetLiveSstFilesSize();
-  return true;
-}
-
-bool InternalStats::HandleLiveNonBottommostSstFilesSize(uint64_t* value,
-                                                        DBImpl* /*db*/,
-                                                        Version* /*version*/) {
-  *value = cfd_->GetLiveSstFilesSize(false /* include_bottommost */);
   return true;
 }
 
@@ -1482,9 +1508,9 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
   // TODO(yiwu): The property is currently available for fifo compaction
   // with allow_compaction = false. This is because we don't propagate
   // oldest_key_time on compaction.
-  if (cfd_->ioptions()->compaction_style != kCompactionStyleFIFO ||
+  if (cfd_->ioptions().compaction_style != kCompactionStyleFIFO ||
       cfd_->GetCurrentMutableCFOptions()
-          ->compaction_options_fifo.allow_compaction) {
+          .compaction_options_fifo.allow_compaction) {
     return false;
   }
   // TODO: plumb Env::IOActivity, Env::IOPriority
@@ -1509,8 +1535,10 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
 }
 
 Cache* InternalStats::GetBlockCacheForStats() {
-  auto* table_factory = cfd_->ioptions()->table_factory.get();
+  // NOTE: called in startup before GetCurrentMutableCFOptions() is ready
+  auto* table_factory = cfd_->GetLatestMutableCFOptions().table_factory.get();
   assert(table_factory != nullptr);
+  // FIXME: need to a shared_ptr if/when block_cache is going to be mutable
   return table_factory->GetOptions<Cache>(TableFactory::kBlockCacheOpts());
 }
 
@@ -1764,7 +1792,7 @@ void InternalStats::DumpCFMapStats(
   assert(vstorage);
 
   int num_levels_to_check =
-      (cfd_->ioptions()->compaction_style == kCompactionStyleLevel)
+      (cfd_->ioptions().compaction_style == kCompactionStyleLevel)
           ? vstorage->num_levels() - 1
           : 1;
 
@@ -2149,5 +2177,64 @@ void InternalStats::DumpCFFileHistogram(std::string* value) {
   value->append(oss.str());
 }
 
+namespace {
+
+class SumPropertyAggregator : public IntPropertyAggregator {
+ public:
+  SumPropertyAggregator() : aggregated_value_(0) {}
+  virtual ~SumPropertyAggregator() override = default;
+
+  void Add(ColumnFamilyData* cfd, uint64_t value) override {
+    (void)cfd;
+    aggregated_value_ += value;
+  }
+
+  uint64_t Aggregate() const override { return aggregated_value_; }
+
+ private:
+  uint64_t aggregated_value_;
+};
+
+// A block cache may be shared by multiple column families.
+// BlockCachePropertyAggregator ensures that the same cache is only added once.
+class BlockCachePropertyAggregator : public IntPropertyAggregator {
+ public:
+  BlockCachePropertyAggregator() = default;
+  virtual ~BlockCachePropertyAggregator() override = default;
+
+  void Add(ColumnFamilyData* cfd, uint64_t value) override {
+    auto* table_factory = cfd->GetCurrentMutableCFOptions().table_factory.get();
+    assert(table_factory != nullptr);
+    Cache* cache =
+        table_factory->GetOptions<Cache>(TableFactory::kBlockCacheOpts());
+    if (cache != nullptr) {
+      block_cache_properties_.emplace(cache, value);
+    }
+  }
+
+  uint64_t Aggregate() const override {
+    uint64_t sum = 0;
+    for (const auto& p : block_cache_properties_) {
+      sum += p.second;
+    }
+    return sum;
+  }
+
+ private:
+  std::unordered_map<Cache*, uint64_t> block_cache_properties_;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<IntPropertyAggregator> CreateIntPropertyAggregator(
+    const Slice& property) {
+  if (property == DB::Properties::kBlockCacheCapacity ||
+      property == DB::Properties::kBlockCacheUsage ||
+      property == DB::Properties::kBlockCachePinnedUsage) {
+    return std::make_unique<BlockCachePropertyAggregator>();
+  } else {
+    return std::make_unique<SumPropertyAggregator>();
+  }
+}
 
 }  // namespace ROCKSDB_NAMESPACE

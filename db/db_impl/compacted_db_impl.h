@@ -22,22 +22,25 @@ class CompactedDBImpl : public DBImpl {
   ~CompactedDBImpl() override;
 
   static Status Open(const Options& options, const std::string& dbname,
-                     DB** dbptr);
+                     std::unique_ptr<DB>* dbptr);
 
   // Implementations of the DB interface
   using DB::Get;
-  Status Get(const ReadOptions& options, ColumnFamilyHandle* column_family,
-             const Slice& key, PinnableSlice* value,
-             std::string* timestamp) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, Get, const ReadOptions& options,
+                                  ColumnFamilyHandle* column_family,
+                                  const Slice& key, PinnableSlice* value,
+                                  std::string* timestamp);
 
   using DB::MultiGet;
   // Note that CompactedDBImpl::MultiGet is not the optimized version of
   // MultiGet to use.
   // TODO: optimize CompactedDBImpl::MultiGet, see DBImpl::MultiGet for details.
-  void MultiGet(const ReadOptions& options, size_t num_keys,
-                ColumnFamilyHandle** column_families, const Slice* keys,
-                PinnableSlice* values, std::string* timestamps,
-                Status* statuses, const bool sorted_input) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet, const ReadOptions& options,
+                                  size_t num_keys,
+                                  ColumnFamilyHandle** column_families,
+                                  const Slice* keys, PinnableSlice* values,
+                                  std::string* timestamps, Status* statuses,
+                                  const bool sorted_input);
 
   using DBImpl::Put;
   Status Put(const WriteOptions& /*options*/,
@@ -129,7 +132,7 @@ class CompactedDBImpl : public DBImpl {
   // Share with DBImplReadOnly?
 
  protected:
-  Status FlushForGetLiveFiles() override {
+  Status FlushForGetLiveFiles(bool /*force_atomic_flush*/) override {
     // No-op for read-only DB
     return Status::OK();
   }
@@ -143,5 +146,6 @@ class CompactedDBImpl : public DBImpl {
   Version* version_;
   const Comparator* user_comparator_;
   LevelFilesBrief files_;
+  int files_level_{0};
 };
 }  // namespace ROCKSDB_NAMESPACE

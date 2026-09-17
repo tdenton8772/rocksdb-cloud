@@ -106,7 +106,7 @@ Status VolatileCacheTier::Lookup(const Slice& page_key,
 }
 
 bool VolatileCacheTier::Erase(const Slice& /*key*/) {
-  assert(!"not supported");
+  assert(false && "not supported");
   return true;
 }
 
@@ -135,4 +135,3 @@ bool VolatileCacheTier::Evict() {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

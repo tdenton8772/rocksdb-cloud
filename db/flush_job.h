@@ -63,11 +63,9 @@ class FlushJob {
            const MutableCFOptions& mutable_cf_options, uint64_t max_memtable_id,
            const FileOptions& file_options, VersionSet* versions,
            InstrumentedMutex* db_mutex, std::atomic<bool>* shutting_down,
-           std::vector<SequenceNumber> existing_snapshots,
-           SequenceNumber earliest_write_conflict_snapshot,
-           SnapshotChecker* snapshot_checker, JobContext* job_context,
-           FlushReason flush_reason, LogBuffer* log_buffer,
-           FSDirectory* db_directory, FSDirectory* output_file_directory,
+           JobContext* job_context, FlushReason flush_reason,
+           LogBuffer* log_buffer, FSDirectory* db_directory,
+           FSDirectory* output_file_directory,
            CompressionType output_compression, Statistics* stats,
            EventLogger* event_logger, bool measure_io_stats,
            const bool sync_output_directory, const bool write_manifest,
@@ -75,7 +73,8 @@ class FlushJob {
            std::shared_ptr<const SeqnoToTimeMapping> seqno_to_time_mapping,
            const std::string& db_id = "", const std::string& db_session_id = "",
            std::string full_history_ts_low = "",
-           BlobFileCompletionCallback* blob_callback = nullptr);
+           BlobFileCompletionCallback* blob_callback = nullptr,
+           bool fast_sst_open = false);
 
   ~FlushJob();
 
@@ -91,7 +90,38 @@ class FlushJob {
              bool* skipped_since_bg_error = nullptr,
              ErrorHandler* error_handler = nullptr);
   void Cancel();
-  const autovector<MemTable*>& GetMemTables() const { return mems_; }
+  const autovector<ReadOnlyMemTable*>& GetMemTables() const { return mems_; }
+
+  // Returns the log number recorded in the flush VersionEdit after
+  // PickMemTable() initializes `edit_`.
+  uint64_t GetLogNumber() const {
+    assert(edit_ != nullptr);
+    return edit_->GetLogNumber();
+  }
+
+  // Stashes write-path blob files so WriteLevel0Table() can add them to the
+  // same VersionEdit as the flushed SST.
+  void AddExternalBlobFileAdditions(std::vector<BlobFileAddition>&& additions) {
+    external_blob_file_additions_ = std::move(additions);
+  }
+
+  // Stashes write-path initial-garbage updates so they are committed with the
+  // same VersionEdit as the matching blob-file additions and flushed SST.
+  void AddExternalBlobFileGarbages(std::vector<BlobFileGarbage>&& garbages) {
+    external_blob_file_garbages_ = std::move(garbages);
+  }
+
+  // Transfers back any prepared blob file additions that were not consumed by
+  // the flush.
+  std::vector<BlobFileAddition> TakeExternalBlobFileAdditions() {
+    return std::move(external_blob_file_additions_);
+  }
+
+  // Transfers back any prepared blob-file garbage updates that were not
+  // consumed by the flush.
+  std::vector<BlobFileGarbage> TakeExternalBlobFileGarbages() {
+    return std::move(external_blob_file_garbages_);
+  }
 
   std::list<std::unique_ptr<FlushJobInfo>>* GetCommittedFlushJobsInfo() {
     return &committed_flush_jobs_info_;
@@ -101,7 +131,7 @@ class FlushJob {
   friend class FlushJobTest_GetRateLimiterPriorityForWrite_Test;
 
   void ReportStartedFlush();
-  void ReportFlushInputSize(const autovector<MemTable*>& mems);
+  static void ReportFlushInputSize(const autovector<ReadOnlyMemTable*>& mems);
   void RecordFlushIOStats();
   Status WriteLevel0Table();
 
@@ -143,6 +173,13 @@ class FlushJob {
   // `MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT` for details.
   void GetEffectiveCutoffUDTForPickedMemTables();
 
+  // If this column family enables tiering feature, it will find the current
+  // `preclude_last_level_min_seqno_`, and the smaller one between this and
+  // the `earliset_snapshot_` will later be announced to user property
+  // collectors. It indicates to tiering use cases which data are old enough to
+  // be placed on the last level.
+  void GetPrecludeLastLevelMinSeqno();
+
   Status MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT();
 
   const std::string& dbname_;
@@ -160,9 +197,7 @@ class FlushJob {
   VersionSet* versions_;
   InstrumentedMutex* db_mutex_;
   std::atomic<bool>* shutting_down_;
-  std::vector<SequenceNumber> existing_snapshots_;
-  SequenceNumber earliest_write_conflict_snapshot_;
-  SnapshotChecker* snapshot_checker_;
+  SequenceNumber earliest_snapshot_;
   JobContext* job_context_;
   FlushReason flush_reason_;
   LogBuffer* log_buffer_;
@@ -197,7 +232,9 @@ class FlushJob {
 
   // Variables below are set by PickMemTable():
   FileMetaData meta_;
-  autovector<MemTable*> mems_;
+  // Memtables to be flushed by this job.
+  // Ordered by increasing memtable id, i.e., oldest memtable first.
+  autovector<ReadOnlyMemTable*> mems_;
   VersionEdit* edit_;
   Version* base_;
   bool pick_memtable_called;
@@ -208,6 +245,12 @@ class FlushJob {
 
   const std::string full_history_ts_low_;
   BlobFileCompletionCallback* blob_callback_;
+  bool fast_sst_open_;
+  // Write-path blob files that should be committed with this flush.
+  std::vector<BlobFileAddition> external_blob_file_additions_;
+  // Initial garbage for write-path blob files that were partially abandoned
+  // before their owning flush committed.
+  std::vector<BlobFileGarbage> external_blob_file_garbages_;
 
   // Shared copy of DB's seqno to time mapping stored in SuperVersion. The
   // ownership is shared with this FlushJob when it's created.
@@ -221,6 +264,12 @@ class FlushJob {
   // Keeps track of the newest user-defined timestamp for this flush job if
   // `persist_user_defined_timestamps` flag is false.
   std::string cutoff_udt_;
+
+  // The current minimum seqno that compaction jobs will preclude the data from
+  // the last level. Data with seqnos larger than this or larger than
+  // `earliest_snapshot_` will be output to the proximal level had it gone
+  // through a compaction to the last level.
+  SequenceNumber preclude_last_level_min_seqno_ = kMaxSequenceNumber;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -76,7 +76,10 @@ public class MutableDBOptions extends AbstractMutableOptions {
     bytes_per_sync(ValueType.LONG),
     wal_bytes_per_sync(ValueType.LONG),
     strict_bytes_per_sync(ValueType.BOOLEAN),
-    compaction_readahead_size(ValueType.LONG);
+    compaction_readahead_size(ValueType.LONG),
+    max_compaction_trigger_wakeup_seconds(ValueType.LONG),
+
+    daily_offpeak_time_utc(ValueType.STRING);
 
     private final ValueType valueType;
     DBOption(final ValueType valueType) {
@@ -214,6 +217,18 @@ public class MutableDBOptions extends AbstractMutableOptions {
     }
 
     @Override
+    public MutableDBOptionsBuilder setMaxCompactionTriggerWakeupSeconds(
+        final long maxCompactionTriggerWakeupSeconds) {
+      return setLong(
+          DBOption.max_compaction_trigger_wakeup_seconds, maxCompactionTriggerWakeupSeconds);
+    }
+
+    @Override
+    public long maxCompactionTriggerWakeupSeconds() {
+      return getLong(DBOption.max_compaction_trigger_wakeup_seconds);
+    }
+
+    @Override
     public MutableDBOptionsBuilder setStatsPersistPeriodSec(
         final int statsPersistPeriodSec) {
       return setInt(DBOption.stats_persist_period_sec, statsPersistPeriodSec);
@@ -287,6 +302,16 @@ public class MutableDBOptions extends AbstractMutableOptions {
     @Override
     public long compactionReadaheadSize() {
       return getLong(DBOption.compaction_readahead_size);
+    }
+
+    @Override
+    public MutableDBOptionsBuilder setDailyOffpeakTimeUTC(final String offpeakTimeUTC) {
+      return setString(DBOption.daily_offpeak_time_utc, offpeakTimeUTC);
+    }
+
+    @Override
+    public String dailyOffpeakTimeUTC() {
+      return getString(DBOption.daily_offpeak_time_utc);
     }
   }
 }

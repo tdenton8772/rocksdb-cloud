@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include "rocksdb/file_system.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -90,6 +89,12 @@ class ReadOnlyFileSystem : public FileSystemWrapper {
                     IODebugContext* /*dbg*/) override {
     return FailReadOnly();
   }
+  IOStatus SyncFile(const std::string& /*fname*/,
+                    const FileOptions& /*file_opts*/,
+                    const IOOptions& /*io_opts*/, bool /*use_fsync*/,
+                    IODebugContext* /*dbg*/) override {
+    return FailReadOnly();
+  }
   IOStatus LockFile(const std::string& /*fname*/, const IOOptions& /*options*/,
                     FileLock** /*lock*/, IODebugContext* /*dbg*/) override {
     return FailReadOnly();
@@ -102,4 +107,3 @@ class ReadOnlyFileSystem : public FileSystemWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

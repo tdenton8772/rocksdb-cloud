@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -72,18 +71,26 @@ class PessimisticTransaction : public TransactionBaseImpl {
                                             std::string* key) const override {
     std::lock_guard<std::mutex> lock(wait_mutex_);
     std::vector<TransactionID> ids(waiting_txn_ids_.size());
-    if (key) *key = waiting_key_ ? *waiting_key_ : "";
+    if (timed_out_key_.has_value()) {
+      if (key) *key = timed_out_key_.value();
+    } else {
+      if (key) *key = waiting_key_ ? *waiting_key_ : "";
+    }
     if (column_family_id) *column_family_id = waiting_cf_id_;
     std::copy(waiting_txn_ids_.begin(), waiting_txn_ids_.end(), ids.begin());
     return ids;
   }
 
-  void SetWaitingTxn(autovector<TransactionID> ids, uint32_t column_family_id,
-                     const std::string* key) {
+  void SetWaitingTxn(autovector<TransactionID>& ids, uint32_t column_family_id,
+                     const std::string* key, bool is_timed_out = false) {
     std::lock_guard<std::mutex> lock(wait_mutex_);
     waiting_txn_ids_ = ids;
     waiting_cf_id_ = column_family_id;
-    waiting_key_ = key;
+    if (is_timed_out) {
+      timed_out_key_ = key ? *key : "";
+    } else {
+      waiting_key_ = key;
+    }
   }
 
   void ClearWaitingTxn() {
@@ -107,6 +114,10 @@ class PessimisticTransaction : public TransactionBaseImpl {
   void SetLockTimeout(int64_t timeout) override {
     lock_timeout_ = timeout * 1000;
   }
+  int64_t GetDeadlockTimeout() const { return deadlock_timeout_us_; }
+  void SetDeadlockTimeout(int64_t timeout_ms) override {
+    deadlock_timeout_us_ = timeout_ms * 1000;
+  }
 
   // Returns true if locks were stolen successfully, false otherwise.
   bool TryStealingLocks();
@@ -123,13 +134,6 @@ class PessimisticTransaction : public TransactionBaseImpl {
                      ColumnFamilyHandle* column_family = nullptr) override;
 
  protected:
-  // Refer to
-  // TransactionOptions::use_only_the_last_commit_time_batch_for_recovery
-  bool use_only_the_last_commit_time_batch_for_recovery_ = false;
-  // Refer to
-  // TransactionOptions::skip_prepare
-  bool skip_prepare_ = false;
-
   virtual Status PrepareInternal() = 0;
 
   virtual Status CommitWithoutPrepareInternal() = 0;
@@ -168,6 +172,18 @@ class PessimisticTransaction : public TransactionBaseImpl {
   TxnTimestamp read_timestamp_{kMaxTxnTimestamp};
   TxnTimestamp commit_timestamp_{kMaxTxnTimestamp};
 
+  // Refer to
+  // TransactionOptions::use_only_the_last_commit_time_batch_for_recovery
+  bool use_only_the_last_commit_time_batch_for_recovery_ = false;
+  // Refer to
+  // TransactionOptions::skip_prepare
+  bool skip_prepare_ = false;
+  // Refer to TransactionOptions::commit_bypass_memtable
+  uint32_t commit_bypass_memtable_threshold_ =
+      std::numeric_limits<uint32_t>::max();
+  uint64_t commit_bypass_memtable_byte_threshold_ =
+      std::numeric_limits<uint64_t>::max();
+
  private:
   friend class TransactionTest_ValidateSnapshotTest_Test;
   // Used to create unique ids for transactions.
@@ -178,7 +194,7 @@ class PessimisticTransaction : public TransactionBaseImpl {
 
   // IDs for the transactions that are blocking the current transaction.
   //
-  // empty if current transaction is not waiting.
+  // empty if current transaction is not waiting or has timed out
   autovector<TransactionID> waiting_txn_ids_;
 
   // The following two represents the (cf, key) that a transaction is waiting
@@ -192,11 +208,18 @@ class PessimisticTransaction : public TransactionBaseImpl {
   uint32_t waiting_cf_id_;
   const std::string* waiting_key_;
 
+  // Waiting key with lifetime of the txn so it can be accessed after timeouts
+  std::optional<std::string> timed_out_key_;
+
   // Mutex protecting waiting_txn_ids_, waiting_cf_id_ and waiting_key_.
   mutable std::mutex wait_mutex_;
 
   // Timeout in microseconds when locking a key or -1 if there is no timeout.
   int64_t lock_timeout_;
+
+  // Timeout in microseconds before perform dead lock detection.
+  // If 0, deadlock detection will be performed immediately.
+  int64_t deadlock_timeout_us_;
 
   // Whether to perform deadlock detection or not.
   bool deadlock_detect_;
@@ -235,6 +258,11 @@ class WriteCommittedTxn : public PessimisticTransaction {
                       PinnableSlice* pinnable_val, bool exclusive,
                       const bool do_validate) override;
 
+  Status GetEntityForUpdate(const ReadOptions& read_options,
+                            ColumnFamilyHandle* column_family, const Slice& key,
+                            PinnableWideColumns* columns, bool exclusive,
+                            bool do_validate) override;
+
   using TransactionBaseImpl::Put;
   // `key` does NOT include timestamp even when it's enabled.
   Status Put(ColumnFamilyHandle* column_family, const Slice& key,
@@ -248,6 +276,25 @@ class WriteCommittedTxn : public PessimisticTransaction {
                       const Slice& value) override;
   Status PutUntracked(ColumnFamilyHandle* column_family, const SliceParts& key,
                       const SliceParts& value) override;
+
+  // `key` does NOT include timestamp even when it's enabled.
+  Status PutEntity(ColumnFamilyHandle* column_family, const Slice& key,
+                   const WideColumns& columns,
+                   bool assume_tracked = false) override {
+    const bool do_validate = !assume_tracked;
+
+    return PutEntityImpl(column_family, key, columns, do_validate,
+                         assume_tracked);
+  }
+
+  Status PutEntityUntracked(ColumnFamilyHandle* column_family, const Slice& key,
+                            const WideColumns& columns) override {
+    constexpr bool do_validate = false;
+    constexpr bool assume_tracked = false;
+
+    return PutEntityImpl(column_family, key, columns, do_validate,
+                         assume_tracked);
+  }
 
   using TransactionBaseImpl::Delete;
   // `key` does NOT include timestamp even when it's enabled.
@@ -288,6 +335,10 @@ class WriteCommittedTxn : public PessimisticTransaction {
                           TValue* value, bool exclusive,
                           const bool do_validate);
 
+  Status PutEntityImpl(ColumnFamilyHandle* column_family, const Slice& key,
+                       const WideColumns& columns, bool do_validate,
+                       bool assume_tracked);
+
   template <typename TKey, typename TOperation>
   Status Operate(ColumnFamilyHandle* column_family, const TKey& key,
                  const bool do_validate, const bool assume_tracked,
@@ -302,6 +353,11 @@ class WriteCommittedTxn : public PessimisticTransaction {
   Status CommitInternal() override;
 
   Status RollbackInternal() override;
+
+  // Checks if the combination of `do_validate`, the read timestamp set in
+  // `read_timestamp_` and the `enable_udt_validation` flag in
+  // TransactionDBOptions make sense together.
+  Status SanityCheckReadTimestamp(bool do_validate);
 
   // Column families that enable timestamps and whose data are written when
   // indexing_enabled_ is false. If a key is written when indexing_enabled_ is

@@ -159,6 +159,11 @@ Status TestRandomAccessFile::MultiRead(ReadRequest* reqs, size_t num_reqs) {
   return target_->MultiRead(reqs, num_reqs);
 }
 
+Status TestRandomAccessFile::GetFileSize(uint64_t* file_size) {
+  assert(target_);
+  return target_->GetFileSize(file_size);
+}
+
 TestWritableFile::TestWritableFile(const std::string& fname,
                                    std::unique_ptr<WritableFile>&& f,
                                    FaultInjectionTestEnv* env)
@@ -354,6 +359,15 @@ Status FaultInjectionTestEnv::ReopenWritableFile(
     }
   }
   return s;
+}
+
+Status FaultInjectionTestEnv::SyncFile(const std::string& fname,
+                                       const EnvOptions& options,
+                                       bool use_fsync) {
+  // Call Env's default implementation instead of EnvWrapper forwarding so
+  // SyncFile exercises this wrapper's ReopenWritableFile hook and the wrapped
+  // file's Sync, Fsync, and Close hooks.
+  return Env::SyncFile(fname, options, use_fsync);
 }
 
 Status FaultInjectionTestEnv::NewRandomRWFile(

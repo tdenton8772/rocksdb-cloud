@@ -29,8 +29,6 @@ namespace ROCKSDB_NAMESPACE {
 const std::string kPropertiesBlockName = "rocksdb.properties";
 // NB: only used with format_version >= 6
 const std::string kIndexBlockName = "rocksdb.index";
-// Old property block name for backward compatibility
-const std::string kPropertiesBlockOldName = "rocksdb.stats";
 const std::string kCompressionDictBlockName = "rocksdb.compression_dict";
 const std::string kRangeDelBlockName = "rocksdb.range_del";
 
@@ -45,6 +43,7 @@ void MetaIndexBuilder::Add(const std::string& key, const BlockHandle& handle) {
 
 Slice MetaIndexBuilder::Finish() {
   for (const auto& metablock : meta_block_handles_) {
+    // NOTE: meta index keys and block handles are guaranteed < 4GB
     meta_index_block_->Add(metablock.first, metablock.second);
   }
   return meta_index_block_->Finish();
@@ -59,12 +58,11 @@ PropertyBlockBuilder::PropertyBlockBuilder()
 
 void PropertyBlockBuilder::Add(const std::string& name,
                                const std::string& val) {
+  assert(props_.find(name) == props_.end());
   props_.insert({name, val});
 }
 
 void PropertyBlockBuilder::Add(const std::string& name, uint64_t val) {
-  assert(props_.find(name) == props_.end());
-
   std::string dst;
   PutVarint64(&dst, val);
 
@@ -94,18 +92,31 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kIndexKeyIsUserKey, props.index_key_is_user_key);
   Add(TablePropertiesNames::kIndexValueIsDeltaEncoded,
       props.index_value_is_delta_encoded);
+  if (props.udi_is_primary_index != 0) {
+    Add(TablePropertiesNames::kUDIIsPrimaryIndex, props.udi_is_primary_index);
+  }
   Add(TablePropertiesNames::kNumEntries, props.num_entries);
   Add(TablePropertiesNames::kNumFilterEntries, props.num_filter_entries);
   Add(TablePropertiesNames::kDeletedKeys, props.num_deletions);
   Add(TablePropertiesNames::kMergeOperands, props.num_merge_operands);
   Add(TablePropertiesNames::kNumRangeDeletions, props.num_range_deletions);
   Add(TablePropertiesNames::kNumDataBlocks, props.num_data_blocks);
+  if (props.num_data_blocks_compression_rejected > 0) {
+    Add(TablePropertiesNames::kNumDataBlocksCompressionRejected,
+        props.num_data_blocks_compression_rejected);
+  }
+  if (props.num_data_blocks_compression_bypassed > 0) {
+    Add(TablePropertiesNames::kNumDataBlocksCompressionBypassed,
+        props.num_data_blocks_compression_bypassed);
+  }
+  Add(TablePropertiesNames::kNumUniformBlocks, props.num_uniform_blocks);
   Add(TablePropertiesNames::kFilterSize, props.filter_size);
   Add(TablePropertiesNames::kFormatVersion, props.format_version);
   Add(TablePropertiesNames::kFixedKeyLen, props.fixed_key_len);
   Add(TablePropertiesNames::kColumnFamilyId, props.column_family_id);
   Add(TablePropertiesNames::kCreationTime, props.creation_time);
   Add(TablePropertiesNames::kOldestKeyTime, props.oldest_key_time);
+  Add(TablePropertiesNames::kNewestKeyTime, props.newest_key_time);
   if (props.file_creation_time > 0) {
     Add(TablePropertiesNames::kFileCreationTime, props.file_creation_time);
   }
@@ -164,11 +175,38 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
     Add(TablePropertiesNames::kSequenceNumberTimeMapping,
         props.seqno_to_time_mapping);
   }
+  if (props.key_largest_seqno != UINT64_MAX) {
+    Add(TablePropertiesNames::kKeyLargestSeqno, props.key_largest_seqno);
+  }
+  if (props.key_smallest_seqno != UINT64_MAX) {
+    Add(TablePropertiesNames::kKeySmallestSeqno, props.key_smallest_seqno);
+  }
+  if (props.data_block_restart_interval > 0) {
+    Add(TablePropertiesNames::kDataBlockRestartInterval,
+        props.data_block_restart_interval);
+  }
+  if (props.index_block_restart_interval > 0) {
+    Add(TablePropertiesNames::kIndexBlockRestartInterval,
+        props.index_block_restart_interval);
+  }
+  if (props.separate_key_value_in_data_block > 0) {
+    Add(TablePropertiesNames::kSeparateKeyValueInDataBlock,
+        props.separate_key_value_in_data_block);
+  }
 }
 
 Slice PropertyBlockBuilder::Finish() {
   for (const auto& prop : props_) {
-    properties_block_->Add(prop.first, prop.second);
+    assert(last_prop_added_to_block_.empty() ||
+           comparator_->Compare(prop.first, last_prop_added_to_block_) > 0);
+    // Use first 4GB of key and value strings to avoid overflow, e.g. from
+    // user property collector (see BlockBuilder::Add API comments)
+    Slice key(prop.first.data(), static_cast<uint32_t>(prop.first.size()));
+    Slice value(prop.second.data(), static_cast<uint32_t>(prop.second.size()));
+    properties_block_->Add(key, value);
+#ifndef NDEBUG
+    last_prop_added_to_block_ = prop.first;
+#endif /* !NDEBUG */
   }
 
   return properties_block_->Finish();
@@ -218,12 +256,21 @@ bool NotifyCollectTableCollectorsOnFinish(
     UserCollectedProperties& readable_properties) {
   bool all_succeeded = true;
   for (auto& collector : collectors) {
-    Status s = collector->Finish(&user_collected_properties);
+    UserCollectedProperties user_properties;
+    Status s = collector->Finish(&user_properties);
     if (s.ok()) {
       for (const auto& prop : collector->GetReadableProperties()) {
         readable_properties.insert(prop);
       }
-      builder->Add(user_collected_properties);
+#ifndef NDEBUG
+      // Check different user properties collectors are not adding properties of
+      // the same name.
+      for (const auto& pair : user_properties) {
+        assert(user_collected_properties.find(pair.first) ==
+               user_collected_properties.end());
+      }
+#endif /* !NDEBUG */
+      user_collected_properties.merge(user_properties);
     } else {
       LogPropertiesCollectionError(info_log, "Finish" /* method */,
                                    collector->Name());
@@ -232,48 +279,16 @@ bool NotifyCollectTableCollectorsOnFinish(
       }
     }
   }
+  builder->Add(user_collected_properties);
   return all_succeeded;
 }
 
-// FIXME: should be a parameter for reading table properties to use persistent
-// cache?
-Status ReadTablePropertiesHelper(
-    const ReadOptions& ro, const BlockHandle& handle,
-    RandomAccessFileReader* file, FilePrefetchBuffer* prefetch_buffer,
-    const Footer& footer, const ImmutableOptions& ioptions,
-    std::unique_ptr<TableProperties>* table_properties,
-    MemoryAllocator* memory_allocator) {
-  assert(table_properties);
-
-  // If this is an external SST file ingested with write_global_seqno set to
-  // true, then we expect the checksum mismatch because checksum was written
-  // by SstFileWriter, but its global seqno in the properties block may have
-  // been changed during ingestion. For this reason, we initially read
-  // and process without checksum verification, then later try checksum
-  // verification so that if it fails, we can copy to a temporary buffer with
-  // global seqno set to its original value, i.e. 0, and attempt checksum
-  // verification again.
-  ReadOptions modified_ro = ro;
-  modified_ro.verify_checksums = false;
-  BlockContents block_contents;
-  BlockFetcher block_fetcher(file, prefetch_buffer, footer, modified_ro, handle,
-                             &block_contents, ioptions, false /* decompress */,
-                             false /*maybe_compressed*/, BlockType::kProperties,
-                             UncompressionDict::GetEmptyDict(),
-                             PersistentCacheOptions::kEmpty, memory_allocator);
-  Status s = block_fetcher.ReadBlockContents();
-  if (!s.ok()) {
-    return s;
-  }
-
-  // Unfortunately, Block::size() might not equal block_contents.data.size(),
-  // and Block hides block_contents
-  uint64_t block_size = block_contents.data.size();
-  Block properties_block(std::move(block_contents));
+Status ParsePropertiesBlock(
+    const ImmutableOptions& ioptions, uint64_t offset, Block& properties_block,
+    std::unique_ptr<TableProperties>& new_table_properties) {
   std::unique_ptr<MetaBlockIter> iter(properties_block.NewMetaIterator());
 
-  std::unique_ptr<TableProperties> new_table_properties{new TableProperties};
-  // All pre-defined properties of type uint64_t
+  //  All pre-defined properties of type uint64_t
   std::unordered_map<std::string, uint64_t*> predefined_uint64_properties = {
       {TablePropertiesNames::kOriginalFileNumber,
        &new_table_properties->orig_file_number},
@@ -287,12 +302,20 @@ Status ReadTablePropertiesHelper(
        &new_table_properties->index_key_is_user_key},
       {TablePropertiesNames::kIndexValueIsDeltaEncoded,
        &new_table_properties->index_value_is_delta_encoded},
+      {TablePropertiesNames::kUDIIsPrimaryIndex,
+       &new_table_properties->udi_is_primary_index},
       {TablePropertiesNames::kFilterSize, &new_table_properties->filter_size},
       {TablePropertiesNames::kRawKeySize, &new_table_properties->raw_key_size},
       {TablePropertiesNames::kRawValueSize,
        &new_table_properties->raw_value_size},
       {TablePropertiesNames::kNumDataBlocks,
        &new_table_properties->num_data_blocks},
+      {TablePropertiesNames::kNumDataBlocksCompressionRejected,
+       &new_table_properties->num_data_blocks_compression_rejected},
+      {TablePropertiesNames::kNumDataBlocksCompressionBypassed,
+       &new_table_properties->num_data_blocks_compression_bypassed},
+      {TablePropertiesNames::kNumUniformBlocks,
+       &new_table_properties->num_uniform_blocks},
       {TablePropertiesNames::kNumEntries, &new_table_properties->num_entries},
       {TablePropertiesNames::kNumFilterEntries,
        &new_table_properties->num_filter_entries},
@@ -312,6 +335,8 @@ Status ReadTablePropertiesHelper(
        &new_table_properties->creation_time},
       {TablePropertiesNames::kOldestKeyTime,
        &new_table_properties->oldest_key_time},
+      {TablePropertiesNames::kNewestKeyTime,
+       &new_table_properties->newest_key_time},
       {TablePropertiesNames::kFileCreationTime,
        &new_table_properties->file_creation_time},
       {TablePropertiesNames::kSlowCompressionEstimatedDataSize,
@@ -322,8 +347,19 @@ Status ReadTablePropertiesHelper(
        &new_table_properties->tail_start_offset},
       {TablePropertiesNames::kUserDefinedTimestampsPersisted,
        &new_table_properties->user_defined_timestamps_persisted},
+      {TablePropertiesNames::kKeyLargestSeqno,
+       &new_table_properties->key_largest_seqno},
+      {TablePropertiesNames::kKeySmallestSeqno,
+       &new_table_properties->key_smallest_seqno},
+      {TablePropertiesNames::kDataBlockRestartInterval,
+       &new_table_properties->data_block_restart_interval},
+      {TablePropertiesNames::kIndexBlockRestartInterval,
+       &new_table_properties->index_block_restart_interval},
+      {TablePropertiesNames::kSeparateKeyValueInDataBlock,
+       &new_table_properties->separate_key_value_in_data_block},
   };
 
+  Status s;
   std::string last_key;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     s = iter->status();
@@ -345,7 +381,7 @@ Status ReadTablePropertiesHelper(
 
     if (key == ExternalSstFilePropertyNames::kGlobalSeqno) {
       new_table_properties->external_sst_file_global_seqno_offset =
-          handle.offset() + iter->ValueOffset();
+          offset + iter->ValueOffset();
     }
 
     if (pos != predefined_uint64_properties.end()) {
@@ -398,27 +434,117 @@ Status ReadTablePropertiesHelper(
     }
   }
 
-  // Modified version of BlockFetcher checksum verification
-  // (See write_global_seqno comment above)
-  if (s.ok() && footer.GetBlockTrailerSize() > 0) {
-    s = VerifyBlockChecksum(footer, properties_block.data(), block_size,
-                            file->file_name(), handle.offset());
-    if (s.IsCorruption()) {
-      if (new_table_properties->external_sst_file_global_seqno_offset != 0) {
-        std::string tmp_buf(properties_block.data(),
-                            block_fetcher.GetBlockSizeWithTrailer());
-        uint64_t global_seqno_offset =
-            new_table_properties->external_sst_file_global_seqno_offset -
-            handle.offset();
-        EncodeFixed64(&tmp_buf[static_cast<size_t>(global_seqno_offset)], 0);
-        s = VerifyBlockChecksum(footer, tmp_buf.data(), block_size,
-                                file->file_name(), handle.offset());
+  return s;
+}
+
+// FIXME: should be a parameter for reading table properties to use persistent
+// cache?
+Status ReadTablePropertiesHelper(
+    const ReadOptions& ro, const BlockHandle& handle,
+    RandomAccessFileReader* file, FilePrefetchBuffer* prefetch_buffer,
+    const Footer& footer, const ImmutableOptions& ioptions,
+    std::unique_ptr<TableProperties>* table_properties,
+    MemoryAllocator* memory_allocator) {
+  assert(table_properties);
+
+  Status s;
+  bool retry = false;
+  while (true) {
+    BlockContents block_contents;
+    size_t len = handle.size() + footer.GetBlockTrailerSize();
+    // If this is an external SST file ingested with write_global_seqno set to
+    // true, then we expect the checksum mismatch because checksum was written
+    // by SstFileWriter, but its global seqno in the properties block may have
+    // been changed during ingestion. For this reason, we initially read
+    // and process without checksum verification, then later try checksum
+    // verification so that if it fails, we can copy to a temporary buffer with
+    // global seqno set to its original value, i.e. 0, and attempt checksum
+    // verification again.
+    if (!retry) {
+      ReadOptions modified_ro = ro;
+      modified_ro.verify_checksums = false;
+      BlockFetcher block_fetcher(
+          file, prefetch_buffer, footer, modified_ro, handle, &block_contents,
+          ioptions, false /* decompress */, false /*maybe_compressed*/,
+          BlockType::kProperties, nullptr /*decompressor*/,
+          PersistentCacheOptions::kEmpty, memory_allocator);
+      s = block_fetcher.ReadBlockContents();
+      if (!s.ok()) {
+        return s;
+      }
+      assert(block_fetcher.GetBlockSizeWithTrailer() == len);
+      TEST_SYNC_POINT_CALLBACK("ReadTablePropertiesHelper:0",
+                               &block_contents.data);
+    } else {
+      assert(s.IsCorruption());
+      // If retrying, use a stronger file system read to check and correct
+      // data corruption
+      IOOptions opts;
+      IODebugContext dbg;
+      if (PrepareIOFromReadOptions(ro, ioptions.clock, opts, &dbg) !=
+          IOStatus::OK()) {
+        return s;
+      }
+      opts.verify_and_reconstruct_read = true;
+      std::unique_ptr<char[]> data(new char[len]);
+      Slice result;
+      IOStatus io_s = file->Read(opts, handle.offset(), len, &result,
+                                 data.get(), nullptr, &dbg);
+      RecordTick(ioptions.stats, FILE_READ_CORRUPTION_RETRY_COUNT);
+      if (!io_s.ok()) {
+        ROCKS_LOG_INFO(ioptions.info_log,
+                       "Reading properties block failed - %s",
+                       io_s.ToString().c_str());
+        // Return the original corruption error as that's more serious
+        return s;
+      }
+      if (result.size() < len) {
+        return Status::Corruption("Reading properties block failed - " +
+                                  std::to_string(result.size()) +
+                                  " bytes read");
+      }
+      RecordTick(ioptions.stats, FILE_READ_CORRUPTION_RETRY_SUCCESS_COUNT);
+      block_contents = BlockContents(std::move(data), handle.size());
+    }
+
+    uint64_t block_size = block_contents.data.size();
+    Block properties_block(std::move(block_contents));
+    std::unique_ptr<TableProperties> new_table_properties{new TableProperties};
+    s = ParsePropertiesBlock(ioptions, handle.offset(), properties_block,
+                             new_table_properties);
+
+    // Modified version of BlockFetcher checksum verification
+    // (See write_global_seqno comment above)
+    if (s.ok() && footer.GetBlockTrailerSize() > 0) {
+      s = VerifyBlockChecksum(footer, properties_block.data(), block_size,
+                              file->file_name(), handle.offset(),
+                              BlockType::kProperties);
+      if (s.IsCorruption()) {
+        if (new_table_properties->external_sst_file_global_seqno_offset != 0) {
+          std::string tmp_buf(properties_block.data(), len);
+          uint64_t global_seqno_offset =
+              new_table_properties->external_sst_file_global_seqno_offset -
+              handle.offset();
+          EncodeFixed64(&tmp_buf[static_cast<size_t>(global_seqno_offset)], 0);
+          s = VerifyBlockChecksum(footer, tmp_buf.data(), block_size,
+                                  file->file_name(), handle.offset(),
+                                  BlockType::kProperties);
+        }
       }
     }
-  }
 
-  if (s.ok()) {
-    *table_properties = std::move(new_table_properties);
+    // If we detected a corruption and the file system supports verification
+    // and reconstruction, retry the read
+    if (s.IsCorruption() && !retry &&
+        CheckFSFeatureSupport(ioptions.fs.get(),
+                              FSSupportedOps::kVerifyAndReconstructRead)) {
+      retry = true;
+    } else {
+      if (s.ok()) {
+        *table_properties = std::move(new_table_properties);
+      }
+      break;
+    }
   }
 
   return s;
@@ -460,14 +586,6 @@ Status FindOptionalMetaBlock(InternalIterator* meta_index_iter,
     if (meta_index_iter->Valid() && meta_index_iter->key() == meta_block_name) {
       Slice v = meta_index_iter->value();
       return block_handle->DecodeFrom(&v);
-    } else if (meta_block_name == kPropertiesBlockName) {
-      // Have to try old name for compatibility
-      meta_index_iter->Seek(kPropertiesBlockOldName);
-      if (meta_index_iter->status().ok() && meta_index_iter->Valid() &&
-          meta_index_iter->key() == kPropertiesBlockOldName) {
-        Slice v = meta_index_iter->value();
-        return block_handle->DecodeFrom(&v);
-      }
     }
   }
   // else
@@ -497,13 +615,14 @@ Status ReadMetaIndexBlockInFile(RandomAccessFileReader* file,
                                 Footer* footer_out) {
   Footer footer;
   IOOptions opts;
+  IODebugContext dbg;
   Status s;
-  s = file->PrepareIOOptions(read_options, opts);
+  s = file->PrepareIOOptions(read_options, opts, &dbg);
   if (!s.ok()) {
     return s;
   }
   s = ReadFooterFromFile(opts, file, *ioptions.fs, prefetch_buffer, file_size,
-                         &footer, table_magic_number);
+                         &footer, table_magic_number, ioptions.stats);
   if (!s.ok()) {
     return s;
   }
@@ -515,7 +634,7 @@ Status ReadMetaIndexBlockInFile(RandomAccessFileReader* file,
   return BlockFetcher(file, prefetch_buffer, footer, read_options,
                       metaindex_handle, metaindex_contents, ioptions,
                       false /* do decompression */, false /*maybe_compressed*/,
-                      BlockType::kMetaIndex, UncompressionDict::GetEmptyDict(),
+                      BlockType::kMetaIndex, nullptr /*decompressor*/,
                       PersistentCacheOptions::kEmpty, memory_allocator)
       .ReadBlockContents();
 }
@@ -568,8 +687,8 @@ Status ReadMetaBlock(RandomAccessFileReader* file,
   return BlockFetcher(file, prefetch_buffer, footer, read_options, block_handle,
                       contents, ioptions, false /* decompress */,
                       false /*maybe_compressed*/, block_type,
-                      UncompressionDict::GetEmptyDict(),
-                      PersistentCacheOptions::kEmpty, memory_allocator)
+                      nullptr /*decompressor*/, PersistentCacheOptions::kEmpty,
+                      memory_allocator)
       .ReadBlockContents();
 }
 

@@ -8,7 +8,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <atomic>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
@@ -16,8 +18,8 @@
 #include "file/filename.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
-#include "rocksdb/options.h"
 #include "rocksdb/utilities/transaction_db.h"
+#include "table/block_based/block_based_table_builder.h"
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "util/cast_util.h"
@@ -34,6 +36,17 @@ static std::string NEW_VALUE = "NewValue";
 class DBFlushTest : public DBTestBase {
  public:
   DBFlushTest() : DBTestBase("db_flush_test", /*env_do_fsync=*/true) {}
+
+  // Wait for all background flush callbacks to complete before Close().
+  // Close() calls db_.reset() which nulls the unique_ptr before the destructor
+  // runs, so a concurrent OnFlushCompleted reading test_->db_ would race.
+  // WaitForCompact() waits for bg_flush_scheduled_==0 (which is decremented
+  // after listener callbacks return) without setting shutting_down_ (so
+  // callbacks are not skipped) and without requiring NumNotFlushed()==0 (which
+  // would hang when mempurge leaves a memtable in imm()).
+  Status WaitForFlushCallbacks() {
+    return db_->WaitForCompact(WaitForCompactOptions());
+  }
 };
 
 class DBFlushDirectIOTest : public DBFlushTest,
@@ -87,8 +100,8 @@ TEST_F(DBFlushTest, SyncFail) {
   options.env = fault_injection_env.get();
 
   SyncPoint::GetInstance()->LoadDependency(
-      {{"DBFlushTest::SyncFail:1", "DBImpl::SyncClosedLogs:Start"},
-       {"DBImpl::SyncClosedLogs:Failed", "DBFlushTest::SyncFail:2"}});
+      {{"DBFlushTest::SyncFail:1", "DBImpl::SyncClosedWals:Start"},
+       {"DBImpl::SyncClosedWals:Failed", "DBFlushTest::SyncFail:2"}});
   SyncPoint::GetInstance()->EnableProcessing();
 
   CreateAndReopenWithCF({"pikachu"}, options);
@@ -102,7 +115,7 @@ TEST_F(DBFlushTest, SyncFail) {
   TEST_SYNC_POINT("DBFlushTest::SyncFail:2");
   fault_injection_env->SetFilesystemActive(true);
   // Now the background job will do the flush; wait for it.
-  // Returns the IO error happend during flush.
+  // Returns the IO error happened during flush.
   ASSERT_NOK(dbfull()->TEST_WaitForFlushMemTable());
   ASSERT_EQ("", FilesPerLevel());  // flush failed.
   Destroy(options);
@@ -112,8 +125,8 @@ TEST_F(DBFlushTest, SyncSkip) {
   Options options = CurrentOptions();
 
   SyncPoint::GetInstance()->LoadDependency(
-      {{"DBFlushTest::SyncSkip:1", "DBImpl::SyncClosedLogs:Skip"},
-       {"DBImpl::SyncClosedLogs:Skip", "DBFlushTest::SyncSkip:2"}});
+      {{"DBFlushTest::SyncSkip:1", "DBImpl::SyncClosedWals:Skip"},
+       {"DBImpl::SyncClosedWals:Skip", "DBFlushTest::SyncSkip:2"}});
   SyncPoint::GetInstance()->EnableProcessing();
 
   Reopen(options);
@@ -462,6 +475,61 @@ TEST_F(DBFlushTest, StatisticsGarbageBasic) {
   Close();
 }
 
+TEST_F(DBFlushTest, FlushReasonStatsWriteBufferFull) {
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
+  options.create_if_missing = true;
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_shutdown = true;
+  options.write_buffer_size = 16 * 1024;
+  options.max_write_buffer_number = 8;
+
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  flush_listener->expected_flush_reason = FlushReason::kWriteBufferFull;
+  options.listeners.push_back(flush_listener);
+
+  ASSERT_OK(TryReopen(options));
+
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(Put(Key(i), DummyString(10 * 1024), write_options));
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+
+  const uint64_t write_buffer_full_flushes =
+      TestGetTickerCount(options, FLUSH_REASON_WRITE_BUFFER_FULL);
+  ASSERT_GT(write_buffer_full_flushes, 0);
+  EXPECT_EQ(0, TestGetTickerCount(options, FLUSH_REASON_WRITE_BUFFER_MANAGER));
+
+  HistogramData all_memtable_memory;
+  options.statistics->histogramData(FLUSH_MEMTABLE_MEMORY_BYTES,
+                                    &all_memtable_memory);
+  EXPECT_GE(all_memtable_memory.count, write_buffer_full_flushes);
+  EXPECT_GT(all_memtable_memory.sum, 0);
+
+  HistogramData all_memtable_data_size;
+  options.statistics->histogramData(FLUSH_MEMTABLE_TOTAL_DATA_SIZE,
+                                    &all_memtable_data_size);
+  EXPECT_GE(all_memtable_data_size.count, write_buffer_full_flushes);
+  EXPECT_GT(all_memtable_data_size.sum, 0);
+
+  HistogramData write_buffer_full_memtable_memory;
+  options.statistics->histogramData(
+      FLUSH_WRITE_BUFFER_FULL_MEMTABLE_MEMORY_BYTES,
+      &write_buffer_full_memtable_memory);
+  EXPECT_EQ(write_buffer_full_flushes, write_buffer_full_memtable_memory.count);
+  EXPECT_GT(write_buffer_full_memtable_memory.sum, 0);
+
+  HistogramData wbm_memtable_memory;
+  options.statistics->histogramData(
+      FLUSH_WRITE_BUFFER_MANAGER_MEMTABLE_MEMORY_BYTES, &wbm_memtable_memory);
+  EXPECT_EQ(0, wbm_memtable_memory.count);
+}
+
 TEST_F(DBFlushTest, StatisticsGarbageInsertAndDeletes) {
   Options options = CurrentOptions();
   options.statistics = CreateDBStatistics();
@@ -519,11 +587,11 @@ TEST_F(DBFlushTest, StatisticsGarbageInsertAndDeletes) {
   // Note : one set of delete for KEY1, KEY2, KEY3 is written to
   // SSTable to propagate the delete operations to K-V pairs
   // that could have been inserted into the database during past Flush
-  // opeartions.
+  // operations.
   EXPECTED_MEMTABLE_GARBAGE_BYTES_AT_FLUSH -=
       KEY1.size() + KEY2.size() + KEY3.size() + 3 * sizeof(uint64_t);
 
-  // Additional useful paylaod.
+  // Additional useful payload.
   ASSERT_OK(Delete(KEY4));
   ASSERT_OK(Delete(KEY5));
   ASSERT_OK(Delete(KEY6));
@@ -615,7 +683,7 @@ TEST_F(DBFlushTest, StatisticsGarbageRangeDeletes) {
 
   // Note : one set of deleteRange for (KEY1, KEY2) and (KEY2, KEY3) is written
   // to SSTable to propagate the deleteRange operations to K-V pairs that could
-  // have been inserted into the database during past Flush opeartions.
+  // have been inserted into the database during past Flush operations.
   EXPECTED_MEMTABLE_GARBAGE_BYTES_AT_FLUSH -=
       (KEY1.size() + KEY2.size() + sizeof(uint64_t)) +
       (KEY2.size() + KEY3.size() + sizeof(uint64_t));
@@ -710,7 +778,7 @@ class TestFlushListener : public EventListener {
     // that assumption does not hold (see the test case MultiDBMultiListeners
     // below).
     ASSERT_TRUE(test_);
-    if (db == test_->db_) {
+    if (db == test_->db_.get()) {
       std::vector<std::vector<FileMetaData>> files_by_level;
       test_->dbfull()->TEST_GetFilesMetaData(db->DefaultColumnFamily(),
                                              &files_by_level);
@@ -843,7 +911,7 @@ TEST_F(DBFlushTest, FixFlushReasonRaceFromConcurrentFlushes) {
     ASSERT_OK(Put(1, Key(idx), std::string(1, 'v')));
   }
 
-  // To coerce a manual flush happenning in the middle of GetLiveFiles's flush,
+  // To coerce a manual flush happening in the middle of GetLiveFiles's flush,
   // we need to pause background flush thread and enable it later.
   std::shared_ptr<test::SleepingBackgroundTask> sleeping_task =
       std::make_shared<test::SleepingBackgroundTask>();
@@ -852,7 +920,7 @@ TEST_F(DBFlushTest, FixFlushReasonRaceFromConcurrentFlushes) {
                  sleeping_task.get(), Env::Priority::HIGH);
   sleeping_task->WaitUntilSleeping();
 
-  // Coerce a manual flush happenning in the middle of GetLiveFiles's flush
+  // Coerce a manual flush happening in the middle of GetLiveFiles's flush
   bool get_live_files_paused_at_sync_point = false;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::AtomicFlushMemTables:AfterScheduleFlush", [&](void* /* arg */) {
@@ -1056,6 +1124,7 @@ TEST_F(DBFlushTest, MemPurgeBasic) {
   ASSERT_EQ(Get(RNDKEY2), p_rv2);
   ASSERT_EQ(Get(RNDKEY3), p_rv3);
 
+  ASSERT_OK(WaitForFlushCallbacks());
   Close();
 }
 
@@ -1170,6 +1239,7 @@ TEST_F(DBFlushTest, MemPurgeBasicToggle) {
   // We expect no mempurge at all.
   EXPECT_EQ(mempurge_count.exchange(0), ZERO);
 
+  ASSERT_OK(WaitForFlushCallbacks());
   Close();
 }
 // End of MemPurgeBasicToggle, which is not
@@ -1426,10 +1496,11 @@ TEST_F(DBFlushTest, MemPurgeDeleteAndDeleteRange) {
     delete iter;
   }
 
+  ASSERT_OK(WaitForFlushCallbacks());
   Close();
 }
 
-// Create a Compaction Fitler that will be invoked
+// Create a Compaction Filter that will be invoked
 // at flush time and will update the value of a KV pair
 // if the key string is "lower" than the filter_key_ string.
 class ConditionalUpdateFilter : public CompactionFilter {
@@ -1838,6 +1909,8 @@ TEST_F(DBFlushTest, MemPurgeCorrectLogNumberAndSSTFileCreation) {
     }
   }
 
+  ASSERT_OK(WaitForFlushCallbacks());
+
   // Check that there was at least one mempurge
   uint32_t expected_min_mempurge_count = 1;
   // Check that there was no SST files created during flush.
@@ -1858,6 +1931,8 @@ TEST_F(DBFlushTest, MemPurgeCorrectLogNumberAndSSTFileCreation) {
     ASSERT_EQ(Get(key), value);
   }
 
+  ASSERT_OK(WaitForFlushCallbacks());
+
   // Check that there was at least one SST files created during flush.
   expected_sst_count = 1;
   EXPECT_GE(sst_count.load(), expected_sst_count);
@@ -1876,6 +1951,88 @@ TEST_F(DBFlushTest, MemPurgeCorrectLogNumberAndSSTFileCreation) {
   }
   // Extra check of database consistency.
   ASSERT_EQ(Get(key), value);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  Close();
+}
+
+// Reproduction for MemPurge memtable ID ordering bug.
+// When MemPurge runs, it releases db_mutex_. During that window, new
+// memtables can be switched to the immutable list with higher IDs. When
+// MemPurge re-acquires the mutex and adds its output memtable using the
+// stale ID from mems_.back(), the ordering assertion fires.
+TEST_F(DBFlushTest, MemPurgeIdOrdering) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.compression = kNoCompression;
+  options.inplace_update_support = false;
+  options.allow_concurrent_memtable_write = true;
+  options.write_buffer_size = 1 << 20;  // 1MB
+  // Allow enough immutable memtables so writes don't stall while the
+  // flush thread is paused in the sync point.
+  options.max_write_buffer_number = 8;
+  // Always attempt MemPurge on flush.
+  options.experimental_mempurge_threshold = 1.0;
+  ASSERT_OK(TryReopen(options));
+
+  // Coordinate via LoadDependency:
+  //   1. Flush thread hits BeforeReacquireMutex -> foreground unblocks
+  //   2. Foreground writes data, triggers memtable switch
+  //   3. Foreground hits SwitchDone -> flush thread unblocks at
+  //   AfterWaitForTest
+  //   4. Flush thread re-acquires mutex, tries AddMemTable with stale ID
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
+      {{"FlushJob::MemPurge:BeforeReacquireMutex",
+        "DBFlushTest::MemPurgeIdOrdering:StartWriting"},
+       {"DBFlushTest::MemPurgeIdOrdering:SwitchDone",
+        "FlushJob::MemPurge:AfterWaitForTest"}});
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  const int kValueSize = 10240;  // 10KB values like MemPurgeBasic
+  const int kNumKeys = 30;
+  Random rnd(301);
+
+  // Fill the memtable with overwrites of the same keys so MemPurge
+  // can compact them down (high garbage ratio). Each round is ~300KB,
+  // need ~3 rounds to approach the 1MB write_buffer_size.
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < kNumKeys; i++) {
+      ASSERT_OK(Put("key" + std::to_string(i), rnd.RandomString(kValueSize)));
+    }
+  }
+
+  // One more round should trigger a flush with MemPurge in the background.
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_OK(Put("key" + std::to_string(i), rnd.RandomString(kValueSize)));
+  }
+
+  // Block until MemPurge reaches the sync point (db_mutex_ released).
+  TEST_SYNC_POINT("DBFlushTest::MemPurgeIdOrdering:StartWriting");
+
+  // Now MemPurge is paused with db_mutex_ released. Write enough data
+  // to fill another memtable and trigger a switch. This creates an
+  // immutable memtable with a higher ID than the one being mempurged.
+  for (int i = 0; i < kNumKeys * 4; i++) {
+    ASSERT_OK(Put("newkey" + std::to_string(i), rnd.RandomString(kValueSize)));
+  }
+
+  // Let MemPurge continue -- it will re-acquire the mutex and try to
+  // add the output memtable with the stale ID.
+  TEST_SYNC_POINT("DBFlushTest::MemPurgeIdOrdering:SwitchDone");
+
+  // Allow background work to finish.
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  // If the bug is present, the assertion in AddMemTable fires before
+  // we reach here.
+  for (int i = 0; i < kNumKeys; i++) {
+    ASSERT_NE(Get("key" + std::to_string(i)), "NOT_FOUND");
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 
   Close();
 }
@@ -2064,8 +2221,12 @@ TEST_F(DBFlushTest, FireOnFlushCompletedAfterCommittedResult) {
   listener->seq1 = db_->GetLatestSequenceNumber();
   // t1 will wait for the second flush complete before committing flush result.
   auto t1 = port::Thread([&]() {
-    // flush_opts.wait = true
-    ASSERT_OK(db_->Flush(FlushOptions()));
+    // flush_opts.wait = true, and listener_wait = true so that Flush() does not
+    // return until the OnFlushCompleted callbacks (which set completed1 and
+    // completed2) have finished running.
+    FlushOptions flush_opts;
+    flush_opts.listener_wait = true;
+    ASSERT_OK(db_->Flush(flush_opts));
   });
   // Wait for first flush started.
   TEST_SYNC_POINT(
@@ -2078,13 +2239,140 @@ TEST_F(DBFlushTest, FireOnFlushCompletedAfterCommittedResult) {
   flush_opts.wait = false;
   ASSERT_OK(db_->Flush(flush_opts));
   t1.join();
-  // Ensure background work is fully finished including listener callbacks
-  // before accessing listener state.
-  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  // listener_wait on t1's flush above guarantees both OnFlushCompleted
+  // callbacks have finished by the time Flush() returned; no need to
+  // additionally wait for background work here.
   ASSERT_TRUE(listener->completed1);
   ASSERT_TRUE(listener->completed2);
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+namespace {
+// EventListener whose OnFlushCompleted blocks until explicitly released, used
+// to verify FlushOptions::listener_wait. Optionally only blocks on the first
+// callback (useful for atomic flush, which fires one callback per CF).
+class BlockingFlushListener : public EventListener {
+ public:
+  explicit BlockingFlushListener(bool block_only_first)
+      : block_only_first_(block_only_first) {}
+
+  void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& /*info*/) override {
+    if (block_only_first_ && num_completed_.fetch_add(1) != 0) {
+      return;
+    }
+    std::unique_lock<std::mutex> lk(mu_);
+    entered_ = true;
+    cv_.notify_all();
+    cv_.wait(lk, [this] { return release_; });
+    returned_ = true;
+  }
+
+  void WaitUntilEntered() {
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [this] { return entered_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      release_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  bool CallbackReturned() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return returned_;
+  }
+
+ private:
+  const bool block_only_first_;
+  std::atomic<int> num_completed_{0};
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool entered_ = false;
+  bool release_ = false;
+  bool returned_ = false;
+};
+}  // anonymous namespace
+
+TEST_F(DBFlushTest, ListenerWaitWaitsForOnFlushCompleted) {
+  // With FlushOptions::listener_wait, Flush(wait=true) must not return until
+  // the OnFlushCompleted callback has finished, even if the flush result is
+  // already committed and bg_cv_ is signalled by unrelated background work.
+  auto listener = std::make_shared<BlockingFlushListener>(
+      /*block_only_first=*/false);
+  Options options = CurrentOptions();
+  options.listeners.push_back(listener);
+  Reopen(options);
+  ASSERT_OK(Put("k", "v"));
+
+  std::atomic<bool> flush_returned{false};
+  port::Thread flush_thread([&] {
+    // Exercises the TEST_ wrapper, which flushes with wait=true and
+    // listener_wait=true.
+    ASSERT_OK(dbfull()->TEST_FlushMemTableWithListenerWait());
+    flush_returned.store(true);
+  });
+
+  // Wait until we are inside OnFlushCompleted. At this point the memtable has
+  // already been committed/removed, which is what unblocks a plain
+  // Flush(wait=true).
+  listener->WaitUntilEntered();
+
+  // Pump spurious bg_cv_ wakeups. A waiter that ignored listener_wait would
+  // wake, observe the memtable already gone, and return here.
+  for (int i = 0; i < 10; ++i) {
+    db_->DisableManualCompaction();
+    db_->EnableManualCompaction();
+  }
+
+  // The OnFlushCompleted callback has not returned, so neither must Flush().
+  ASSERT_FALSE(listener->CallbackReturned());
+  ASSERT_FALSE(flush_returned.load());
+
+  listener->Release();
+  flush_thread.join();
+  ASSERT_TRUE(flush_returned.load());
+  ASSERT_TRUE(listener->CallbackReturned());
+}
+
+TEST_F(DBFlushTest, ListenerWaitAtomicFlushWaitsForAllOnFlushCompleted) {
+  // Same guarantee for atomic flush across multiple column families. The atomic
+  // flush removes all CFs' memtables together and then fires OnFlushCompleted
+  // per CF, releasing the DB mutex between CFs; listener_wait must still block
+  // Flush() until the (first, still-running) callback has finished.
+  auto listener = std::make_shared<BlockingFlushListener>(
+      /*block_only_first=*/true);
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.listeners.push_back(listener);
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(0, "k0", "v0"));
+  ASSERT_OK(Put(1, "k1", "v1"));
+
+  std::atomic<bool> flush_returned{false};
+  port::Thread flush_thread([&] {
+    FlushOptions fo;
+    fo.wait = true;
+    fo.listener_wait = true;
+    ASSERT_OK(db_->Flush(fo, {handles_[0], handles_[1]}));
+    flush_returned.store(true);
+  });
+
+  listener->WaitUntilEntered();
+  for (int i = 0; i < 10; ++i) {
+    db_->DisableManualCompaction();
+    db_->EnableManualCompaction();
+  }
+  ASSERT_FALSE(listener->CallbackReturned());
+  ASSERT_FALSE(flush_returned.load());
+
+  listener->Release();
+  flush_thread.join();
+  ASSERT_TRUE(flush_returned.load());
+  ASSERT_TRUE(listener->CallbackReturned());
 }
 
 TEST_F(DBFlushTest, FlushWithBlob) {
@@ -2382,7 +2670,7 @@ TEST_F(DBFlushTest, PickRightMemtables) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncClosedLogs:BeforeReLock", [&](void* /*arg*/) {
+      "DBImpl::SyncClosedWals:BeforeReLock", [&](void* /*arg*/) {
         ASSERT_OK(db_->Put(WriteOptions(), handles_[1], "what", "v"));
         auto* cfhi =
             static_cast_with_check<ColumnFamilyHandleImpl>(handles_[1]);
@@ -2534,7 +2822,7 @@ TEST_F(DBFlushTest, TombstoneVisibleInSnapshot) {
 
   ASSERT_OK(db_->Put(WriteOptions(), "foo", "value0"));
 
-  ManagedSnapshot snapshot_guard(db_);
+  ManagedSnapshot snapshot_guard(db_.get());
 
   ColumnFamilyHandle* default_cf = db_->DefaultColumnFamily();
   ASSERT_OK(db_->Flush(FlushOptions(), default_cf));
@@ -2575,7 +2863,7 @@ TEST_P(DBAtomicFlushTest, ManualFlushUnder2PC) {
   txn_db_opts.write_policy = TxnDBWritePolicy::WRITE_COMMITTED;
   ASSERT_OK(TransactionDB::Open(options, txn_db_opts, dbname_, &txn_db));
   ASSERT_NE(txn_db, nullptr);
-  db_ = txn_db;
+  db_.reset(txn_db);
 
   // Create two more columns other than default CF.
   std::vector<std::string> cfs = {"puppy", "kitty"};
@@ -2639,15 +2927,16 @@ TEST_P(DBAtomicFlushTest, ManualFlushUnder2PC) {
   // it means atomic flush didn't write the min_log_number_to_keep to MANIFEST.
   cfs.push_back(kDefaultColumnFamilyName);
   ASSERT_OK(TryReopenWithColumnFamilies(cfs, options));
-  DBImpl* db_impl = static_cast<DBImpl*>(db_);
-  ASSERT_TRUE(db_impl->allow_2pc());
-  ASSERT_NE(db_impl->MinLogNumberToKeep(), 0);
+  ASSERT_TRUE(dbfull()->allow_2pc());
+  ASSERT_NE(dbfull()->MinLogNumberToKeep(), 0);
 }
 
 TEST_P(DBAtomicFlushTest, ManualAtomicFlush) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
   options.atomic_flush = GetParam();
+  options.statistics = CreateDBStatistics();
+  options.statistics->set_stats_level(StatsLevel::kAll);
   options.write_buffer_size = (static_cast<size_t>(64) << 20);
   auto flush_listener = std::make_shared<FlushCounterListener>();
   flush_listener->expected_flush_reason = FlushReason::kManualFlush;
@@ -2673,6 +2962,16 @@ TEST_P(DBAtomicFlushTest, ManualAtomicFlush) {
     cf_ids.emplace_back(static_cast<int>(i));
   }
   ASSERT_OK(Flush(cf_ids));
+
+  EXPECT_EQ(options.atomic_flush ? 1 : 0,
+            TestGetTickerCount(options, ATOMIC_FLUSH_REQUEST_REASON_OTHER));
+  EXPECT_EQ(0, TestGetTickerCount(
+                   options, ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_FULL));
+  EXPECT_EQ(0, TestGetTickerCount(
+                   options, ATOMIC_FLUSH_REQUEST_REASON_WRITE_BUFFER_MANAGER));
+  EXPECT_EQ(0, TestGetTickerCount(
+                   options,
+                   ATOMIC_FLUSH_REQUEST_REASON_MEMTABLE_MAX_RANGE_DELETIONS));
 
   for (size_t i = 0; i != num_cfs; ++i) {
     auto cfh = static_cast<ColumnFamilyHandleImpl*>(handles_[i]);
@@ -3189,383 +3488,6 @@ TEST_P(DBAtomicFlushTest, BgThreadNoWaitAfterManifestError) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-// Disable auto flush shouldn't affect how WriteBufferManager works
-TEST_F(DBFlushTest, DisableAutoFlushWhenExceedDBWriteBufferSize) {
-    Options options;
-    options.env = env_;
-    options.db_write_buffer_size = 100;
-    options.write_buffer_size = 10 << 20;
-    options.disable_auto_flush = true;
-    Reopen(options);
-
-    auto versions = dbfull()->GetVersionSet();
-    auto mem_id = versions->GetColumnFamilySet()->GetDefault()->mem()->GetID();
-
-    // The db_write_buffer_size is so small that each Put will trigger write
-    // buffer full handling
-    // 
-    // Flush won't be triggered since memtable is empty
-    ASSERT_OK(Put("k1", "v1"));
-
-    // flush triggered this time
-    ASSERT_OK(Put("k2", "v2"));
-    EXPECT_NE(mem_id,
-              versions->GetColumnFamilySet()->GetDefault()->mem()->GetID());
-    Close();
-}
-
-// When WAL is supported, auto flush should never be disabled
-TEST_F(DBFlushTest, DisableAutoFlushWhenSwitchWAL) {
-  Options options;
-  options.env = env_;
-  options.db_write_buffer_size = 0;
-  options.write_buffer_size = 10 << 20;
-  options.max_total_wal_size = 1;
-  options.disable_auto_flush = true;
-  Reopen(options);
-  // switchWAL will only be triggered with more than 1 CF
-  CreateColumnFamilies({"cf1"}, options);
-
-  auto versions = dbfull()->GetVersionSet();
-  auto default_cf = versions->GetColumnFamilySet()
-                ->GetDefault();
-  auto cf1 = versions->GetColumnFamilySet()->GetColumnFamily("cf1");
-  auto mem_table_id = default_cf->mem()->GetID();
-  auto cf1_memtable_id = cf1->mem()->GetID();
-
-  // This write will cause log size to exceed limit
-  EXPECT_OK(Put("k1", "v1"));
-
-  // This write will trigger SwitchWAL, but it will fail since flush disabled
-  EXPECT_NOK(Put("k2", "v2"));
-
-  EXPECT_EQ(mem_table_id, default_cf->mem()->GetID());
-
-  // verify that put k2 fails
-  PinnableSlice value;
-  EXPECT_NOK(Get("k2", &value));
-
-  ASSERT_OK(db_->SetOptions({{"disable_auto_flush", "false"}}));
-
-  // this write will trigger SwitchWAL, but since CF1 still has flush
-  // disabled, switchWAL is not triggered
-  EXPECT_NOK(Put("k2", "v2"));
-
-  EXPECT_EQ(mem_table_id, default_cf->mem()->GetID());
-
-  // update cf1 disable_flush setting
-  ASSERT_OK(db_->SetOptions(handles_[0], {{"disable_auto_flush", "false"}}));
-
-  // this write will trigger SwitchWAL and flush
-  EXPECT_OK(Put("k2", "v2"));
-
-  EXPECT_NE(mem_table_id, default_cf->mem()->GetID());
-  // cf1 is also flushed since the log number is old enough 
-  EXPECT_NE(cf1_memtable_id, cf1->mem()->GetID());
-
-  Close();
-}
-
-// Manual flush can still be issued when diable_auto_flush = true
-TEST_F(DBFlushTest, DisableAutoFlushWhenManualFlush) {
-  Options options;
-  options.env = env_;
-  options.disable_auto_flush = true;
-  Reopen(options);
-  ASSERT_OK(Put("k1", "v1"));
-  EXPECT_OK(Flush({}));
-  Close();
-}
-
-// When auto flush disabled, memtables won't be flushed even when
-// the size exceeds write_buffer_size limit
-TEST_F(DBFlushTest, DisableAutoFlushWhenExceedWriteBufferSize) {
-  Options options;
-  options.disable_auto_flush = true;
-  options.env = env_;
-  // minimum write buffer size we can set is 65536
-  options.write_buffer_size = 65536;
-  Reopen(options);
-  auto versions = dbfull()->GetVersionSet();
-  auto default_cf = versions->GetColumnFamilySet()
-                ->GetDefault();
-
-  // make sure our write_buffer_size setting is not sanitized
-  EXPECT_EQ(default_cf->GetLatestCFOptions().write_buffer_size, 65536);
-  auto mem_table_id = default_cf->mem()->GetID();
-  // generate enough keys to exceed write buffer size limit
-  for (int i = 0; i < 2000; i++) {
-    ASSERT_OK(Put("k" + std::to_string(i), "v" + std::to_string(i)));
-  }
-  // memtable is not switched
-  EXPECT_EQ(mem_table_id, default_cf->mem()->GetID());
-
-  // Turn on flush
-  ASSERT_OK(db_->SetOptions({{"disable_auto_flush", "false"}}));
-
-  // this write should update the flush state and schedule work in flush scheduler
-  ASSERT_OK(Put("new_k1", "new_v1"));
-
-  // this write will cause the flush to be scheduled
-  ASSERT_OK(Put("new_k2", "new_v2"));
-
-  // verify that memtable is switched
-  EXPECT_NE(mem_table_id, default_cf->mem()->GetID());
-
-  Close();
-}
-
-// Test the case of disable auto flush when there are multiple CFs and
-// atomic_flush=true
-TEST_F(DBFlushTest, DisableAutoFlushMultiCFAndAtomicFlush) {
-  auto triggerRandomWrites = [this](uint32_t handle_idx, size_t num_keys) {
-    for (size_t i = 0; i < num_keys; i++) {
-      ASSERT_OK(Put(handle_idx, "k" + std::to_string(i), "v" + std::to_string(i)));
-    }
-  };
-
-  Options options;
-  options.disable_auto_flush = true;
-  options.env = env_;
-
-  options.write_buffer_size = 65536;
-  options.atomic_flush = true;
-  Reopen(options);
-  CreateColumnFamilies({"cf1", "cf2"}, options);
-  auto versions = dbfull()->GetVersionSet();
-  auto cf1 = versions->GetColumnFamilySet()->GetColumnFamily("cf1");
-  auto cf2 = versions->GetColumnFamilySet()->GetColumnFamily("cf2");
-
-  auto getCurrentMemtableIds = [cf1, cf2]() {
-    return std::make_pair<>(cf1->mem()->GetID(), cf2->mem()->GetID());
-  };
-  auto memtable_ids = getCurrentMemtableIds();
-  triggerRandomWrites(0 /* cf1 */, 2000);
-  triggerRandomWrites(1 /* cf2 */, 2000);
-
-  // Double check memtables are not switched
-  EXPECT_EQ(memtable_ids, getCurrentMemtableIds());
-
-  // Turn on flush for default_cf and cf1
-  ASSERT_OK(db_->SetOptions({{"disable_auto_flush", "false"}}));
-  ASSERT_OK(db_->SetOptions(handles_[0], {{"disable_auto_flush", "false"}}));
-
-  // this write should update the flush state for cf1 and schedule work in flush scheduler
-  ASSERT_OK(Put(0 /* cf1 */, "new_k1", "new_v1"));
-
-  // this write will trigger `ScheduleFlushes`, but since cf2 has flush disabled,
-  // atomic flush still won't be triggered
-  ASSERT_OK(Put(0 /* cf1 */, "new_k2", "new_v2"));
-
-  // cf1 has been put into flush_scheduler queue, so the flush state has been
-  // cleared
-  EXPECT_FALSE(cf1->mem()->ShouldScheduleFlush());
-  EXPECT_TRUE(cf1->mem()->ShouldFlushNow());
-  // cf2's flush state is not even updated yet. Of course, it won't be in
-  // flush_scheduler queue
-  EXPECT_FALSE(cf2->mem()->ShouldScheduleFlush());
-  EXPECT_TRUE(cf2->mem()->ShouldFlushNow());
-
-  // enable auto flush for cf2
-  ASSERT_OK(db_->SetOptions(handles_[1], {{"disable_auto_flush", "false"}}));
-
-  // This write will trigger `ScheduleFlushes` again. cf1 is in flush_scheduler,
-  // cf2 is not, but since atomic_flush = true, all non-empty CFs will be flushed
-  ASSERT_OK(Put(0 /* cf1 */, "new_k3", "new_v3"));
-
-  // double check that both CFs are flushed
-  EXPECT_GT(cf1->mem()->GetID(), memtable_ids.first);
-  EXPECT_GT(cf2->mem()->GetID(), memtable_ids.second);
-  EXPECT_FALSE(cf1->mem()->ShouldFlushNow());
-  EXPECT_FALSE(cf2->mem()->ShouldFlushNow());
-
-  Close();
-}
-
-// Test the case of disable auto flush when there are multiple CFs and
-// atomic_flush=false
-TEST_F(DBFlushTest, DisableAutoFlushMultiCF) {
-  auto triggerRandomWrites = [this](uint32_t handle_idx, size_t num_keys) {
-    for (size_t i = 0; i < num_keys; i++) {
-      ASSERT_OK(Put(handle_idx, "k" + std::to_string(i), "v" + std::to_string(i)));
-    }
-  };
-
-  Options options;
-  options.disable_auto_flush = true;
-  options.env = env_;
-
-  options.write_buffer_size = 65536;
-  options.atomic_flush = false;
-  Reopen(options);
-  CreateColumnFamilies({"cf1", "cf2"}, options);
-  auto versions = dbfull()->GetVersionSet();
-  auto cf1 = versions->GetColumnFamilySet()->GetColumnFamily("cf1");
-  auto cf2 = versions->GetColumnFamilySet()->GetColumnFamily("cf2");
-
-  auto getCurrentMemtableIds = [cf1, cf2]() {
-    return std::make_pair<>(cf1->mem()->GetID(), cf2->mem()->GetID());
-  };
-  auto memtable_ids = getCurrentMemtableIds();
-  triggerRandomWrites(0 /* cf1 */, 2000);
-  triggerRandomWrites(1 /* cf2 */, 2000);
-
-  // Double check memtables are not switched
-  EXPECT_EQ(memtable_ids, getCurrentMemtableIds());
-
-  // Turn on flush for default_cf and cf1
-  ASSERT_OK(db_->SetOptions({{"disable_auto_flush", "false"}}));
-  ASSERT_OK(db_->SetOptions(handles_[0], {{"disable_auto_flush", "false"}}));
-
-  // this write should update the flush state for cf1 and schedule work in flush scheduler
-  ASSERT_OK(Put(0 /* cf1 */, "new_k1", "new_v1"));
-
-  // this write will trigger `ScheduleFlushes` for cf1 so cf1 memtable will be flushed
-  ASSERT_OK(Put(0 /* cf1 */, "new_k2", "new_v2"));
-
-  // double check that cf1 is flushed while cf2 is not
-  EXPECT_GT(cf1->mem()->GetID(), memtable_ids.first);
-  EXPECT_EQ(cf2->mem()->GetID(), memtable_ids.second);
-
-  memtable_ids = getCurrentMemtableIds();
-
-  // enable auto flush for cf2
-  ASSERT_OK(db_->SetOptions(handles_[1], {{"disable_auto_flush", "false"}}));
-
-  // this write should update the flush state for cf2 and schedule work in flush scheduler
-  ASSERT_OK(Put(1 /* cf2 */, "new_k1", "new_v1"));
-
-  // this write will trigger `ScheduleFlushes` for cf2 so cf2 memtable will be flushed
-  ASSERT_OK(Put(1 /* cf2 */, "new_k2", "new_v2"));
-
-  // double check that cf2 is flushed while cf1 is not
-  EXPECT_EQ(cf1->mem()->GetID(), memtable_ids.first);
-  EXPECT_GT(cf2->mem()->GetID(), memtable_ids.second);
-
-  Close();
-}
-
-TEST_F(DBFlushTest, DisableAutoFlushOnRunningDB) {
-  EXPECT_NOK(db_->SetOptions({{"disable_auto_flush", "true"}}));
-}
-
-// Test the case that non-trival compaction job is triggered before
-// we enable auto flush and make sure that compaction job with old
-// mutable_cf_options won't cause auto flush to be disabled
-TEST_F(DBFlushTest, AutoCompactionBeforeEnablingFlush) {
-  const int kNumKeysPerFile = 100;
-
-  Options options;
-  options.env = env_;
-  options.disable_auto_compactions = false;
-  options.disable_auto_flush = true;
-  options.num_levels = 3;
-  options.level0_file_num_compaction_trigger = 3;
-
-  CreateAndReopenWithCF({"pikachu"}, options);
-
-  auto cfd = static_cast_with_check<ColumnFamilyHandleImpl>(handles_[1])->cfd();
-
-  Random rnd(301);
-
-  for (int num = 0; num < options.level0_file_num_compaction_trigger - 1;
-       num++) {
-    std::vector<std::string> values;
-    // Write 100KB (100 values, each 1K)
-    for (int i = 0; i < kNumKeysPerFile; i++) {
-      values.push_back(rnd.RandomString(990));
-      ASSERT_OK(Put(1, Key(i), values[i]));
-    }
-    ASSERT_OK(dbfull()->Flush({}, handles_[1]));
-    ASSERT_EQ(NumTableFilesAtLevel(0, 1), num + 1);
-  }
-
-  // Order of steps:
-  // - CompactionJob with old mutable_cf_options(disable_auto_flush=true)
-  // created but not running yet
-  // - SetOptions with disable_auto_flush=false starts
-  // - SetOptions with disable_auto_flush=false done
-  // - CompactionJob continues to run and InstallSuperVersion with old
-  // mutable_cf_options(disable_auto_flush=true)
-  SyncPoint::GetInstance()->LoadDependency(
-      {{"DBImpl::BackgroundCompaction:NonTrivial:BeforeRun",
-        "DBFlushTest::CompactionBeforeFlush:BeforeEnableAutoFlush"},
-        {
-          "DBFlushTest::CompactionBeforeFlush:AfterEnableAutoFlush",
-          "CompactionJob::Run():Start"
-        }});
-  SyncPoint::GetInstance()->EnableProcessing();
-
-  // Write one more file to trigger auto compaction
-  std::vector<std::string> values;
-  for (int i = 0; i < kNumKeysPerFile; i++) {
-    values.push_back(rnd.RandomString(990));
-    ASSERT_OK(Put(1, Key(i), values[i]));
-  }
-  ASSERT_OK(dbfull()->Flush({}, handles_[1]));
-
-  TEST_SYNC_POINT("DBFlushTest::CompactionBeforeFlush:BeforeEnableAutoFlush");
-  EXPECT_TRUE(cfd->GetSuperVersion()->mutable_cf_options.disable_auto_flush);
-  ASSERT_OK(db_->SetOptions(
-    handles_[1], {{"disable_auto_flush", "false"}}));
-  EXPECT_FALSE(cfd->GetSuperVersion()->mutable_cf_options.disable_auto_flush);
-  TEST_SYNC_POINT("DBFlushTest::CompactionBeforeFlush:AfterEnableAutoFlush");
-
-  ASSERT_OK(dbfull()->TEST_WaitForCompact());
-
-  // old super version of compaction job installed, which has
-  // `disable_auto_flush = true!`
-  EXPECT_TRUE(cfd->GetSuperVersion()->mutable_cf_options.disable_auto_flush);
-  // But auto flush of memtable won't be disabled. So we have a short period
-  // of time that current superversion's `mutable_cf_option` to be not consistent
-  // with memtable's auto_flush setting, which is fine since next time we call
-  // `InstallSuperVersion` will fix this
-  EXPECT_TRUE(cfd->GetSuperVersion()->mem->TEST_IsAutoFlushEnabled());
-
-  // trigger a manual flush to install a new super version
-  // the new superversion will use the latest `mutable_cf_options` of the
-  // CF(`disable_auto_flush=false`)
-  ASSERT_OK(Put(1, "k", "v"));
-  ASSERT_OK(dbfull()->Flush({}, handles_[1]));
-
-  EXPECT_FALSE(cfd->GetSuperVersion()->mutable_cf_options.disable_auto_flush);
-  EXPECT_TRUE(cfd->GetSuperVersion()->mem->TEST_IsAutoFlushEnabled());
-
-  Close();
-  SyncPoint::GetInstance()->DisableProcessing();
-}
-
-TEST_F(DBFlushTest, NoStopWritesWhenAutoFlushDisabled) {
-  Options options = CurrentOptions();
-  options.max_write_buffer_number = 2;
-  options.write_buffer_size = 65536;
-  options.disable_auto_flush = true;
-
-  Reopen(options);
-
-  auto cfd =
-      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
-          ->cfd();
-
-  // generate the immutable memtables
-  db_->PauseBackgroundWork();
-
-  for (int i = 1; i <= options.max_write_buffer_number; i++) {
-    ASSERT_OK(Put("k" + std::to_string(i), "v" + std::to_string(i)));
-    FlushOptions opts;
-    opts.wait = false;
-    opts.allow_write_stall = true;
-    db_->Flush(opts);
-  }
-
-  EXPECT_EQ(cfd->imm()->NumNotFlushed(), options.max_write_buffer_number);
-
-  EXPECT_OK(Put("k0", "v"));
-
-  Close();
-}
-
-#if 0 // RocksDB-Cloud disabled
 TEST_P(DBAtomicFlushTest, NoWaitWhenWritesStopped) {
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
@@ -3603,7 +3525,6 @@ TEST_P(DBAtomicFlushTest, NoWaitWhenWritesStopped) {
 
   SyncPoint::GetInstance()->DisableProcessing();
 }
-#endif
 
 INSTANTIATE_TEST_CASE_P(DBFlushDirectIOTest, DBFlushDirectIOTest,
                         testing::Bool());
@@ -3883,6 +3804,377 @@ TEST_F(DBFlushTest, DBStuckAfterAtomicFlushError) {
   ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
   ASSERT_EQ(1, NumTableFilesAtLevel(0));
 }
+
+TEST_F(DBFlushTest, VerifyOutputRecordCount) {
+  for (bool use_plain_table : {false, true}) {
+    Options options = CurrentOptions();
+    options.flush_verify_memtable_count = true;
+    options.merge_operator = MergeOperators::CreateStringAppendOperator();
+    DestroyAndReopen(options);
+    // Verify flush output record count verification in different table
+    // formats
+    if (use_plain_table) {
+      options.table_factory.reset(NewPlainTableFactory());
+    }
+
+    // Verify that flush output record count verification does not produce false
+    // positives.
+    ASSERT_OK(Merge("k0", "v1"));
+    ASSERT_OK(Put("k1", "v1"));
+    ASSERT_OK(Put("k2", "v1"));
+    ASSERT_OK(SingleDelete("k2"));
+    ASSERT_OK(Delete("k2"));
+    ASSERT_OK(Delete("k3"));
+    ASSERT_OK(db_->DeleteRange(WriteOptions(), "k1", "k3"));
+    ASSERT_OK(Flush());
+
+    // Verify that flush output record count verification catch corruption
+    DestroyAndReopen(options);
+    if (use_plain_table) {
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+          "PlainTableBuilder::Add::skip",
+          [&](void* skip) { *(bool*)skip = true; });
+
+    } else {
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+          "BlockBasedTableBuilder::Add::skip",
+          [&](void* skip) { *(bool*)skip = true; });
+    }
+    SyncPoint::GetInstance()->EnableProcessing();
+    const char* expect =
+        "Number of keys in flush output SST files does not match";
+
+    // 1. During DB open flush
+    ASSERT_OK(Put("k1", "v1"));
+    ASSERT_OK(Put("k2", "v1"));
+    Status s = TryReopen(options);
+    ASSERT_TRUE(s.IsCorruption());
+    ASSERT_TRUE(std::strstr(s.getState(), expect));
+
+    // 2. During regular flush
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("k1", "v1"));
+    ASSERT_OK(Put("k2", "v1"));
+    s = Flush();
+    ASSERT_TRUE(s.IsCorruption());
+    ASSERT_TRUE(std::strstr(s.getState(), expect));
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  }
+}
+
+class DBFlushSuperBlockTest
+    : public DBFlushTest,
+      public ::testing::WithParamInterface<std::tuple<bool, size_t, size_t>> {
+ public:
+  DBFlushSuperBlockTest() : DBFlushTest() {}
+
+  std::string formatKey(int i) {
+    int desired_length = 10;
+    char buffer[64];
+    snprintf(buffer, 64, "%0*d", desired_length, i);
+    return buffer;
+  }
+
+  void VerifyReadWithGet(int key_count) {
+    for (int i = 0; i < key_count; ++i) {
+      PinnableSlice value;
+      ASSERT_OK(Get(formatKey(i), &value));
+      ASSERT_EQ(value.ToString(), added_data[formatKey(i)]);
+    }
+  }
+
+  void VerifyReadWithIterator(int key_count) {
+    {
+      std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+      int i = 0;
+      for (it->SeekToFirst(); it->Valid(); it->Next()) {
+        ASSERT_OK(it->status());
+        ASSERT_EQ((it->key()).ToString(), formatKey(i));
+        ASSERT_EQ((it->value()).ToString(), added_data[formatKey(i)]);
+        i++;
+      }
+      ASSERT_OK(it->status());
+      ASSERT_EQ(i, key_count);
+    }
+  }
+
+ protected:
+  Random rnd{123};
+  std::unordered_map<std::string, std::string> added_data;
+};
+
+constexpr size_t kLowSpaceOverheadRatio = 256;
+
+TEST_P(DBFlushSuperBlockTest, SuperBlock) {
+  constexpr int key_count = 12345;
+  Options options;
+  options.env = env_;
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  options.paranoid_file_checks = true;
+  options.write_buffer_size = 1024 * 1024;
+  BlockBasedTableOptions block_options;
+  block_options.block_align = get<0>(GetParam());
+  block_options.index_block_restart_interval = 3;
+  block_options.super_block_alignment_size = get<1>(GetParam());
+  block_options.super_block_alignment_space_overhead_ratio = get<2>(GetParam());
+  options.table_factory.reset(NewBlockBasedTableFactory(block_options));
+  if (block_options.block_align) {
+    // When block align is enabled, disable compression
+    options.compression = kNoCompression;
+  }
+
+  ASSERT_OK(options.table_factory->ValidateOptions(
+      DBOptions(options), ColumnFamilyOptions(options)));
+
+  Reopen(options);
+
+  int super_block_pad_count = 0;
+  int super_block_pad_exceed_limit_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::WriteMaybeCompressedBlock:"
+      "SuperBlockAlignment",
+      [&super_block_pad_count](void* /*arg*/) { super_block_pad_count++; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::WriteMaybeCompressedBlock:"
+      "SuperBlockAlignmentPaddingBytesExceedLimit",
+      [&super_block_pad_exceed_limit_count](void* /*arg*/) {
+        super_block_pad_exceed_limit_count++;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Add lots of keys
+  for (int i = 0; i < key_count; ++i) {
+    added_data[formatKey(i)] = std::string(rnd.RandomString(rnd.Next() % 1000));
+    ASSERT_OK(Put(formatKey(i), added_data[formatKey(i)]));
+  }
+
+  // flush the data in memory to disk to verify with super block alignment, the
+  // data could be read back properly
+  Reopen(options);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // When block_align is enabled, super block is always aligned, so there should
+  // be 0 padding for super block alignment
+  if (block_options.super_block_alignment_size != 0 &&
+      !block_options.block_align) {
+    ASSERT_GT(super_block_pad_count, 0);
+  } else {
+    ASSERT_EQ(super_block_pad_count, 0);
+  }
+
+  if (!block_options.block_align &&
+      block_options.super_block_alignment_size != 0 &&
+      block_options.super_block_alignment_space_overhead_ratio ==
+          kLowSpaceOverheadRatio) {
+    ASSERT_GT(super_block_pad_exceed_limit_count, 0);
+  }
+
+  // verify the values are correct
+  VerifyReadWithGet(key_count);
+  Reopen(options);
+  VerifyReadWithIterator(key_count);
+
+  // verify checksum
+  ASSERT_OK(db_->VerifyFileChecksums(ReadOptions()));
+
+  // Reopen options and flip the option of super block configuration, read still
+  // works. This verifies the forward/backward compatibility
+  if (block_options.super_block_alignment_size == 0) {
+    block_options.super_block_alignment_size = 16 * 1024;
+  } else {
+    block_options.super_block_alignment_size = 0;
+  }
+  options.table_factory.reset(NewBlockBasedTableFactory(block_options));
+
+  Reopen(options);
+
+  // verify the values are correct
+  VerifyReadWithGet(key_count);
+  Reopen(options);
+  VerifyReadWithIterator(key_count);
+
+  // verify checksum
+  ASSERT_OK(db_->VerifyFileChecksums(ReadOptions()));
+}
+
+INSTANTIATE_TEST_CASE_P(
+    SuperBlockTests, DBFlushSuperBlockTest,
+    testing::Combine(testing::Bool(), testing::Values(0, 32 * 1024, 16 * 1024),
+                     // Use very low space overhead ratio to test
+                     // the case where required padded bytes is
+                     // larger than the max allowed padding size
+                     testing::Values(4, kLowSpaceOverheadRatio)));
+
+// Test that when the table builder's io_status becomes bad during flush
+// (simulating write fault injection), BuildTable properly propagates the
+// builder's IO error instead of producing a misleading Corruption from the
+// num_entries mismatch check.
+TEST_F(DBFlushTest, BuilderWriteFaultPropagationDuringFlush) {
+  Options options = CurrentOptions();
+  options.flush_verify_memtable_count = true;
+  options.table_factory.reset(
+      NewBlockBasedTableFactory(BlockBasedTableOptions()));
+
+  DestroyAndReopen(options);
+
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(100, 'v') + std::to_string(i)));
+  }
+
+  // Skip all Add() calls to simulate entries not being committed (builder
+  // stays empty), as happens when fault injection causes early returns.
+  SyncPoint::GetInstance()->SetCallBack(
+      "BlockBasedTableBuilder::Add::skip",
+      [&](void* skip) { *(bool*)skip = true; });
+
+  // Inject an IOError into the builder's status before the empty check.
+  // This simulates the scenario where write fault injection puts the builder
+  // in an error state, causing all Add() calls to return early (ok() is false)
+  // and leaving the builder empty.
+  SyncPoint::GetInstance()->SetCallBack(
+      "BuildTable:BeforeCheckEmpty", [&](void* arg) {
+        auto* builder = static_cast<BlockBasedTableBuilder*>(
+            static_cast<TableBuilder*>(arg));
+        builder->TEST_InjectIOError();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = Flush();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // With the fix, the builder's IOError is propagated instead of the
+  // misleading Corruption from the key count mismatch check.
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsIOError())
+      << "Expected IOError from builder error propagation, got: "
+      << s.ToString();
+
+  Close();
+}
+// Regression test for table cache leak when flush install fails.
+// BuildTable caches the flush output file (for user reads) but if the
+// subsequent TryInstallMemtableFlushResults (LogAndApply) fails, the
+// cache entry was never evicted. The FindObsoleteFiles backstop normally
+// catches this, but fails under metadata read fault injection
+// (open_metadata_read_fault_one_in), causing
+// TEST_VerifyNoObsoleteFilesCached to fire during Close().
+TEST_F(DBFlushTest, LeakedTableCacheEntryOnFlushInstallFailure) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+
+  Options options = CurrentOptions();
+  options.env = fault_env.get();
+  options.paranoid_file_checks = true;
+  // Disable auto-recovery so it doesn't clean up the orphan on a separate
+  // thread where metadata faults aren't enabled.
+  options.max_bgerror_resume_count = 0;
+  DestroyAndReopen(options);
+
+  // Write data so flush produces a non-empty file.
+  ASSERT_OK(Put("a", std::string(1024, 'x')));
+
+  // After BuildTable succeeds (caching the output file), inject a failure
+  // before the install-or-rollback decision. This simulates scenarios like
+  // CF dropped or shutdown after BuildTable. Also deactivate the filesystem
+  // so the post-flush FindObsoleteFiles backstop cannot scan the directory.
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::Run:PostBuildTable", [&](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("injected");
+        fault_fs->SetFilesystemActive(false);
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Trigger flush -- BuildTable succeeds but LogAndApply fails.
+  Status s = Flush();
+  ASSERT_NOK(s);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // With the fix, the leaked cache entry was already evicted by
+  // ReleaseObsolete in FlushJob::Run(). Without the fix, it persists.
+  // We can verify by counting non-live cache entries. The quarantine
+  // includes the file (BG error is active), but that's only a workaround --
+  // the cache entry should not exist at all with the fix.
+  //
+  // Check: with the fix, the table cache should be empty (the flush output
+  // was never installed and the fix evicted it). Without the fix, there's
+  // a leaked entry.
+  int cache_entries = 0;
+  auto count_fn = [&cache_entries](const Slice&, Cache::ObjectPtr, size_t,
+                                   const Cache::CacheItemHelper*) {
+    cache_entries++;
+  };
+  dbfull()->TEST_table_cache()->ApplyToAllEntries(count_fn, {});
+  ASSERT_EQ(cache_entries, 0)
+      << "Leaked table cache entry for flush output that was never installed";
+
+  // Reactivate filesystem for clean shutdown.
+  fault_fs->SetFilesystemActive(true);
+  db_ = nullptr;  // destructor handles Close
+}
+
+// Verify that ConstructFragmentedRangeTombstones runs after MarkImmutable
+// in SwitchMemtable. A range tombstone inserted between construction and
+// immutability would cause a flush entry count mismatch.
+TEST_F(DBFlushTest, FlushAfterReadPathRangeTombstoneInsertion) {
+  Options options = CurrentOptions();
+  options.min_tombstones_for_range_conversion = 2;
+  options.flush_verify_memtable_count = true;
+  options.statistics = CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  // Write base data and flush to L0.
+  for (char c = 'a'; c <= 'h'; c++) {
+    ASSERT_OK(Put(std::string(1, c), std::string("v") + c));
+  }
+  ASSERT_OK(Flush());
+
+  // Delete contiguous keys in the memtable.
+  for (const auto& key : {"b", "c", "d", "e"}) {
+    ASSERT_OK(Delete(key));
+  }
+
+  // When SwitchMemtable hits the sync point after
+  // ConstructFragmentedRangeTombstones, directly call
+  // AddLogicallyRedundantRangeTombstone on the memtable being switched.
+  // We can't create an iterator here (would deadlock on the DB mutex).
+  auto* cfh = static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily());
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SwitchMemtable:AfterConstructFragmentedRangeTombstones",
+      [&](void*) {
+        // Try to insert a range tombstone. With the fix (Construct after
+        // MarkImmutable), this returns false because the memtable is
+        // already immutable. Without the fix, this succeeds and creates
+        // an entry count mismatch.
+        // Try to insert a range tombstone. With the fix (Construct after
+        // MarkImmutable), this returns false because the memtable is
+        // already immutable. Without the fix, this succeeds and creates
+        // an entry count mismatch.
+        cfh->cfd()->mem()->AddLogicallyRedundantRangeTombstone(
+            1 /* seq */, "b", "f", cfh->cfd()->GetIngestSstLock());
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = Flush();
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(s);
+
+  ASSERT_EQ(Get("a"), "va");
+  ASSERT_EQ(Get("b"), "NOT_FOUND");
+  ASSERT_EQ(Get("d"), "NOT_FOUND");
+  ASSERT_EQ(Get("f"), "vf");
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

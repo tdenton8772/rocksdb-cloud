@@ -1589,8 +1589,9 @@ IOStatus CloudFileSystemImpl::LoadCloudManifest(const std::string& local_dbname,
     // Create dummy CURRENT file to point to the dummy manifest (cloud env
     // will remap the filename appropriately, this is just to fool the
     // underyling RocksDB)
+    // SetCurrentFile gained a Temperature parameter ahead of the directory arg.
     st = SetCurrentFile(WriteOptions(), GetBaseFileSystem().get(), local_dbname,
-                        1 /* descriptor_number */,
+                        1 /* descriptor_number */, Temperature::kUnknown,
                         nullptr /* dir_contains_current_file */);
     if (!st.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, info_log_,

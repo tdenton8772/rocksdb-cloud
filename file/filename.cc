@@ -25,6 +25,7 @@ namespace ROCKSDB_NAMESPACE {
 
 const std::string kCurrentFileName = "CURRENT";
 const std::string kOptionsFileNamePrefix = "OPTIONS-";
+const std::string kCompactionProgressFileNamePrefix = "COMPACTION_PROGRESS-";
 const std::string kTempFileNameSuffix = "dbtmp";
 
 static const std::string kRocksDbTFileExt = "sst";
@@ -242,6 +243,25 @@ std::string TempOptionsFileName(const std::string& dbname, uint64_t file_num) {
   return dbname + "/" + buffer;
 }
 
+std::string CompactionProgressFileName(const std::string& dbname,
+                                       uint64_t timestamp) {
+  char buffer[256];
+  snprintf(buffer, sizeof(buffer), "%s%llu",
+           kCompactionProgressFileNamePrefix.c_str(),
+           static_cast<unsigned long long>(timestamp));
+  return dbname + "/" + buffer;
+}
+
+std::string TempCompactionProgressFileName(const std::string& dbname,
+                                           uint64_t timestamp) {
+  char buffer[256];
+  snprintf(buffer, sizeof(buffer), "%s%llu.%s",
+           kCompactionProgressFileNamePrefix.c_str(),
+           static_cast<unsigned long long>(timestamp),
+           kTempFileNameSuffix.c_str());
+  return dbname + "/" + buffer;
+}
+
 std::string MetaDatabaseName(const std::string& dbname, uint64_t number) {
   char buf[100];
   snprintf(buf, sizeof(buf), "/METADB-%llu",
@@ -264,6 +284,8 @@ std::string IdentityFileName(const std::string& dbname) {
 //    dbname/METADB-[0-9]+
 //    dbname/OPTIONS-[0-9]+
 //    dbname/OPTIONS-[0-9]+.dbtmp
+//    dbname/COMPACTION_PROGRESS-[timestamp]
+//    dbname/COMPACTION_PROGRESS-[timestamp].dbtmp
 //    Disregards / at the beginning
 bool ParseFileName(const std::string& fname, uint64_t* number, FileType* type,
                    WalFileType* log_type) {
@@ -339,6 +361,24 @@ bool ParseFileName(const std::string& fname, uint64_t* number,
     }
     *number = ts_suffix;
     *type = is_temp_file ? kTempFile : kOptionsFile;
+  } else if (rest.starts_with(kCompactionProgressFileNamePrefix)) {
+    uint64_t timestamp;
+    bool is_temp_file = false;
+    rest.remove_prefix(kCompactionProgressFileNamePrefix.size());
+    const std::string kTempFileNameSuffixWithDot =
+        std::string(".") + kTempFileNameSuffix;
+    if (rest.ends_with(kTempFileNameSuffixWithDot)) {
+      rest.remove_suffix(kTempFileNameSuffixWithDot.size());
+      is_temp_file = true;
+    }
+    if (!ConsumeDecimalNumber(&rest, &timestamp)) {
+      return false;
+    }
+    if (!rest.empty()) {
+      return false;
+    }
+    *number = timestamp;
+    *type = is_temp_file ? kTempFile : kCompactionProgressFile;
   } else {
     // Avoid strtoull() to keep filename format independent of the
     // current locale
@@ -388,6 +428,7 @@ bool ParseFileName(const std::string& fname, uint64_t* number,
 
 IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         const std::string& dbname, uint64_t descriptor_number,
+                        Temperature temp,
                         FSDirectory* dir_contains_current_file) {
   // Remove leading "dbname/" and add newline to manifest file name
   std::string manifest = DescriptorFileName(dbname, descriptor_number);
@@ -397,8 +438,11 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
   std::string tmp = TempFileName(dbname, descriptor_number);
   IOOptions opts;
   IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
+  FileOptions file_opts;
+  file_opts.temperature = temp;
   if (s.ok()) {
-    s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts);
+    s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts,
+                          file_opts);
   }
   TEST_SYNC_POINT_CALLBACK("SetCurrentFile:BeforeRename", &s);
   if (s.ok()) {
@@ -423,7 +467,8 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
 }
 
 Status SetIdentityFile(const WriteOptions& write_options, Env* env,
-                       const std::string& dbname, const std::string& db_id) {
+                       const std::string& dbname, Temperature temp,
+                       const std::string& db_id) {
   std::string id;
   if (db_id.empty()) {
     id = env->GenerateUniqueId();
@@ -437,8 +482,11 @@ Status SetIdentityFile(const WriteOptions& write_options, Env* env,
   Status s;
   IOOptions opts;
   s = PrepareIOFromWriteOptions(write_options, opts);
+  FileOptions file_opts;
+  file_opts.temperature = temp;
   if (s.ok()) {
-    s = WriteStringToFile(env, id, tmp, true, &opts);
+    s = WriteStringToFile(env->GetFileSystem().get(), id, tmp,
+                          /*should_sync=*/true, opts, file_opts);
   }
   if (s.ok()) {
     s = env->RenameFile(tmp, identify_file_name);

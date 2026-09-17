@@ -33,7 +33,7 @@ const char* kTieredCacheName = "TieredCache";
 // proportionally across the primary/secondary caches.
 //
 // The primary block cache is initially sized to the sum of the primary cache
-// budget + teh secondary cache budget, as follows -
+// budget + the secondary cache budget, as follows -
 //   |---------    Primary Cache Configured Capacity  -----------|
 //   |---Secondary Cache Budget----|----Primary Cache Budget-----|
 //
@@ -51,7 +51,7 @@ const char* kTieredCacheName = "TieredCache";
 // placeholder is counted against the primary cache. To compensate and count
 // a portion of it against the secondary cache, the secondary cache Deflate()
 // method is called to shrink it. Since the Deflate() causes the secondary
-// actual usage to shrink, it is refelcted here by releasing an equal amount
+// actual usage to shrink, it is reflected here by releasing an equal amount
 // from the pri_cache_res_ reservation. The Deflate() in the secondary cache
 // can be, but is not required to be, implemented using its own cache
 // reservation manager.
@@ -72,7 +72,7 @@ const char* kTieredCacheName = "TieredCache";
 // reservation is increased by an equal amount.
 //
 // Another way of implementing this would have been to simply split the user
-// reservation into primary and seconary components. However, this would
+// reservation into primary and secondary components. However, this would
 // require allocating a structure to track the associated secondary cache
 // reservation, which adds some complexity and overhead.
 //
@@ -121,7 +121,14 @@ CacheWithSecondaryAdapter::~CacheWithSecondaryAdapter() {
     assert(s.ok());
     assert(placeholder_usage_ == 0);
     assert(reserved_usage_ == 0);
-    assert(pri_cache_res_->GetTotalMemoryUsed() == sec_capacity);
+    if (pri_cache_res_->GetTotalMemoryUsed() != sec_capacity) {
+      fprintf(stdout,
+              "~CacheWithSecondaryAdapter: Primary cache reservation: "
+              "%zu, Secondary cache capacity: %zu, "
+              "Secondary cache reserved: %zu\n",
+              pri_cache_res_->GetTotalMemoryUsed(), sec_capacity,
+              sec_reserved_);
+    }
   }
 #endif  // NDEBUG
 }
@@ -134,12 +141,14 @@ bool CacheWithSecondaryAdapter::EvictionHandler(const Slice& key,
     auto obj = target_->Value(handle);
     // Ignore dummy entry
     if (obj != kDummyObj) {
-      bool hit = false;
+      bool force = false;
       if (adm_policy_ == TieredAdmissionPolicy::kAdmPolicyAllowCacheHits) {
-        hit = was_hit;
+        force = was_hit;
+      } else if (adm_policy_ == TieredAdmissionPolicy::kAdmPolicyAllowAll) {
+        force = true;
       }
       // Spill into secondary cache.
-      secondary_cache_->Insert(key, obj, helper, hit).PermitUncheckedError();
+      secondary_cache_->Insert(key, obj, helper, force).PermitUncheckedError();
     }
   }
   // Never takes ownership of obj
@@ -269,7 +278,8 @@ Status CacheWithSecondaryAdapter::Insert(const Slice& key, ObjectPtr value,
   // Warm up the secondary cache with the compressed block. The secondary
   // cache may choose to ignore it based on the admission policy.
   if (value != nullptr && !compressed_value.empty() &&
-      adm_policy_ == TieredAdmissionPolicy::kAdmPolicyThreeQueue) {
+      adm_policy_ == TieredAdmissionPolicy::kAdmPolicyThreeQueue &&
+      helper->IsSecondaryCacheCompatible()) {
     Status status = secondary_cache_->InsertSaved(key, compressed_value, type);
     assert(status.ok() || status.IsNotSupported());
   }
@@ -476,12 +486,10 @@ const char* CacheWithSecondaryAdapter::Name() const {
 // as well. At the moment, we don't have a good way of handling the case
 // where the new capacity < total cache reservations.
 void CacheWithSecondaryAdapter::SetCapacity(size_t capacity) {
-  size_t sec_capacity = static_cast<size_t>(
-      capacity * (distribute_cache_res_ ? sec_cache_res_ratio_ : 0.0));
-  size_t old_sec_capacity = 0;
-
   if (distribute_cache_res_) {
     MutexLock m(&cache_res_mutex_);
+    size_t sec_capacity = static_cast<size_t>(capacity * sec_cache_res_ratio_);
+    size_t old_sec_capacity = 0;
 
     Status s = secondary_cache_->GetCapacity(old_sec_capacity);
     if (!s.ok()) {
@@ -576,7 +584,7 @@ Status CacheWithSecondaryAdapter::UpdateCacheReservationRatio(
   size_t pri_capacity = target_->GetCapacity();
   size_t sec_capacity =
       static_cast<size_t>(pri_capacity * compressed_secondary_ratio);
-  size_t old_sec_capacity;
+  size_t old_sec_capacity = 0;
   Status s = secondary_cache_->GetCapacity(old_sec_capacity);
   if (!s.ok()) {
     return s;
@@ -600,6 +608,7 @@ Status CacheWithSecondaryAdapter::UpdateCacheReservationRatio(
     //    cache utilization (increase in capacity - increase in share of cache
     //    reservation)
     // 3. Increase secondary cache capacity
+    assert(new_sec_reserved >= sec_reserved_);
     s = secondary_cache_->Deflate(new_sec_reserved - sec_reserved_);
     assert(s.ok());
     s = pri_cache_res_->UpdateCacheReservation(
@@ -612,7 +621,7 @@ Status CacheWithSecondaryAdapter::UpdateCacheReservationRatio(
   } else {
     // We're shrinking the ratio. Try to avoid unnecessary evictions -
     // 1. Lower the secondary cache capacity
-    // 2. Decrease pri_cache_res_ reservation to relect lower secondary
+    // 2. Decrease pri_cache_res_ reservation to reflect lower secondary
     //    cache utilization (decrease in capacity - decrease in share of cache
     //    reservations)
     // 3. Inflate the secondary cache to give it back the reduction in its
@@ -661,6 +670,7 @@ std::shared_ptr<Cache> NewTieredCache(const TieredCacheOptions& _opts) {
         break;
       case TieredAdmissionPolicy::kAdmPolicyPlaceholder:
       case TieredAdmissionPolicy::kAdmPolicyAllowCacheHits:
+      case TieredAdmissionPolicy::kAdmPolicyAllowAll:
         if (opts.nvm_sec_cache) {
           valid_adm_policy = false;
         }

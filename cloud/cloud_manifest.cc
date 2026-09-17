@@ -18,7 +18,9 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 struct CorruptionReporter : public log::Reader::Reporter {
-  void Corruption(size_t /*bytes*/, const Status& s) override {
+  // log::Reader::Reporter::Corruption gained a trailing log_number argument.
+  void Corruption(size_t /*bytes*/, const Status& s,
+                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
     if (status->ok()) {
       *status = s;
     }

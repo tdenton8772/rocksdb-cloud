@@ -18,6 +18,13 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// This class supports abstracting different types of an `Env`'s functionality
+// into separate interfaces. It is constructed with a `FileSystem` and a
+// `SystemClock` and delegates:
+// * File system operations to member `file_system_`.
+// * Time related misc operations to member `clock_`.
+// A subclass needs to inherit `CompositeEnv` and provide implementations for
+// the thread management related APIs.
 class CompositeEnv : public Env {
  public:
   // Initialize a CompositeEnvWrapper that delegates all thread/time related
@@ -135,6 +142,13 @@ class CompositeEnv : public Env {
     return file_system_->LinkFile(s, t, io_opts, &dbg);
   }
 
+  Status SyncFile(const std::string& fname, const EnvOptions& env_options,
+                  bool use_fsync) override {
+    IODebugContext dbg;
+    return file_system_->SyncFile(fname, FileOptions(env_options), IOOptions(),
+                                  use_fsync, &dbg);
+  }
+
   Status NumFileLinks(const std::string& fname, uint64_t* count) override {
     IOOptions io_opts;
     IODebugContext dbg;
@@ -250,6 +264,20 @@ class CompositeEnv : public Env {
   }
 };
 
+// A `CompositeEnvWrapper` is constructed with a target `Env` object, an
+// optional `FileSystem` object and an optional `SystemClock` object.
+// `Env::GetFileSystem()` is a fallback file system if no such object is
+// explicitly provided. Similarly, `Env::GetSystemClock()` is a fallback system
+// clock.
+// Besides delegating corresponding functionality to `file_system_` and `clock_`
+// which is inherited from `CompositeEnv`, it also implements the thread
+// management APIs by delegating them to the target `Env` object.
+//
+// Effectively, this class helps to support using customized file system
+// implementations such as a remote file system instead of the default file
+// system provided by the operating system.
+//
+// Also see public API `NewCompositeEnv` in rocksdb/include/env.h
 class CompositeEnvWrapper : public CompositeEnv {
  public:
   // Initialize a CompositeEnvWrapper that delegates all thread/time related
@@ -375,5 +403,4 @@ class CompositeEnvWrapper : public CompositeEnv {
  private:
   EnvWrapper::Target target_;
 };
-
 }  // namespace ROCKSDB_NAMESPACE

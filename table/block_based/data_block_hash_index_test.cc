@@ -18,6 +18,7 @@
 #include "table/table_builder.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/coding.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -96,7 +97,7 @@ TEST(DataBlockHashIndex, DataBlockHashTestSmall) {
     Slice s(buffer2);
     DataBlockHashIndex index;
     uint16_t map_offset;
-    index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+    ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
     // the additional hash map should start at the end of the buffer
     ASSERT_EQ(original_size, map_offset);
@@ -135,7 +136,7 @@ TEST(DataBlockHashIndex, DataBlockHashTest) {
   Slice s(buffer2);
   DataBlockHashIndex index;
   uint16_t map_offset;
-  index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+  ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
@@ -144,6 +145,57 @@ TEST(DataBlockHashIndex, DataBlockHashTest) {
     uint8_t restart_point = i;
     ASSERT_TRUE(
         SearchForOffset(index, s.data(), map_offset, key, restart_point));
+  }
+}
+
+TEST(DataBlockHashIndex, InitializeRejectsCorruptNumBuckets) {
+  // Build a valid hash index, then corrupt the trailing NUM_BUCKETS field so
+  // that the encoded bucket count exceeds the buffer. Initialize must reject it
+  // instead of underflowing the map_offset computation (which, in a release
+  // build where the debug asserts are compiled out, would later drive an
+  // out-of-bounds read while parsing the block).
+  DataBlockHashIndexBuilder builder;
+  builder.Initialize(0.75 /*util_ratio*/);
+  for (uint8_t i = 0; i < 10; i++) {
+    builder.Add("key" + std::to_string(i), i);
+  }
+  std::string buffer("fake content");
+  builder.Finish(buffer);
+
+  // Sanity check: the unmodified index parses.
+  {
+    Slice s(buffer);
+    DataBlockHashIndex index;
+    uint16_t map_offset = 0;
+    ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
+  }
+
+  // Corrupt NUM_BUCKETS (last 2 bytes) to a value larger than the buffer.
+  std::string corrupted = buffer;
+  EncodeFixed16(&corrupted[corrupted.size() - sizeof(uint16_t)],
+                static_cast<uint16_t>(corrupted.size() + 1000));
+  Slice s(corrupted);
+  DataBlockHashIndex index;
+  uint16_t map_offset = 0;
+  ASSERT_FALSE(index.Initialize(s.data(), s.size(), &map_offset));
+  ASSERT_FALSE(index.Valid());
+
+  // A NUM_BUCKETS of zero is also invalid.
+  EncodeFixed16(&corrupted[corrupted.size() - sizeof(uint16_t)], 0);
+  Slice s0(corrupted);
+  DataBlockHashIndex index0;
+  ASSERT_FALSE(index0.Initialize(s0.data(), s0.size(), &map_offset));
+}
+
+TEST(DataBlockHashIndex, InitializeRejectsUnsupportedSize) {
+  for (const size_t size :
+       {size_t{0}, size_t{1}, kMaxBlockSizeSupportedByHashIndex,
+        kMaxBlockSizeSupportedByHashIndex + 1}) {
+    const std::string input(size, 'x');
+    DataBlockHashIndex index;
+    uint16_t map_offset = 0;
+    ASSERT_FALSE(index.Initialize(input.data(), input.size(), &map_offset));
+    ASSERT_FALSE(index.Valid());
   }
 }
 
@@ -172,7 +224,7 @@ TEST(DataBlockHashIndex, DataBlockHashTestCollision) {
   Slice s(buffer2);
   DataBlockHashIndex index;
   uint16_t map_offset;
-  index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+  ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
@@ -213,7 +265,7 @@ TEST(DataBlockHashIndex, DataBlockHashTestLarge) {
   Slice s(buffer2);
   DataBlockHashIndex index;
   uint16_t map_offset;
-  index.Initialize(s.data(), static_cast<uint16_t>(s.size()), &map_offset);
+  ASSERT_TRUE(index.Initialize(s.data(), s.size(), &map_offset));
 
   // the additional hash map should start at the end of the buffer
   ASSERT_EQ(original_size, map_offset);
@@ -555,13 +607,13 @@ void TestBoundary(InternalKey& ik1, std::string& v1, InternalKey& ik2,
   std::string column_family_name;
   const ReadOptions read_options;
   const WriteOptions write_options;
-  builder.reset(ioptions.table_factory->NewTableBuilder(
+  builder.reset(moptions.table_factory->NewTableBuilder(
       TableBuilderOptions(
           ioptions, moptions, read_options, write_options, internal_comparator,
           &internal_tbl_prop_coll_factories, options.compression,
           CompressionOptions(),
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
-          column_family_name, level_),
+          column_family_name, level_, kUnknownNewestKeyTime),
       file_writer.get()));
 
   builder->Add(ik1.Encode().ToString(), v1);
@@ -581,8 +633,9 @@ void TestBoundary(InternalKey& ik1, std::string& v1, InternalKey& ik2,
   file_reader.reset(new RandomAccessFileReader(std::move(file), "test"));
   const bool kSkipFilters = true;
   const bool kImmortal = true;
-  ASSERT_OK(ioptions.table_factory->NewTableReader(
-      TableReaderOptions(ioptions, moptions.prefix_extractor, soptions,
+  ASSERT_OK(moptions.table_factory->NewTableReader(
+      TableReaderOptions(ioptions, moptions.prefix_extractor,
+                         nullptr /* compression_manager */, soptions,
                          internal_comparator,
                          0 /* block_protection_bytes_per_key */, !kSkipFilters,
                          !kImmortal, level_),

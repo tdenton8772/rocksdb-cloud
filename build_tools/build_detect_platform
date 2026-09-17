@@ -27,7 +27,6 @@
 #       -DLZ4                       if the LZ4 library is present
 #       -DZSTD                      if the ZSTD library is present
 #       -DNUMA                      if the NUMA library is present
-#       -DTBB                       if the TBB library is present
 #       -DMEMKIND                   if the memkind library is present
 #
 # Using gflags in rocksdb:
@@ -45,18 +44,21 @@ if test -z "$OUTPUT"; then
   exit 1
 fi
 
-# we depend on C++17, but should be compatible with newer standards
+# we depend on C++20, but should be compatible with newer standards
 if [ "$ROCKSDB_CXX_STANDARD" ]; then
   PLATFORM_CXXFLAGS="-std=$ROCKSDB_CXX_STANDARD"
 else
-  PLATFORM_CXXFLAGS="-std=c++17"
+  PLATFORM_CXXFLAGS="-std=c++20"
 fi
 
 # we currently depend on POSIX platform
 COMMON_FLAGS="-DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX"
 
-# Default to fbcode gcc on internal fb machines
-if [ -z "$ROCKSDB_NO_FBCODE" -a -d /mnt/gvfs/third-party ]; then
+# Default to fbcode gcc on Meta internal machines
+IS_META_HOST="$(hostname | grep -E '(facebook|meta).com|fbinfra.net')"
+if [ -z "$ROCKSDB_NO_FBCODE" -a "$IS_META_HOST" ]; then
+  if [ -d /mnt/gvfs/third-party ]; then
+    echo "NOTE: Using fbcode build" >&2
     FBCODE_BUILD="true"
     # If we're compiling with TSAN or shared lib, we need pic build
     PIC_BUILD=$COMPILE_WITH_TSAN
@@ -64,6 +66,11 @@ if [ -z "$ROCKSDB_NO_FBCODE" -a -d /mnt/gvfs/third-party ]; then
       PIC_BUILD=1
     fi
     source "$PWD/build_tools/fbcode_config_platform010.sh"
+  else
+    echo "************************************************************************" >&2
+    echo "WARNING: -d /mnt/gvfs/third-party failed; no fbcode build" >&2
+    echo "************************************************************************" >&2
+  fi
 fi
 
 # Delete existing output, if it exists
@@ -71,7 +78,9 @@ rm -f "$OUTPUT"
 touch "$OUTPUT"
 
 if test -z "$CC"; then
-    if [ -x "$(command -v cc)" ]; then
+    if [ "$USE_CLANG" -a -x "$(command -v clang)" ]; then
+        CC=clang
+    elif [ -x "$(command -v cc)" ]; then
         CC=cc
     elif [ -x "$(command -v clang)" ]; then
         CC=clang
@@ -80,23 +89,61 @@ if test -z "$CC"; then
     fi
 fi
 
+# CLANG_CXX is the single clang++ detection point for the whole script: it is
+# used for CXX when building with clang, for CLANG_ANALYZER (scan-build), and by
+# tooling that needs clang even in a gcc build (e.g. the C API codegen, which
+# parses C++ ASTs). The fbcode config above already sets CLANG_CXX; otherwise
+# resolve it here.
+if test -z "$CLANG_CXX"; then
+    if [ -n "$CXX" ] && echo | $CXX -dM -E -x c++ - 2>/dev/null | grep -q '\b__clang__\b'; then
+        # Honor an already-configured clang compiler (e.g. CI sets
+        # CXX=clang++-21) so codegen parses headers with the same clang the
+        # build uses, not an unrelated clang++ that merely happens to come first
+        # on PATH (an image may ship both a bare clang++ and clang++-NN).
+        CLANG_CXX="$CXX"
+    else
+        # Otherwise take the first clang++ on PATH. Candidates cover a bare
+        # clang++, versioned names, and clang++.par (a Meta-internal wrapper
+        # often present on dev machines).
+        CLANG_CXX=$(command -v clang++ || command -v clang++-21 || command -v clang++-20 \
+            || command -v clang++-19 || command -v clang++-18 || command -v clang++-17 \
+            || command -v clang++-16 || command -v clang++-15 || command -v clang++-14 \
+            || command -v clang++-13 || command -v clang++.par || true)
+    fi
+fi
+
 if test -z "$CXX"; then
-    if [ -x "$(command -v g++)" ]; then
+    if [ "$USE_CLANG" ] && [ -n "$CLANG_CXX" ]; then
+        CXX="$CLANG_CXX"
+    elif [ -x "$(command -v g++)" ]; then
         CXX=g++
-    elif [ -x "$(command -v clang++)" ]; then
-        CXX=clang++
+    elif [ -n "$CLANG_CXX" ]; then
+        CXX="$CLANG_CXX"
     else
         CXX=g++
     fi
 fi
 
 if test -z "$AR"; then
-    if [ -x "$(command -v gcc-ar)" ]; then
+    if [ "$USE_CLANG" -a -x "$(command -v llvm-ar)" ]; then
+        AR=llvm-ar
+    elif [ -x "$(command -v gcc-ar)" ]; then
         AR=gcc-ar
     elif [ -x "$(command -v llvm-ar)" ]; then
         AR=llvm-ar
     else
         AR=ar
+    fi
+fi
+
+# If the selected C++ compiler is actually clang (e.g. clang was the only
+# compiler available), reflect that as USE_CLANG so clang-specific logic in the
+# Makefile applies consistently. Detect it via the compiler's own __clang__
+# predefined macro rather than matching the binary path, which can false-positive
+# (e.g. a home directory containing "clang").
+if test -z "$USE_CLANG"; then
+    if echo | $CXX -dM -E -x c++ - 2>/dev/null | grep -q '\b__clang__\b'; then
+        USE_CLANG=1
     fi
 fi
 
@@ -114,7 +161,7 @@ if test -z "$CLANG_SCAN_BUILD"; then
 fi
 
 if test -z "$CLANG_ANALYZER"; then
-    CLANG_ANALYZER=$(command -v clang++ 2> /dev/null)
+    CLANG_ANALYZER="$CLANG_CXX"
 fi
 
 if test -z "$FIND"; then
@@ -133,6 +180,24 @@ PLATFORM_SHARED_EXT="so"
 PLATFORM_SHARED_LDFLAGS="-Wl,--no-as-needed -shared -Wl,-soname -Wl,"
 PLATFORM_SHARED_CFLAGS="-fPIC"
 PLATFORM_SHARED_VERSIONED=true
+
+# Prefer lld linker when available on Linux. lld is typically 5-10x faster
+# than the default ld.bfd for large C++ projects. macOS uses ld64 (or
+# ld-prime) which is already fast, so we skip lld detection there.
+# Set ROCKSDB_NO_FAST_LINKER=1 to disable this auto-detection.
+if [ -z "$ROCKSDB_NO_FAST_LINKER" ] && [ "$TARGET_OS" = "Linux" ]; then
+    if $CXX -fuse-ld=lld -L/usr/local/lib -x c++ - -o /dev/null 2>/dev/null <<EOF
+int main() { return 0; }
+EOF
+    then
+        PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -fuse-ld=lld"
+        # Ensure lld can find libraries in /usr/local/lib (lld does not
+        # search there by default, unlike ld.bfd)
+        if [ -d /usr/local/lib ]; then
+            PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -L/usr/local/lib"
+        fi
+    fi
+fi
 
 # generic port files (working on all platform by #ifdef) go directly in /port
 GENERIC_PORT_FILES=`cd "$ROCKSDB_ROOT"; find port -name '*.cc' | tr "\n" " "`
@@ -297,7 +362,8 @@ EOF
 EOF
         then
           COMMON_FLAGS="$COMMON_FLAGS -DGFLAGS=1"
-          PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lgflags"
+          # Hack: don't link extra gflags assuming it comes with folly
+          [ "$USE_FOLLY" ] || PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lgflags"
         # check if namespace is gflags
         elif $CXX $PLATFORM_CXXFLAGS -x c++ - -o test.o 2>/dev/null << EOF
             #include <gflags/gflags.h>
@@ -306,7 +372,8 @@ EOF
 EOF
         then
           COMMON_FLAGS="$COMMON_FLAGS -DGFLAGS=1 -DGFLAGS_NAMESPACE=gflags"
-          PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lgflags"
+          # Hack: don't link extra gflags assuming it comes with folly
+          [ "$USE_FOLLY" ] || PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lgflags"
         # check if namespace is google
         elif $CXX $PLATFORM_CXXFLAGS -x c++ - -o test.o 2>/dev/null << EOF
             #include <gflags/gflags.h>
@@ -360,9 +427,13 @@ EOF
     fi
 
     if ! test $ROCKSDB_DISABLE_ZSTD; then
-        # Test whether zstd library is installed
+        # Test whether zstd library is installed with minimum version
+        # (Keep in sync with compression.h)
         $CXX $PLATFORM_CXXFLAGS $COMMON_FLAGS -x c++ - -o /dev/null 2>/dev/null  <<EOF
           #include <zstd.h>
+          #if ZSTD_VERSION_NUMBER < 10400
+          #error "ZSTD support requires version >= 1.4.0 (libzstd-devel)"
+          #endif  // ZSTD_VERSION_NUMBER
           int main() {}
 EOF
         if [ "$?" = 0 ]; then
@@ -383,19 +454,6 @@ EOF
             COMMON_FLAGS="$COMMON_FLAGS -DNUMA"
             PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lnuma"
             JAVA_LDFLAGS="$JAVA_LDFLAGS -lnuma"
-        fi
-    fi
-
-    if ! test $ROCKSDB_DISABLE_TBB; then
-        # Test whether tbb is available
-        $CXX $PLATFORM_CXXFLAGS $LDFLAGS -x c++ - -o test.o -ltbb 2>/dev/null  <<EOF
-          #include <tbb/tbb.h>
-          int main() {}
-EOF
-        if [ "$?" = 0 ]; then
-            COMMON_FLAGS="$COMMON_FLAGS -DTBB"
-            PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -ltbb"
-            JAVA_LDFLAGS="$JAVA_LDFLAGS -ltbb"
         fi
     fi
 
@@ -585,7 +643,7 @@ EOF
             PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -lbenchmark"
         fi
     fi
-    if test $USE_FOLLY; then
+    if test $USE_FOLLY || test $USE_FOLLY_LITE; then
         # Test whether libfolly library is installed
         $CXX $PLATFORM_CXXFLAGS $COMMON_FLAGS -x c++ - -o /dev/null 2>/dev/null  <<EOF
           #include <folly/synchronization/DistributedMutex.h>
@@ -626,29 +684,6 @@ EOF
   if [ "$?" = 0 ]; then
     COMMON_FLAGS="$COMMON_FLAGS -Wshorten-64-to-32"
   fi
-fi
-
-#
-# Support the AWS cloud environment only if the env variable named USE_AWS
-# is set to 1. Setting it to any other value or not setting it at all means
-# that the AWS build is not triggered.
-#
-if [ "${USE_AWS}XXX" = "1XXX" ]; then
-  AWS_SDK=/usr/local
-  AWI=${AWS_SDK}/include/
-  S3_CCFLAGS="$S3_CCFLAGS -I$AWI -DUSE_AWS"
-  S3_LDFLAGS="$S3_LDFLAGS -laws-cpp-sdk-s3 -laws-cpp-sdk-kinesis -laws-cpp-sdk-core -laws-cpp-sdk-transfer"
-  COMMON_FLAGS="$COMMON_FLAGS $S3_CCFLAGS"
-  PLATFORM_LDFLAGS="$S3_LDFLAGS $PLATFORM_LDFLAGS"
-fi
-#
-# Support the Kafka WAL storing if the env variable named USE_KAFKA
-# is set to 1. Setting it to any other value or not setting it at all means
-# that the Kafka WAL build is not triggered.
-#
-if [ "${USE_KAFKA}XXX" = "1XXX" ]; then
-  COMMON_FLAGS="$COMMON_FLAGS -DUSE_KAFKA"
-  PLATFORM_LDFLAGS="-lrdkafka++ $PLATFORM_LDFLAGS"
 fi
 
 if [ "$PORTABLE" == "" ] || [ "$PORTABLE" == 0 ]; then
@@ -774,6 +809,12 @@ if [ "$USE_FOLLY" ]; then
     FOLLY_PATH=`cd $FOLLY_DIR && $PYTHON build/fbcode_builder/getdeps.py show-inst-dir folly`
   fi
 fi
+if [ "$USE_FOLLY_LITE" ]; then
+  if [ "$FOLLY_DIR" ]; then
+    BOOST_SOURCE_PATH=`cd $FOLLY_DIR && $PYTHON build/fbcode_builder/getdeps.py show-source-dir boost`
+    FMT_SOURCE_PATH=`cd $FOLLY_DIR && $PYTHON build/fbcode_builder/getdeps.py show-source-dir fmt`
+  fi
+fi
 
 PLATFORM_CCFLAGS="$PLATFORM_CCFLAGS $COMMON_FLAGS"
 PLATFORM_CXXFLAGS="$PLATFORM_CXXFLAGS $COMMON_FLAGS"
@@ -811,10 +852,16 @@ echo "ROCKSDB_MINOR=$ROCKSDB_MINOR" >> "$OUTPUT"
 echo "ROCKSDB_PATCH=$ROCKSDB_PATCH" >> "$OUTPUT"
 echo "CLANG_SCAN_BUILD=$CLANG_SCAN_BUILD" >> "$OUTPUT"
 echo "CLANG_ANALYZER=$CLANG_ANALYZER" >> "$OUTPUT"
+echo "CLANG_CXX=$CLANG_CXX" >> "$OUTPUT"
+if test -n "$USE_CLANG"; then
+  echo "USE_CLANG=$USE_CLANG" >> "$OUTPUT"
+fi
 echo "PROFILING_FLAGS=$PROFILING_FLAGS" >> "$OUTPUT"
 echo "FIND=$FIND" >> "$OUTPUT"
 echo "WATCH=$WATCH" >> "$OUTPUT"
 echo "FOLLY_PATH=$FOLLY_PATH" >> "$OUTPUT"
+echo "BOOST_SOURCE_PATH=$BOOST_SOURCE_PATH" >> "$OUTPUT"
+echo "FMT_SOURCE_PATH=$FMT_SOURCE_PATH" >> "$OUTPUT"
 
 # This will enable some related identifiers for the preprocessor
 if test -n "$JEMALLOC"; then
@@ -826,7 +873,6 @@ fi
 if test -n "$WITH_JEMALLOC_FLAG"; then
   echo "WITH_JEMALLOC_FLAG=$WITH_JEMALLOC_FLAG" >> "$OUTPUT"
 fi
-echo "LUA_PATH=$LUA_PATH" >> "$OUTPUT"
 if test -n "$USE_FOLLY"; then
   echo "USE_FOLLY=$USE_FOLLY" >> "$OUTPUT"
 fi

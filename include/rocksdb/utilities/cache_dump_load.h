@@ -67,6 +67,10 @@ class CacheDumpReader {
 // dump or load process related control variables can be added here.
 struct CacheDumpOptions {
   SystemClock* clock;
+  // Deadline for dumper or loader in microseconds
+  std::chrono::microseconds deadline = std::chrono::microseconds::zero();
+  // Max size bytes for dumper or loader
+  uint64_t max_size_bytes = 0;
 };
 
 // NOTE that: this class is EXPERIMENTAL! May be changed in the future!
@@ -86,7 +90,7 @@ class CacheDumper {
  public:
   virtual ~CacheDumper() = default;
   // Only dump the blocks in the block cache that belong to the DBs in this list
-  virtual Status SetDumpFilter(std::vector<DB*> db_list) {
+  virtual Status SetDumpFilter(const std::vector<DB*>& db_list) {
     (void)db_list;
     return Status::NotSupported("SetDumpFilter is not supported");
   }

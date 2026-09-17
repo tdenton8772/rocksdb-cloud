@@ -83,7 +83,7 @@ TEST_P(MemoryAllocatorTest, DatabaseBlockCache) {
   auto cache = NewLRUCache(1024 * 1024, 6, false, 0.0, allocator_);
   table_options.block_cache = cache;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   Status s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
   ASSERT_NE(db, nullptr);
@@ -115,7 +115,7 @@ TEST_P(MemoryAllocatorTest, DatabaseBlockCache) {
   // Close database
   s = db->Close();
   ASSERT_OK(s);
-  delete db;
+  db.reset();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
@@ -209,18 +209,6 @@ TEST_F(CreateMemoryAllocatorTest, NewJemallocNodumpAllocator) {
   ASSERT_EQ(opts->limit_tcache_size, jopts.limit_tcache_size);
 }
 
-#ifdef ROCKSDB_JEMALLOC_NODUMP_ALLOCATOR
-TEST(JemallocNodumpAllocatorTest, LimitCacheSize) {
-  std::shared_ptr<MemoryAllocator> allocator;
-  JemallocAllocatorOptions options;
-  options.limit_tcache_size = true;
-  ASSERT_OK(NewJemallocNodumpAllocator(options, &allocator));
-  auto ptr = allocator->Allocate(1024);
-  EXPECT_GE(allocator->UsableSize(ptr, 1024), 1024);
-  allocator->Deallocate(ptr);
-}
-#endif
-
 INSTANTIATE_TEST_CASE_P(DefaultMemoryAllocator, MemoryAllocatorTest,
                         ::testing::Values(std::make_tuple(
                             DefaultMemoryAllocator::kClassName(), true)));
@@ -237,7 +225,6 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::Values(std::make_tuple(JemallocNodumpAllocator::kClassName(),
                                       JemallocNodumpAllocator::IsSupported())));
 #endif  // ROCKSDB_JEMALLOC
-
 
 }  // namespace ROCKSDB_NAMESPACE
 

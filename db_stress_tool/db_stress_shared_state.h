@@ -24,21 +24,50 @@ DECLARE_uint64(log2_keys_per_lock);
 DECLARE_int32(threads);
 DECLARE_int32(column_families);
 DECLARE_int32(nooverwritepercent);
-DECLARE_string(expected_values_dir);
 DECLARE_int32(clear_column_family_one_in);
 DECLARE_bool(test_batches_snapshots);
 DECLARE_int32(compaction_thread_pool_adjust_interval);
 DECLARE_int32(continuous_verification_interval);
+DECLARE_bool(error_recovery_with_no_fault_injection);
+DECLARE_bool(sync_fault_injection);
+DECLARE_int32(range_deletion_width);
+DECLARE_bool(disable_wal);
+DECLARE_int32(manual_wal_flush_one_in);
+DECLARE_int32(metadata_read_fault_one_in);
+DECLARE_int32(metadata_write_fault_one_in);
 DECLARE_int32(read_fault_one_in);
 DECLARE_int32(write_fault_one_in);
+DECLARE_bool(exclude_wal_from_write_fault_injection);
+DECLARE_int32(open_metadata_read_fault_one_in);
 DECLARE_int32(open_metadata_write_fault_one_in);
 DECLARE_int32(open_write_fault_one_in);
 DECLARE_int32(open_read_fault_one_in);
 
 DECLARE_int32(inject_error_severity);
+DECLARE_bool(tolerate_non_injected_io_errors_for_remote_dbs);
+DECLARE_bool(disable_auto_compactions);
+DECLARE_bool(enable_compaction_filter);
 
 namespace ROCKSDB_NAMESPACE {
 class StressTest;
+
+struct RemoteCompactionQueueItem {
+  std::string job_id;
+  CompactionServiceJobInfo job_info;
+  std::string serialized_input;
+  std::string output_directory;
+  bool canceled;
+
+  RemoteCompactionQueueItem(const std::string& id,
+                            const CompactionServiceJobInfo& info,
+                            const std::string& input,
+                            const std::string& output_dir, bool was_canceled)
+      : job_id(id),
+        job_info(info),
+        serialized_input(input),
+        output_directory(output_dir),
+        canceled(was_canceled) {}
+};
 
 // State shared by all concurrent executions of the same benchmark.
 class SharedState {
@@ -49,97 +78,12 @@ class SharedState {
   // for those calls
   static thread_local bool ignore_read_error;
 
-  SharedState(Env* /*env*/, StressTest* stress_test)
-      : cv_(&mu_),
-        seed_(static_cast<uint32_t>(FLAGS_seed)),
-        max_key_(FLAGS_max_key),
-        log2_keys_per_lock_(static_cast<uint32_t>(FLAGS_log2_keys_per_lock)),
-        num_threads_(0),
-        num_initialized_(0),
-        num_populated_(0),
-        vote_reopen_(0),
-        num_done_(0),
-        start_(false),
-        start_verify_(false),
-        num_bg_threads_(0),
-        should_stop_bg_thread_(false),
-        bg_thread_finished_(0),
-        stress_test_(stress_test),
-        verification_failure_(false),
-        should_stop_test_(false),
-        no_overwrite_ids_(GenerateNoOverwriteIds()),
-        expected_state_manager_(nullptr),
-        printing_verification_results_(false),
-        start_timestamp_(Env::Default()->NowNanos()) {
-    Status status;
-    // TODO: We should introduce a way to explicitly disable verification
-    // during shutdown. When that is disabled and FLAGS_expected_values_dir
-    // is empty (disabling verification at startup), we can skip tracking
-    // expected state. Only then should we permit bypassing the below feature
-    // compatibility checks.
-    if (!FLAGS_expected_values_dir.empty()) {
-      if (!std::atomic<uint32_t>{}.is_lock_free()) {
-        status = Status::InvalidArgument(
-            "Cannot use --expected_values_dir on platforms without lock-free "
-            "std::atomic<uint32_t>");
-      }
-      if (status.ok() && FLAGS_clear_column_family_one_in > 0) {
-        status = Status::InvalidArgument(
-            "Cannot use --expected_values_dir on when "
-            "--clear_column_family_one_in is greater than zero.");
-      }
-    }
-    if (status.ok()) {
-      if (FLAGS_expected_values_dir.empty()) {
-        expected_state_manager_.reset(
-            new AnonExpectedStateManager(FLAGS_max_key, FLAGS_column_families));
-      } else {
-        expected_state_manager_.reset(new FileExpectedStateManager(
-            FLAGS_max_key, FLAGS_column_families, FLAGS_expected_values_dir));
-      }
-      status = expected_state_manager_->Open();
-    }
-    if (!status.ok()) {
-      fprintf(stderr, "Failed setting up expected state with error: %s\n",
-              status.ToString().c_str());
-      exit(1);
-    }
-
-    if (FLAGS_test_batches_snapshots) {
-      fprintf(stdout, "No lock creation because test_batches_snapshots set\n");
-      return;
-    }
-
-    long num_locks = static_cast<long>(max_key_ >> log2_keys_per_lock_);
-    if (max_key_ & ((1 << log2_keys_per_lock_) - 1)) {
-      num_locks++;
-    }
-    fprintf(stdout, "Creating %ld locks\n", num_locks * FLAGS_column_families);
-    key_locks_.resize(FLAGS_column_families);
-
-    for (int i = 0; i < FLAGS_column_families; ++i) {
-      key_locks_[i].reset(new port::Mutex[num_locks]);
-    }
-    if (FLAGS_read_fault_one_in) {
-#ifdef NDEBUG
-      // Unsupported in release mode because it relies on
-      // `IGNORE_STATUS_IF_ERROR` to distinguish faults not expected to lead to
-      // failure.
-      fprintf(stderr,
-              "Cannot set nonzero value for --read_fault_one_in in "
-              "release mode.");
-      exit(1);
-#else   // NDEBUG
-      SyncPoint::GetInstance()->SetCallBack("FaultInjectionIgnoreError",
-                                            IgnoreReadErrorCallback);
-      SyncPoint::GetInstance()->EnableProcessing();
-#endif  // NDEBUG
-    }
-  }
+  SharedState(Env* env, StressTest* stress_test);
 
   ~SharedState() {
 #ifndef NDEBUG
-    if (FLAGS_read_fault_one_in) {
+    if (FLAGS_read_fault_one_in || FLAGS_write_fault_one_in ||
+        FLAGS_metadata_write_fault_one_in) {
       SyncPoint::GetInstance()->ClearAllCallBacks();
       SyncPoint::GetInstance()->DisableProcessing();
     }
@@ -248,12 +192,80 @@ class SharedState {
     return expected_state_manager_->ClearColumnFamily(cf);
   }
 
+  void SetPersistedSeqno(SequenceNumber seqno) {
+    MutexLock l(&persist_seqno_mu_);
+    return expected_state_manager_->SetPersistedSeqno(seqno);
+  }
+
+  SequenceNumber GetPersistedSeqno() {
+    MutexLock l(&persist_seqno_mu_);
+    return expected_state_manager_->GetPersistedSeqno();
+  }
+
+  void EnqueueRemoteCompaction(const std::string& job_id,
+                               const CompactionServiceJobInfo& job_info,
+                               const std::string& serialized_input,
+                               const std::string& output_directory,
+                               bool canceled) {
+    MutexLock l(&remote_compaction_queue_mu_);
+    remote_compaction_queue_.emplace(job_id, job_info, serialized_input,
+                                     output_directory, canceled);
+  }
+
+  bool DequeueRemoteCompaction(std::string* job_id,
+                               CompactionServiceJobInfo* job_info,
+                               std::string* serialized_input,
+                               std::string* output_directory, bool* canceled) {
+    assert(job_id);
+    assert(job_info);
+    assert(serialized_input);
+    assert(output_directory);
+    assert(canceled);
+    MutexLock l(&remote_compaction_queue_mu_);
+    if (!remote_compaction_queue_.empty()) {
+      const RemoteCompactionQueueItem& item = remote_compaction_queue_.front();
+      *job_id = item.job_id;
+      *job_info = item.job_info;
+      *serialized_input = item.serialized_input;
+      *output_directory = item.output_directory;
+      *canceled = item.canceled;
+      remote_compaction_queue_.pop();
+      return true;
+    }
+    return false;
+  }
+
+  void AddRemoteCompactionResult(const std::string& job_id,
+                                 const Status& status,
+                                 const std::string& result) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    remote_compaction_result_map_.emplace(
+        job_id, std::pair<Status, std::string>{status, result});
+  }
+
+  std::optional<Status> GetRemoteCompactionResult(const std::string& job_id,
+                                                  std::string* result) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    if (remote_compaction_result_map_.find(job_id) !=
+        remote_compaction_result_map_.end()) {
+      const auto& pair = remote_compaction_result_map_.at(job_id);
+      *result = pair.second;
+      return pair.first;
+    }
+    return std::nullopt;
+  }
+
+  void RemoveRemoteCompactionResult(const std::string& job_id) {
+    MutexLock l(&remote_compaction_result_map_mu_);
+    remote_compaction_result_map_.erase(job_id);
+  }
+
   // Prepare a Put that will be started but not finish yet
   // This is useful for crash-recovery testing when the process may crash
   // before updating the corresponding expected value
   //
-  // Requires external locking covering `key` in `cf` to prevent concurrent
-  // write or delete to the same `key`.
+  // Requires external locking covering `key` in `cf` to prevent
+  // concurrent write or delete to the same `key`.
   PendingExpectedValue PreparePut(int cf, int64_t key) {
     return expected_state_manager_->PreparePut(cf, key);
   }
@@ -326,9 +338,7 @@ class SharedState {
     return bg_thread_finished_ == num_bg_threads_;
   }
 
-  bool ShouldVerifyAtBeginning() const {
-    return !FLAGS_expected_values_dir.empty();
-  }
+  bool ShouldVerifyAtBeginning() const;
 
   bool PrintingVerificationResults() {
     bool tmp = false;
@@ -384,6 +394,7 @@ class SharedState {
 
   port::Mutex mu_;
   port::CondVar cv_;
+  port::Mutex persist_seqno_mu_;
   const uint32_t seed_;
   const int64_t max_key_;
   const uint32_t log2_keys_per_lock_;
@@ -400,6 +411,15 @@ class SharedState {
   StressTest* stress_test_;
   std::atomic<bool> verification_failure_;
   std::atomic<bool> should_stop_test_;
+
+  // Queue for the remote compaction.
+  port::Mutex remote_compaction_queue_mu_;
+  std::queue<RemoteCompactionQueueItem> remote_compaction_queue_;
+  // Result Map for the remote compaciton. Key is the scheduled_job_id and value
+  // is serialized compaction_service_result
+  port::Mutex remote_compaction_result_map_mu_;
+  std::unordered_map<std::string, std::pair<Status, std::string>>
+      remote_compaction_result_map_;
 
   // Keys that should not be overwritten
   const std::unordered_set<int64_t> no_overwrite_ids_;

@@ -12,14 +12,15 @@
 
 #include "db/range_tombstone_fragmenter.h"
 #if USE_COROUTINES
-#include "folly/experimental/coro/Coroutine.h"
-#include "folly/experimental/coro/Task.h"
+#include "folly/coro/Coroutine.h"
+#include "folly/coro/Task.h"
 #endif
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/table_reader_caller.h"
 #include "table/get_context.h"
 #include "table/internal_iterator.h"
 #include "table/multiget_context.h"
+#include "util/coro_utils.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -137,6 +138,15 @@ class TableReader {
                      const SliceTransform* prefix_extractor,
                      bool skip_filters = false) = 0;
 
+#if USE_COROUTINES
+  virtual folly::coro::Task<Status> GetCoroutine(
+      const ReadOptions& readOptions, const Slice& key, GetContext* get_context,
+      const SliceTransform* prefix_extractor, bool skip_filters = false) {
+    co_return Get(readOptions, key, get_context, prefix_extractor,
+                  skip_filters);
+  }
+#endif  // USE_COROUTINES
+
   // Use bloom filters in the table file, if present, to filter out keys. The
   // mget_range will be updated to skip keys that get a negative result from
   // the filter lookup.
@@ -179,14 +189,25 @@ class TableReader {
   }
 
   // convert db file to a human readable form
-  virtual Status DumpTable(WritableFile* /*out_file*/) {
+  virtual Status DumpTable(WritableFile* /*out_file*/,
+                           bool /*show_sequence_number_type*/ = false) {
     return Status::NotSupported("DumpTable() not supported");
   }
 
   // check whether there is corruption in this db file
   virtual Status VerifyChecksum(const ReadOptions& /*read_options*/,
-                                TableReaderCaller /*caller*/) {
+                                TableReaderCaller /*caller*/,
+                                bool /*meta_blocks_only*/ = false) {
     return Status::NotSupported("VerifyChecksum() not supported");
+  }
+
+  // Tell the reader that the file should now be obsolete, e.g. as a hint
+  // to delete relevant cache entries on destruction. (It might not be safe
+  // to "unpin" cache entries until destruction time.) NOTE: must be thread
+  // safe because multiple table cache references might all mark this file as
+  // obsolete when they are released (the last of which destroys this reader).
+  virtual void MarkObsolete(uint32_t /*uncache_aggressiveness*/) {
+    // no-op as default
   }
 };
 

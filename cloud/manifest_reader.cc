@@ -18,6 +18,20 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+// VersionSet::LogReporter sits below VersionSet's friend block and is not
+// accessible here. This is the same trivial reporter.
+struct ManifestLogReporter : public log::Reader::Reporter {
+  Status* status;
+  void Corruption(size_t /*bytes*/, const Status& s,
+                  uint64_t /*log_number*/ = kMaxSequenceNumber) override {
+    if (status->ok()) {
+      *status = s;
+    }
+  }
+};
+}  // namespace
+
 LocalManifestReader::LocalManifestReader(std::shared_ptr<Logger> info_log,
                                          CloudFileSystem* cfs)
     : info_log_(std::move(info_log)), cfs_(cfs) {}
@@ -80,7 +94,7 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
     std::set<uint64_t>* list) const {
   Status s;
   // create a callback that gets invoked whil looping through the log records
-  VersionSet::LogReporter reporter;
+  ManifestLogReporter reporter;
   reporter.status = &s;
   log::Reader reader(nullptr, std::move(file_reader), &reporter,
                      true /*checksum*/, 0);
@@ -211,7 +225,7 @@ IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem* fs,
     return s;
   }
 
-  VersionSet::LogReporter reporter;
+  ManifestLogReporter reporter;
   reporter.status = &s;
   log::Reader reader(NULL,
                      std::unique_ptr<SequentialFileReader>(
@@ -228,8 +242,10 @@ IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem* fs,
     if (!s.ok()) {
       break;
     }
-    uint64_t f;
-    if (edit.GetNextFileNumber(&f)) {
+    // Upstream VersionEdit exposes HasNextFile()/GetNextFile(); the combined
+    // GetNextFileNumber(uint64_t*) accessor is specific to the rockset fork.
+    if (edit.HasNextFile()) {
+      const uint64_t f = edit.GetNextFile();
       // Disabled temporarily.
       // TODO: Reenable once the cloud manifest consistency issue is addressed.
       // assert(*maxFileNumber <= f);

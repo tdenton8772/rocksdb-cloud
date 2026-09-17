@@ -5,6 +5,9 @@
 
 #include "rocksdb/wide_columns.h"
 
+#include <iterator>
+
+#include "db/blob/blob_index.h"
 #include "db/wide/wide_column_serialization.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -12,12 +15,32 @@ namespace ROCKSDB_NAMESPACE {
 const Slice kDefaultWideColumnName;
 
 const WideColumns kNoWideColumns;
-const AttributeGroups kNoAttributeGroups;
 
-Status PinnableWideColumns::CreateIndexForWideColumns() {
-  Slice value_copy = value_;
+Status PinnableWideColumns::BuildColumnsForEntity() {
+  columns_.clear();
+  unresolved_blob_column_indices_.clear();
 
-  return WideColumnSerialization::Deserialize(value_copy, columns_);
+  // Called right after a Set*() has placed the serialized entity in a single
+  // backing buffer; the whole entity must live in backing_.front().
+  assert(!backing_.empty());
+  assert(std::next(backing_.begin()) == backing_.end());
+
+  // Collect any blob column references; a resolved entity simply yields none.
+  std::vector<std::pair<size_t, BlobIndex>> blob_columns;
+  Status status = WideColumnSerialization::Deserialize(backing_.front(),
+                                                       columns_, &blob_columns);
+  if (status.ok()) {
+    unresolved_blob_column_indices_.reserve(blob_columns.size());
+    for (const auto& blob_column : blob_columns) {
+      unresolved_blob_column_indices_.push_back(blob_column.first);
+    }
+  }
+
+  return status;
+}
+
+size_t PinnableWideColumns::serialized_size() const {
+  return WideColumnSerialization::SerializedSizeV1(columns_);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

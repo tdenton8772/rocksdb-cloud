@@ -69,10 +69,15 @@ constexpr bool kMustFreeHeapAllocations = false;
 #define TSAN_SUPPRESSION
 #endif  // TSAN_SUPPRESSION
 
+// Fail in debug build with a useful message, for automatically grouping
+// related failures
+#define DEBUG_FAIL(msg) assert(false && msg)
+
 // Compile-time CPU feature testing compatibility
 //
 // A way to be extra sure these defines have been included.
-#define ASSERT_FEATURE_COMPAT_HEADER() static_assert(true, "Semicolon required") /* empty */
+#define ASSERT_FEATURE_COMPAT_HEADER() \
+  static_assert(true, "Semicolon required") /* empty */
 
 // MSVC doesn't support the same defines that gcc and clang provide
 // but does some like __AVX__. Here we can infer some features from others.

@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "db/dbformat.h"
 #include "db/log_format.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/env.h"
@@ -74,20 +75,31 @@ namespace log {
 class Writer {
  public:
   // Create a writer that will append data to "*dest".
-  // "*dest" must be initially empty.
-  // "*dest" must remain live while this Writer is in use.
+  // "*dest" must remain live while this Writer is in use. By default
+  // "*dest" is expected to be empty (initial_block_offset = 0). When
+  // resuming append into an existing log file (e.g.
+  // VersionSet::ReopenManifestForAppend), pass the offset within the
+  // current 32 KiB block at which writes should resume so that record
+  // framing aligns to the existing block layout.
+  // TODO(hx235): separate WAL related parameters from general `Reader`
+  // parameters
   explicit Writer(std::unique_ptr<WritableFileWriter>&& dest,
                   uint64_t log_number, bool recycle_log_files,
                   bool manual_flush = false,
-                  CompressionType compressionType = kNoCompression);
+                  CompressionType compressionType = kNoCompression,
+                  bool track_and_verify_wals = false,
+                  size_t initial_block_offset = 0);
   // No copying allowed
   Writer(const Writer&) = delete;
   void operator=(const Writer&) = delete;
 
   ~Writer();
 
-  IOStatus AddRecord(const WriteOptions& write_options, const Slice& slice);
+  IOStatus AddRecord(const WriteOptions& write_options, const Slice& slice,
+                     const SequenceNumber& seqno = 0);
   IOStatus AddCompressionTypeRecord(const WriteOptions& write_options);
+  IOStatus MaybeAddPredecessorWALInfo(const WriteOptions& write_options,
+                                      const PredecessorWALInfo& info);
 
   // If there are column families in `cf_to_ts_sz` not included in
   // `recorded_cf_to_ts_sz_` and its user-defined timestamp size is non-zero,
@@ -107,13 +119,23 @@ class Writer {
 
   IOStatus Close(const WriteOptions& write_options);
 
+  // If closing the writer through file(), call this afterwards to modify
+  // this object's state to reflect that. Returns true if the destination file
+  // has been closed. If it hasn't been closed, returns false with no change.
+  bool PublishIfClosed();
+
   bool BufferIsEmpty();
+
+  size_t TEST_block_offset() const { return block_offset_; }
+
+  SequenceNumber GetLastSeqnoRecorded() const { return last_seqno_recorded_; };
 
  private:
   std::unique_ptr<WritableFileWriter> dest_;
   size_t block_offset_;  // Current offset in block
   uint64_t log_number_;
   bool recycle_log_files_;
+  int header_size_;
 
   // crc32c values for all supported record types.  These are
   // pre-computed to reduce the overhead of computing the crc of the
@@ -123,13 +145,18 @@ class Writer {
   IOStatus EmitPhysicalRecord(const WriteOptions& write_options,
                               RecordType type, const char* ptr, size_t length);
 
+  IOStatus MaybeHandleSeenFileWriterError();
+
+  IOStatus MaybeSwitchToNewBlock(const WriteOptions& write_options,
+                                 const std::string& content_to_write);
+
   // If true, it does not flush after each write. Instead it relies on the upper
   // layer to manually does the flush by calling ::WriteBuffer()
   bool manual_flush_;
 
   // Compression Type
   CompressionType compression_type_;
-  StreamingCompress* compress_;
+  std::unique_ptr<StreamingCompress> compress_;
   // Reusable compressed output buffer
   std::unique_ptr<char[]> compressed_buffer_;
 
@@ -137,6 +164,11 @@ class Writer {
   // Since the user-defined timestamp size cannot be changed while the DB is
   // running, existing entry in this map cannot be updated.
   UnorderedMap<uint32_t, size_t> recorded_cf_to_ts_sz_;
+
+  // See `Options::track_and_verify_wals`
+  bool track_and_verify_wals_;
+
+  SequenceNumber last_seqno_recorded_;
 };
 
 }  // namespace log

@@ -146,6 +146,26 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   boolean paranoidChecks();
 
   /**
+   * If true, SST files are opened and validated asynchronously in the
+   * background after DB::Open returns. This reduces DB open time for
+   * databases with many SST files.
+   *
+   * Default: false
+   *
+   * @param openFilesAsync true to enable async file opening.
+   * @return the reference to the current option.
+   */
+  T setOpenFilesAsync(boolean openFilesAsync);
+
+  /**
+   * If true, SST files are opened and validated asynchronously in the
+   * background after DB::Open returns.
+   *
+   * @return a boolean indicating whether async file opening is enabled.
+   */
+  boolean openFilesAsync();
+
+  /**
    * Use to control write rate of flush and compaction. Flush has higher
    * priority than compaction. Rate limiting is disabled if nullptr.
    * Default: nullptr
@@ -939,54 +959,6 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   long dbWriteBufferSize();
 
   /**
-   * This is a maximum buffer size that is used by WinMmapReadableFile in
-   * unbuffered disk I/O mode. We need to maintain an aligned buffer for
-   * reads. We allow the buffer to grow until the specified value and then
-   * for bigger requests allocate one shot buffers. In unbuffered mode we
-   * always bypass read-ahead buffer at ReadaheadRandomAccessFile
-   * When read-ahead is required we then make use of
-   * {@link MutableDBOptionsInterface#compactionReadaheadSize()} value and
-   * always try to read ahead.
-   * With read-ahead we always pre-allocate buffer to the size instead of
-   * growing it up to a limit.
-   *
-   * This option is currently honored only on Windows
-   *
-   * Default: 1 Mb
-   *
-   * Special value: 0 - means do not maintain per instance buffer. Allocate
-   *                per request buffer and avoid locking.
-   *
-   * @param randomAccessMaxBufferSize the maximum size of the random access
-   *     buffer
-   *
-   * @return the reference to the current options.
-   */
-  T setRandomAccessMaxBufferSize(long randomAccessMaxBufferSize);
-
-  /**
-   * This is a maximum buffer size that is used by WinMmapReadableFile in
-   * unbuffered disk I/O mode. We need to maintain an aligned buffer for
-   * reads. We allow the buffer to grow until the specified value and then
-   * for bigger requests allocate one shot buffers. In unbuffered mode we
-   * always bypass read-ahead buffer at ReadaheadRandomAccessFile
-   * When read-ahead is required we then make use of
-   * {@link MutableDBOptionsInterface#compactionReadaheadSize()} value and
-   * always try to read ahead. With read-ahead we always pre-allocate buffer
-   * to the size instead of growing it up to a limit.
-   *
-   * This option is currently honored only on Windows
-   *
-   * Default: 1 Mb
-   *
-   * Special value: 0 - means do not maintain per instance buffer. Allocate
-   *                per request buffer and avoid locking.
-   *
-   * @return the maximum size of the random access buffer
-   */
-  long randomAccessMaxBufferSize();
-
-  /**
    * Use adaptive mutex, which spins in the user space before resorting
    * to kernel. This could reduce context switch when the mutex is not
    * heavily contended. However, if the mutex is hot, we could end up
@@ -1261,36 +1233,6 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    * @return true if updating stats will be skipped
    */
   boolean skipStatsUpdateOnDbOpen();
-
-  /**
-   * If true, then {@link RocksDB#open(String)} will not fetch and check sizes of all sst files.
-   * This may significantly speed up startup if there are many sst files,
-   * especially when using non-default Env with expensive GetFileSize().
-   * We'll still check that all required sst files exist.
-   * If {@code paranoid_checks} is false, this option is ignored, and sst files are
-   * not checked at all.
-   *
-   * Default: false
-   *
-   * @param skipCheckingSstFileSizesOnDbOpen if true, then SST file sizes will not be checked
-   *                                         when calling {@link RocksDB#open(String)}.
-   * @return the reference to the current options.
-   */
-  T setSkipCheckingSstFileSizesOnDbOpen(final boolean skipCheckingSstFileSizesOnDbOpen);
-
-  /**
-   * If true, then {@link RocksDB#open(String)} will not fetch and check sizes of all sst files.
-   * This may significantly speed up startup if there are many sst files,
-   * especially when using non-default Env with expensive GetFileSize().
-   * We'll still check that all required sst files exist.
-   * If {@code paranoid_checks} is false, this option is ignored, and sst files are
-   * not checked at all.
-   *
-   * Default: false
-   *
-   * @return true, if file sizes will not be checked when calling {@link RocksDB#open(String)}.
-   */
-  boolean skipCheckingSstFileSizesOnDbOpen();
 
   /**
    * Recovery mode to control the consistency while replaying WAL
@@ -1744,4 +1686,47 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    * @return the instance of the current object.
    */
   long bgerrorResumeRetryInterval();
+
+  /**
+   * Implementing off-peak duration awareness in RocksDB. In this context,
+   * "off-peak time" signifies periods characterized by significantly less read
+   * and write activity compared to other times. By leveraging this knowledge,
+   * we can prevent low-priority tasks, such as TTL-based compactions, from
+   * competing with read and write operations during peak hours. Essentially, we
+   * preprocess these tasks during the preceding off-peak period, just before
+   * the next peak cycle begins. For example, if the TTL is configured for 25
+   * days, we may compact the files during the off-peak hours of the 24th day.
+   *
+   * Time of the day in UTC, start_time-end_time inclusive.
+   * Format - HH:mm-HH:mm (00:00-23:59)
+   * If the start time exceeds the end time, it will be considered that the time period
+   * spans to the next day (e.g., 23:30-04:00). To make an entire day off-peak,
+   * use "0:00-23:59". To make an entire day have no offpeak period, leave
+   * this field blank. Default: Empty string (no offpeak).
+   *
+   * @param offpeakTimeUTC String value from which to parse offpeak time range
+   */
+  T setDailyOffpeakTimeUTC(final String offpeakTimeUTC);
+
+  /**
+   *
+   * Implementing off-peak duration awareness in RocksDB. In this context,
+   * "off-peak time" signifies periods characterized by significantly less read
+   * and write activity compared to other times. By leveraging this knowledge,
+   * we can prevent low-priority tasks, such as TTL-based compactions, from
+   * competing with read and write operations during peak hours. Essentially, we
+   * preprocess these tasks during the preceding off-peak period, just before
+   * the next peak cycle begins. For example, if the TTL is configured for 25
+   * days, we may compact the files during the off-peak hours of the 24th day.
+   *
+   * Time of the day in UTC, start_time-end_time inclusive.
+   * Format - HH:mm-HH:mm (00:00-23:59)
+   * If the start time exceeds the end time, it will be considered that the time period
+   * spans to the next day (e.g., 23:30-04:00). To make an entire day off-peak,
+   * use "0:00-23:59". To make an entire day have no offpeak period, leave
+   * this field blank. Default: Empty string (no offpeak).
+   *
+   * @return String value of current offpeak time range, "" if none is set.
+   */
+  String dailyOffpeakTimeUTC();
 }

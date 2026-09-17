@@ -37,6 +37,7 @@ static std::unordered_map<std::string, WALRecoveryMode>
 
 static std::unordered_map<std::string, CacheTier> cache_tier_string_map = {
     {"kVolatileTier", CacheTier::kVolatileTier},
+    {"kVolatileCompressedTier", CacheTier::kVolatileCompressedTier},
     {"kNonVolatileBlockTier", CacheTier::kNonVolatileBlockTier}};
 
 static std::unordered_map<std::string, InfoLogLevel> info_log_level_string_map =
@@ -123,9 +124,38 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableDBOptions, max_background_flushes),
           OptionType::kInt, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"max_manifest_file_size",
+         {offsetof(struct MutableDBOptions, max_manifest_file_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"max_manifest_space_amp_pct",
+         {offsetof(struct MutableDBOptions, max_manifest_space_amp_pct),
+          OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"manifest_preallocation_size",
+         {offsetof(struct MutableDBOptions, manifest_preallocation_size),
+          OptionType::kSizeT, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"verify_manifest_content_on_close",
+         {offsetof(struct MutableDBOptions, verify_manifest_content_on_close),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"optimize_manifest_for_recovery",
+         {offsetof(struct MutableDBOptions, optimize_manifest_for_recovery),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"daily_offpeak_time_utc",
          {offsetof(struct MutableDBOptions, daily_offpeak_time_utc),
           OptionType::kString, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"max_compaction_trigger_wakeup_seconds",
+         {offsetof(struct MutableDBOptions,
+                   max_compaction_trigger_wakeup_seconds),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"fast_sst_open",
+         {offsetof(struct MutableDBOptions, fast_sst_open),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
 };
 
@@ -140,6 +170,7 @@ static std::unordered_map<std::string, OptionTypeInfo>
           std::shared_ptr<Statistics> statistics;
           std::vector<DbPath> db_paths;
           FileTypeSet checksum_handoff_file_types;
+          CompactionStyleSet calculate_sst_write_lifetime_hint_set;
          */
         {"advise_random_on_open",
          {offsetof(struct ImmutableDBOptions, advise_random_on_open),
@@ -159,6 +190,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kNone}},
         {"use_direct_reads",
          {offsetof(struct ImmutableDBOptions, use_direct_reads),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"use_direct_io_for_compaction_reads",
+         {offsetof(struct ImmutableDBOptions,
+                   use_direct_io_for_compaction_reads),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"use_direct_writes",
@@ -216,6 +252,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, paranoid_checks),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"open_files_async",
+         {offsetof(struct ImmutableDBOptions, open_files_async),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"flush_verify_memtable_count",
          {offsetof(struct ImmutableDBOptions, flush_verify_memtable_count),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -227,6 +267,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"track_and_verify_wals_in_manifest",
          {offsetof(struct ImmutableDBOptions,
                    track_and_verify_wals_in_manifest),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"track_and_verify_wals",
+         {offsetof(struct ImmutableDBOptions, track_and_verify_wals),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"verify_sst_unique_id_in_manifest",
@@ -241,16 +285,13 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"skip_checking_sst_file_sizes_on_db_open",
-         {offsetof(struct ImmutableDBOptions,
-                   skip_checking_sst_file_sizes_on_db_open),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
+         {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
         {"new_table_reader_for_compaction_inputs",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
         {"random_access_max_buffer_size",
-         {offsetof(struct ImmutableDBOptions, random_access_max_buffer_size),
-          OptionType::kSizeT, OptionVerificationType::kNormal,
+         {0, OptionType::kSizeT, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
         {"use_adaptive_mutex",
          {offsetof(struct ImmutableDBOptions, use_adaptive_mutex),
@@ -261,6 +302,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
         {"max_file_opening_threads",
          {offsetof(struct ImmutableDBOptions, max_file_opening_threads),
+          OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"read_io_executor_threads",
+         {offsetof(struct ImmutableDBOptions, read_io_executor_threads),
           OptionType::kInt, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"table_cache_numshardbits",
@@ -279,12 +324,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, recycle_log_file_num),
           OptionType::kSizeT, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"async_wal_precreate",
+         {offsetof(struct ImmutableDBOptions, async_wal_precreate),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"log_file_time_to_roll",
          {offsetof(struct ImmutableDBOptions, log_file_time_to_roll),
-          OptionType::kSizeT, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
-        {"manifest_preallocation_size",
-         {offsetof(struct ImmutableDBOptions, manifest_preallocation_size),
           OptionType::kSizeT, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"max_log_file_size",
@@ -305,21 +350,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, WAL_ttl_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
-        {"max_manifest_file_size",
-         {offsetof(struct ImmutableDBOptions, max_manifest_file_size),
-          OptionType::kUInt64T, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
         {"persist_stats_to_disk",
          {offsetof(struct ImmutableDBOptions, persist_stats_to_disk),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"fail_if_options_file_error",
-         {offsetof(struct ImmutableDBOptions, fail_if_options_file_error),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
-        {"use_options_file",
-         {offsetof(struct ImmutableDBOptions, use_options_file),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
+         {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
         {"enable_pipelined_write",
          {offsetof(struct ImmutableDBOptions, enable_pipelined_write),
@@ -369,6 +405,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, avoid_flush_during_recovery),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"enforce_write_buffer_manager_during_recovery",
+         {offsetof(struct ImmutableDBOptions,
+                   enforce_write_buffer_manager_during_recovery),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"allow_ingest_behind",
          {offsetof(struct ImmutableDBOptions, allow_ingest_behind),
           OptionType::kBoolean, OptionVerificationType::kNormal,
@@ -391,6 +432,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, wal_compression),
           OptionType::kCompressionType, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"background_close_inactive_wals",
+         {offsetof(struct ImmutableDBOptions, background_close_inactive_wals),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"seq_per_batch",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
@@ -402,8 +447,20 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, avoid_unnecessary_blocking_io),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"prefix_seek_opt_in_only",
+         {offsetof(struct ImmutableDBOptions, prefix_seek_opt_in_only),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"write_dbid_to_manifest",
          {offsetof(struct ImmutableDBOptions, write_dbid_to_manifest),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"reuse_manifest_on_open",
+         {offsetof(struct ImmutableDBOptions, reuse_manifest_on_open),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"write_identity_file",
+         {offsetof(struct ImmutableDBOptions, write_identity_file),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"log_readahead_size",
@@ -479,10 +536,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, allow_data_in_errors),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
-        {"disable_manifest_sync",
-         {offsetof(struct ImmutableDBOptions, disable_manifest_sync),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone}},
         {"file_checksum_gen_factory",
          OptionTypeInfo::AsCustomSharedPtr<FileChecksumGenFactory>(
              offsetof(struct ImmutableDBOptions, file_checksum_gen_factory),
@@ -513,11 +566,13 @@ static std::unordered_map<std::string, OptionTypeInfo>
             embedded.ignore_unsupported_options = true;
             std::vector<std::shared_ptr<EventListener>> listeners;
             Status s;
+            // Permit `{item1:item2}` or bare `item1:item2`.
+            std::string stripped = OptionTypeInfo::StripOuterBraces(value);
             for (size_t start = 0, end = 0;
-                 s.ok() && start < value.size() && end != std::string::npos;
+                 s.ok() && start < stripped.size() && end != std::string::npos;
                  start = end + 1) {
               std::string token;
-              s = OptionTypeInfo::NextToken(value, ':', start, &end, &token);
+              s = OptionTypeInfo::NextToken(stripped, ':', start, &end, &token);
               if (s.ok() && !token.empty()) {
                 std::shared_ptr<EventListener> listener;
                 s = EventListener::CreateFromString(embedded, token, &listener);
@@ -566,19 +621,26 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, enforce_single_del_contracts),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
-        {"disable_delete_obsolete_files_on_open",
+        {"follower_refresh_catchup_period_ms",
          {offsetof(struct ImmutableDBOptions,
-                   disable_delete_obsolete_files_on_open),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
+                   follower_refresh_catchup_period_ms),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
-        {"max_num_replication_epochs",
-         {offsetof(struct ImmutableDBOptions, max_num_replication_epochs),
-          OptionType::kInt, OptionVerificationType::kNormal,
+        {"follower_catchup_retry_count",
+         {offsetof(struct ImmutableDBOptions, follower_catchup_retry_count),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
-        {"attempt_recovery_after_manifest_write_error",
-         {offsetof(struct ImmutableDBOptions,
-                   attempt_recovery_after_manifest_write_error),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
+        {"follower_catchup_retry_wait_ms",
+         {offsetof(struct ImmutableDBOptions, follower_catchup_retry_wait_ms),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"metadata_write_temperature",
+         {offsetof(struct ImmutableDBOptions, metadata_write_temperature),
+          OptionType::kTemperature, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"wal_write_temperature",
+         {offsetof(struct ImmutableDBOptions, wal_write_temperature),
+          OptionType::kTemperature, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
 };
 
@@ -642,7 +704,7 @@ class DBOptionsConfigurable : public MutableDBConfigurable {
   explicit DBOptionsConfigurable(
       const DBOptions& opts,
       const std::unordered_map<std::string, std::string>* map = nullptr)
-      : MutableDBConfigurable(MutableDBOptions(opts), map), db_options_(opts) {
+      : MutableDBConfigurable(MutableDBOptions{opts}, map), db_options_(opts) {
     // The ImmutableDBOptions currently requires the env to be non-null.  Make
     // sure it is
     if (opts.env != nullptr) {
@@ -693,19 +755,19 @@ std::unique_ptr<Configurable> DBOptionsAsConfigurable(
   return ptr;
 }
 
-ImmutableDBOptions::ImmutableDBOptions() : ImmutableDBOptions(Options()) {}
+ImmutableDBOptions::ImmutableDBOptions() : ImmutableDBOptions(DBOptions{}) {}
 
 ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
     : create_if_missing(options.create_if_missing),
-      replication_log_listener(options.replication_log_listener),
-      replication_epoch_extractor(options.replication_epoch_extractor),
       create_missing_column_families(options.create_missing_column_families),
       error_if_exists(options.error_if_exists),
       paranoid_checks(options.paranoid_checks),
+      open_files_async(options.open_files_async),
       flush_verify_memtable_count(options.flush_verify_memtable_count),
       compaction_verify_record_count(options.compaction_verify_record_count),
       track_and_verify_wals_in_manifest(
           options.track_and_verify_wals_in_manifest),
+      track_and_verify_wals(options.track_and_verify_wals),
       verify_sst_unique_id_in_manifest(
           options.verify_sst_unique_id_in_manifest),
       env(options.env),
@@ -714,6 +776,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       info_log(options.info_log),
       info_log_level(options.info_log_level),
       max_file_opening_threads(options.max_file_opening_threads),
+      read_io_executor_threads(options.read_io_executor_threads),
       statistics(options.statistics),
       use_fsync(options.use_fsync),
       db_paths(options.db_paths),
@@ -723,16 +786,17 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       log_file_time_to_roll(options.log_file_time_to_roll),
       keep_log_file_num(options.keep_log_file_num),
       recycle_log_file_num(options.recycle_log_file_num),
-      max_manifest_file_size(options.max_manifest_file_size),
+      async_wal_precreate(options.async_wal_precreate),
       table_cache_numshardbits(options.table_cache_numshardbits),
       WAL_ttl_seconds(options.WAL_ttl_seconds),
       WAL_size_limit_MB(options.WAL_size_limit_MB),
       max_write_batch_group_size_bytes(
           options.max_write_batch_group_size_bytes),
-      manifest_preallocation_size(options.manifest_preallocation_size),
       allow_mmap_reads(options.allow_mmap_reads),
       allow_mmap_writes(options.allow_mmap_writes),
       use_direct_reads(options.use_direct_reads),
+      use_direct_io_for_compaction_reads(
+          options.use_direct_io_for_compaction_reads),
       use_direct_io_for_flush_and_compaction(
           options.use_direct_io_for_flush_and_compaction),
       allow_fallocate(options.allow_fallocate),
@@ -740,7 +804,6 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       advise_random_on_open(options.advise_random_on_open),
       db_write_buffer_size(options.db_write_buffer_size),
       write_buffer_manager(options.write_buffer_manager),
-      random_access_max_buffer_size(options.random_access_max_buffer_size),
       use_adaptive_mutex(options.use_adaptive_mutex),
       listeners(options.listeners),
       enable_thread_tracking(options.enable_thread_tracking),
@@ -752,40 +815,45 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       write_thread_max_yield_usec(options.write_thread_max_yield_usec),
       write_thread_slow_yield_usec(options.write_thread_slow_yield_usec),
       skip_stats_update_on_db_open(options.skip_stats_update_on_db_open),
-      skip_checking_sst_file_sizes_on_db_open(
-          options.skip_checking_sst_file_sizes_on_db_open),
       wal_recovery_mode(options.wal_recovery_mode),
       allow_2pc(options.allow_2pc),
       row_cache(options.row_cache),
       wal_filter(options.wal_filter),
-      fail_if_options_file_error(options.fail_if_options_file_error),
-      use_options_file(options.use_options_file),
       dump_malloc_stats(options.dump_malloc_stats),
       avoid_flush_during_recovery(options.avoid_flush_during_recovery),
+      enforce_write_buffer_manager_during_recovery(
+          options.enforce_write_buffer_manager_during_recovery),
       allow_ingest_behind(options.allow_ingest_behind),
       two_write_queues(options.two_write_queues),
       manual_wal_flush(options.manual_wal_flush),
       wal_compression(options.wal_compression),
+      background_close_inactive_wals(options.background_close_inactive_wals),
       atomic_flush(options.atomic_flush),
       avoid_unnecessary_blocking_io(options.avoid_unnecessary_blocking_io),
+      prefix_seek_opt_in_only(options.prefix_seek_opt_in_only),
       persist_stats_to_disk(options.persist_stats_to_disk),
       write_dbid_to_manifest(options.write_dbid_to_manifest),
+      reuse_manifest_on_open(options.reuse_manifest_on_open),
+      write_identity_file(options.write_identity_file),
       log_readahead_size(options.log_readahead_size),
       file_checksum_gen_factory(options.file_checksum_gen_factory),
       best_efforts_recovery(options.best_efforts_recovery),
       max_bgerror_resume_count(options.max_bgerror_resume_count),
       bgerror_resume_retry_interval(options.bgerror_resume_retry_interval),
       allow_data_in_errors(options.allow_data_in_errors),
-      disable_manifest_sync(options.disable_manifest_sync),
       db_host_id(options.db_host_id),
       checksum_handoff_file_types(options.checksum_handoff_file_types),
       lowest_used_cache_tier(options.lowest_used_cache_tier),
       compaction_service(options.compaction_service),
       enforce_single_del_contracts(options.enforce_single_del_contracts),
-      disable_delete_obsolete_files_on_open(options.disable_delete_obsolete_files_on_open),
-      max_num_replication_epochs(options.max_num_replication_epochs),
-      attempt_recovery_after_manifest_write_error(
-          options.attempt_recovery_after_manifest_write_error) {
+      follower_refresh_catchup_period_ms(
+          options.follower_refresh_catchup_period_ms),
+      follower_catchup_retry_count(options.follower_catchup_retry_count),
+      follower_catchup_retry_wait_ms(options.follower_catchup_retry_wait_ms),
+      metadata_write_temperature(options.metadata_write_temperature),
+      wal_write_temperature(options.wal_write_temperature),
+      calculate_sst_write_lifetime_hint_set(
+          options.calculate_sst_write_lifetime_hint_set) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();
   logger = info_log.get();
@@ -799,6 +867,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    create_if_missing);
   ROCKS_LOG_HEADER(log, "                        Options.paranoid_checks: %d",
                    paranoid_checks);
+  ROCKS_LOG_HEADER(log, "                       Options.open_files_async: %d",
+                   open_files_async);
   ROCKS_LOG_HEADER(log, "            Options.flush_verify_memtable_count: %d",
                    flush_verify_memtable_count);
   ROCKS_LOG_HEADER(log, "         Options.compaction_verify_record_count: %d",
@@ -807,6 +877,10 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    "                              "
                    "Options.track_and_verify_wals_in_manifest: %d",
                    track_and_verify_wals_in_manifest);
+  ROCKS_LOG_HEADER(log,
+                   "                              "
+                   "Options.track_and_verify_wals: %d",
+                   track_and_verify_wals);
   ROCKS_LOG_HEADER(log, "       Options.verify_sst_unique_id_in_manifest: %d",
                    verify_sst_unique_id_in_manifest);
   ROCKS_LOG_HEADER(log, "                                    Options.env: %p",
@@ -817,6 +891,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    info_log.get());
   ROCKS_LOG_HEADER(log, "               Options.max_file_opening_threads: %d",
                    max_file_opening_threads);
+  ROCKS_LOG_HEADER(log, "               Options.read_io_executor_threads: %d",
+                   read_io_executor_threads);
   ROCKS_LOG_HEADER(log, "                             Options.statistics: %p",
                    stats);
   if (stats) {
@@ -829,9 +905,6 @@ void ImmutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(
       log, "                      Options.max_log_file_size: %" ROCKSDB_PRIszt,
       max_log_file_size);
-  ROCKS_LOG_HEADER(log,
-                   "                 Options.max_manifest_file_size: %" PRIu64,
-                   max_manifest_file_size);
   ROCKS_LOG_HEADER(
       log, "                  Options.log_file_time_to_roll: %" ROCKSDB_PRIszt,
       log_file_time_to_roll);
@@ -841,6 +914,8 @@ void ImmutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(
       log, "                   Options.recycle_log_file_num: %" ROCKSDB_PRIszt,
       recycle_log_file_num);
+  ROCKS_LOG_HEADER(log, "                    Options.async_wal_precreate: %d",
+                   async_wal_precreate);
   ROCKS_LOG_HEADER(log, "                        Options.allow_fallocate: %d",
                    allow_fallocate);
   ROCKS_LOG_HEADER(log, "                       Options.allow_mmap_reads: %d",
@@ -850,8 +925,10 @@ void ImmutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log, "                       Options.use_direct_reads: %d",
                    use_direct_reads);
   ROCKS_LOG_HEADER(log,
-                   "                       "
-                   "Options.use_direct_io_for_flush_and_compaction: %d",
+                   "            Options.use_direct_io_for_compaction_reads: %d",
+                   use_direct_io_for_compaction_reads);
+  ROCKS_LOG_HEADER(log,
+                   "        Options.use_direct_io_for_flush_and_compaction: %d",
                    use_direct_io_for_flush_and_compaction);
   ROCKS_LOG_HEADER(log, "         Options.create_missing_column_families: %d",
                    create_missing_column_families);
@@ -871,9 +948,6 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    "                       "
                    "Options.max_write_batch_group_size_bytes: %" PRIu64,
                    max_write_batch_group_size_bytes);
-  ROCKS_LOG_HEADER(
-      log, "            Options.manifest_preallocation_size: %" ROCKSDB_PRIszt,
-      manifest_preallocation_size);
   ROCKS_LOG_HEADER(log, "                    Options.is_fd_close_on_exec: %d",
                    is_fd_close_on_exec);
   ROCKS_LOG_HEADER(log, "                  Options.advise_random_on_open: %d",
@@ -883,9 +957,6 @@ void ImmutableDBOptions::Dump(Logger* log) const {
       db_write_buffer_size);
   ROCKS_LOG_HEADER(log, "                   Options.write_buffer_manager: %p",
                    write_buffer_manager.get());
-  ROCKS_LOG_HEADER(
-      log, "          Options.random_access_max_buffer_size: %" ROCKSDB_PRIszt,
-      random_access_max_buffer_size);
   ROCKS_LOG_HEADER(log, "                     Options.use_adaptive_mutex: %d",
                    use_adaptive_mutex);
   ROCKS_LOG_HEADER(log, "                           Options.rate_limiter: %p",
@@ -925,6 +996,9 @@ void ImmutableDBOptions::Dump(Logger* log) const {
 
   ROCKS_LOG_HEADER(log, "            Options.avoid_flush_during_recovery: %d",
                    avoid_flush_during_recovery);
+  ROCKS_LOG_HEADER(
+      log, "        Options.enforce_write_buffer_manager_during_recovery: %d",
+      enforce_write_buffer_manager_during_recovery);
   ROCKS_LOG_HEADER(log, "            Options.allow_ingest_behind: %d",
                    allow_ingest_behind);
   ROCKS_LOG_HEADER(log, "            Options.two_write_queues: %d",
@@ -933,14 +1007,22 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    manual_wal_flush);
   ROCKS_LOG_HEADER(log, "            Options.wal_compression: %d",
                    wal_compression);
-  ROCKS_LOG_HEADER(log, "            Options.atomic_flush: %d", atomic_flush);
   ROCKS_LOG_HEADER(log,
-                   "            Options.avoid_unnecessary_blocking_io: %d",
+                   "            Options.background_close_inactive_wals: %d",
+                   background_close_inactive_wals);
+  ROCKS_LOG_HEADER(log, "            Options.atomic_flush: %d", atomic_flush);
+  ROCKS_LOG_HEADER(log, "            Options.avoid_unnecessary_blocking_io: %d",
                    avoid_unnecessary_blocking_io);
+  ROCKS_LOG_HEADER(log, "            Options.prefix_seek_opt_in_only: %d",
+                   prefix_seek_opt_in_only);
   ROCKS_LOG_HEADER(log, "                Options.persist_stats_to_disk: %u",
                    persist_stats_to_disk);
   ROCKS_LOG_HEADER(log, "                Options.write_dbid_to_manifest: %d",
                    write_dbid_to_manifest);
+  ROCKS_LOG_HEADER(log, "                Options.reuse_manifest_on_open: %d",
+                   reuse_manifest_on_open);
+  ROCKS_LOG_HEADER(log, "                Options.write_identity_file: %d",
+                   write_identity_file);
   ROCKS_LOG_HEADER(
       log, "                Options.log_readahead_size: %" ROCKSDB_PRIszt,
       log_readahead_size);
@@ -956,18 +1038,14 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    bgerror_resume_retry_interval);
   ROCKS_LOG_HEADER(log, "            Options.allow_data_in_errors: %d",
                    allow_data_in_errors);
-  ROCKS_LOG_HEADER(log, "           Options.disable_manifest_sync: %d",
-                   disable_manifest_sync);
   ROCKS_LOG_HEADER(log, "            Options.db_host_id: %s",
                    db_host_id.c_str());
   ROCKS_LOG_HEADER(log, "            Options.enforce_single_del_contracts: %s",
                    enforce_single_del_contracts ? "true" : "false");
-  ROCKS_LOG_HEADER(log, "   Options.disable_delete_obsolete_files_on_open: %s",
-                   disable_delete_obsolete_files_on_open ? "true" : "false");
-  ROCKS_LOG_HEADER(log, "              Options.max_num_replication_epochs: %d",
-                   max_num_replication_epochs);
-  ROCKS_LOG_HEADER(log, "              Options.attempt_recovery_after_manifest_write_error: %d",
-                   attempt_recovery_after_manifest_write_error);
+  ROCKS_LOG_HEADER(log, "            Options.metadata_write_temperature: %s",
+                   temperature_to_string[metadata_write_temperature].c_str());
+  ROCKS_LOG_HEADER(log, "            Options.wal_write_temperature: %s",
+                   temperature_to_string[wal_write_temperature].c_str());
 }
 
 bool ImmutableDBOptions::IsWalDirSameAsDBPath() const {
@@ -1005,24 +1083,7 @@ const std::string& ImmutableDBOptions::GetWalDir(
   }
 }
 
-MutableDBOptions::MutableDBOptions()
-    : max_background_jobs(2),
-      max_background_compactions(-1),
-      max_subcompactions(0),
-      avoid_flush_during_shutdown(false),
-      writable_file_max_buffer_size(1024 * 1024),
-      delayed_write_rate(2 * 1024U * 1024U),
-      max_total_wal_size(0),
-      delete_obsolete_files_period_micros(6ULL * 60 * 60 * 1000000),
-      stats_dump_period_sec(600),
-      stats_persist_period_sec(600),
-      stats_history_buffer_size(1024 * 1024),
-      max_open_files(-1),
-      bytes_per_sync(0),
-      wal_bytes_per_sync(0),
-      strict_bytes_per_sync(false),
-      compaction_readahead_size(0),
-      max_background_flushes(-1) {}
+MutableDBOptions::MutableDBOptions() : MutableDBOptions(DBOptions{}) {}
 
 MutableDBOptions::MutableDBOptions(const DBOptions& options)
     : max_background_jobs(options.max_background_jobs),
@@ -1043,7 +1104,16 @@ MutableDBOptions::MutableDBOptions(const DBOptions& options)
       strict_bytes_per_sync(options.strict_bytes_per_sync),
       compaction_readahead_size(options.compaction_readahead_size),
       max_background_flushes(options.max_background_flushes),
-      daily_offpeak_time_utc(options.daily_offpeak_time_utc) {}
+      max_manifest_file_size(options.max_manifest_file_size),
+      max_manifest_space_amp_pct(options.max_manifest_space_amp_pct),
+      manifest_preallocation_size(options.manifest_preallocation_size),
+      verify_manifest_content_on_close(
+          options.verify_manifest_content_on_close),
+      optimize_manifest_for_recovery(options.optimize_manifest_for_recovery),
+      fast_sst_open(options.fast_sst_open),
+      daily_offpeak_time_utc(options.daily_offpeak_time_utc),
+      max_compaction_trigger_wakeup_seconds(
+          options.max_compaction_trigger_wakeup_seconds) {}
 
 void MutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log, "            Options.max_background_jobs: %d",
@@ -1080,16 +1150,33 @@ void MutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "                     Options.wal_bytes_per_sync: %" PRIu64,
                    wal_bytes_per_sync);
-  ROCKS_LOG_HEADER(log,
-                   "                  Options.strict_bytes_per_sync: %d",
+  ROCKS_LOG_HEADER(log, "                  Options.strict_bytes_per_sync: %d",
                    strict_bytes_per_sync);
   ROCKS_LOG_HEADER(log,
                    "      Options.compaction_readahead_size: %" ROCKSDB_PRIszt,
                    compaction_readahead_size);
   ROCKS_LOG_HEADER(log, "                 Options.max_background_flushes: %d",
-                          max_background_flushes);
+                   max_background_flushes);
+  ROCKS_LOG_HEADER(log,
+                   "                 Options.max_manifest_file_size: %" PRIu64,
+                   max_manifest_file_size);
+  ROCKS_LOG_HEADER(log,
+                   "                 Options.max_manifest_space_amp_pct: %d",
+                   max_manifest_space_amp_pct);
+  ROCKS_LOG_HEADER(
+      log, "            Options.manifest_preallocation_size: %" ROCKSDB_PRIszt,
+      manifest_preallocation_size);
+  ROCKS_LOG_HEADER(log, "      Options.verify_manifest_content_on_close: %d",
+                   verify_manifest_content_on_close);
+  ROCKS_LOG_HEADER(log, "         Options.optimize_manifest_for_recovery: %d",
+                   optimize_manifest_for_recovery);
   ROCKS_LOG_HEADER(log, "Options.daily_offpeak_time_utc: %s",
                    daily_offpeak_time_utc.c_str());
+  ROCKS_LOG_HEADER(log,
+                   "Options.max_compaction_trigger_wakeup_seconds: %" PRIu64,
+                   max_compaction_trigger_wakeup_seconds);
+  ROCKS_LOG_HEADER(log, "                         Options.fast_sst_open: %d",
+                   fast_sst_open);
 }
 
 Status GetMutableDBOptionsFromStrings(

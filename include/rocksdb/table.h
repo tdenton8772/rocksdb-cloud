@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "rocksdb/cache.h"
+#include "rocksdb/cleanable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
@@ -44,6 +45,68 @@ class TableReader;
 class WritableFileWriter;
 struct ConfigOptions;
 struct EnvOptions;
+class UserDefinedIndexFactory;
+
+// Hook for providing read-scoped storage for data blocks read from SST files.
+// This is configured through C++ options rather than OPTIONS files.
+//
+// Current support is limited to block-based table iterator scans and MultiScan
+// data-block reads. Reads using mmap ignore this provider and use normal
+// RocksDB block backing.
+//
+// The provider backs final data-block contents pinned by the scan. RocksDB may
+// still use ordinary temporary scratch for serialized block bytes, such as when
+// reading a block that may be compressed before decompressing or copying the
+// final data block into provider-backed storage.
+//
+// This is separate from MemoryAllocator because each allocation needs a
+// per-lease cleanup handle that RocksDB can attach to pinned blocks/slices, and
+// direct-I/O reads that use provider-backed read buffers need the requested
+// alignment to be passed to the provider.
+//
+// TODO: Extend support to point lookups (Get/MultiGet) once those paths can
+// preserve provider-backed block ownership.
+//
+// Requirements:
+// - If the same provider instance is shared by multiple concurrently active
+//   readers, `Allocate()` must be safe to call concurrently.
+// - `Lease::data` must point to at least `size` bytes of writable contiguous
+//   memory that remains valid until every copy of `Lease::cleanup` is reset.
+// - `Lease::data` must be aligned to `alignment` bytes, where `alignment` is a
+//   power of two and `1` means no special alignment requirement.
+// - When `alignment` is greater than 1, `Lease::size` must also be a multiple
+//   of `alignment` so it can be used as direct-I/O backing storage.
+// - `Lease::cleanup` must be non-null on success. Its cleanup may run on any
+//   thread that releases the last RocksDB reference. If the cleanup touches
+//   provider or other shared state, it must synchronize with Allocate() and
+//   other provider cleanup callbacks.
+// - After `Allocate()` succeeds, RocksDB releases `Lease::cleanup` on all
+//   paths, including later I/O or decompression failure.
+class ReadScopedBlockBufferProvider {
+ public:
+  // A Lease hands one writable backing allocation from the provider to
+  // RocksDB. For a provider-backed block, the final BlockContents data points
+  // into this allocation and RocksDB attaches `cleanup` to the resulting Blocks
+  // and any slices pinned from them. File-read scratch, copying, and
+  // decompression choices are implementation details outside this contract.
+  //
+  // The provider controls allocation reclamation. RocksDB keeps the data valid
+  // by copying `cleanup`; the provider must not reuse or release `data` until
+  // every copy of `cleanup` has been reset. `size` is the usable backing
+  // allocation size and may be larger than the requested allocation size. For
+  // direct-I/O reads, `size` must be a multiple of the requested alignment.
+  struct Lease {
+    // Writable contiguous memory for the loaded block.
+    char* data = nullptr;
+    size_t size = 0;
+    // Reclaims `data` after all derived pinned key/value slices are released.
+    SharedCleanablePtr cleanup;
+  };
+
+  virtual ~ReadScopedBlockBufferProvider() = default;
+
+  virtual Status Allocate(size_t size, size_t alignment, Lease* out) = 0;
+};
 
 // Types of checksums to use for checking integrity of logical blocks within
 // files. All checksums currently use 32 bits of checking power (1 in 4B
@@ -125,8 +188,33 @@ struct CacheUsageOptions {
   std::map<CacheEntryRole, CacheEntryRoleOptions> options_overrides;
 };
 
-
-// For advanced user only
+// Configures how SST files using the block-based table format (standard)
+// are written and read. With few exceptions, each option only affects either
+// (a) how new SST files are written, or (b) how SST files are read. If an
+// option seems to affect how the SST file is constructed, e.g. format_version,
+// that option *ONLY* has an effect at construction time. Contrast this with
+// options like the various `cache` and `pin` options, that only affect
+// in-memory and IO behavior at read time. In general, any version of RocksDB
+// able to read the full key-value and indexing data in the SST file will read
+// it as written regardless of current options for writing new files. See
+// filter_policy regarding filters.
+//
+// Except as specifically noted, all options here are "mutable" using
+// SetOptions(), with the caveat that only new table builders and new table
+// readers will pick up new options. This is nearly immediate effect for
+// SST building, but in the worst case, options affecting reads only take
+// effect for new files. (Unless the DB is closed and re-opened, table readers
+// can live as long as the SST file itself.)
+//
+// Examples (DB* db):
+// db->SetOptions({{"block_based_table_factory",
+//                  "{detect_filter_construct_corruption=true;}"}});
+// db->SetOptions({{"block_based_table_factory",
+//                  "{max_auto_readahead_size=0;block_size=8192;}"}}));
+// db->SetOptions({{"block_based_table_factory",
+//                  "{prepopulate_block_cache=kFlushOnly;}"}}));
+// db->SetOptions({{"block_based_table_factory",
+//                  "{filter_policy=ribbonfilter:10;}"}});
 struct BlockBasedTableOptions {
   static const char* kName() { return "BlockTableOptions"; }
   // @flush_block_policy_factory creates the instances of flush block policy.
@@ -237,6 +325,34 @@ struct BlockBasedTableOptions {
 
   IndexType index_type = kBinarySearch;
 
+  // The search algorithm used when seeking to entries in the index block.
+  //
+  // Note: This option is only used at read time and is compatible with any type
+  // of block.
+  enum BlockSearchType : char {
+    // Standard binary search
+    kBinary = 0x00,
+    // Interpolation search, which may be better suited for uniformly
+    // distributed keys. This will only be applicable if the comparator is the
+    // byte-wise comparator. Avoid using
+    // IndexShorteningMode::kShortenSeparatorsAndSuccessor as shortening the
+    // succesor can skew the end key and make interpolation search significantly
+    // less performant.
+    kInterpolation = 0x01,
+    // See `uniform_cv_threshold`. On the write path if `uniform_cv_threshold`
+    // >= 0, then it is possible for a block to be marked as "is_uniform=true"
+    // in the block footer via bit flag. On files from older versions or
+    // produced via `uniform_cv_threshold` < 0, blocks are always marked as
+    // "is_uniform=false".
+    //
+    // When kAuto is used, the search algorithm will use interpolation search if
+    // "is_uniform" flag is set in the block footer, otherwise it will use
+    // binary search.
+    kAuto = 0x02,
+  };
+
+  BlockSearchType index_block_search_type = kBinary;
+
   // The index type that will be used for the data block.
   enum DataBlockIndexType : char {
     kDataBlockBinarySearch = 0,   // traditional block type
@@ -257,13 +373,20 @@ struct BlockBasedTableOptions {
   // even though they have different checksum type.
   ChecksumType checksum = kXXH3;
 
-  // Disable block cache. If this is set to true,
-  // then no block cache should be used, and the block_cache should
-  // point to a nullptr object.
+  // Disable block cache. If this is set to true, then no block cache
+  // will be configured (block_cache reset to nullptr).
+  //
+  // This option should not be used with SetOptions.
   bool no_block_cache = false;
 
-  // If non-NULL use the specified cache for blocks.
-  // If NULL, rocksdb will automatically create and use a 32MB internal cache.
+  // If non-nullptr and no_block_cache == false, use the specified cache for
+  // blocks. If nullptr and no_block_cache == false, a 32MB internal cache
+  // will be created and used.
+  //
+  // This option should not be used with SetOptions, because (a) the code
+  // to make it safe is incomplete, and (b) it is not clear when/if the
+  // old block cache would go away. For now, dynamic changes to block cache
+  // should be through the Cache object, e.g. Cache::SetCapacity().
   std::shared_ptr<Cache> block_cache = nullptr;
 
   // If non-NULL use the specified cache for pages read from device
@@ -292,15 +415,11 @@ struct BlockBasedTableOptions {
   // Same as block_restart_interval but used for the index block.
   int index_block_restart_interval = 1;
 
-  // Block size for partitioned metadata. Currently applied to indexes when
-  // kTwoLevelIndexSearch is used and to filters when partition_filters is used.
-  // Note: Since in the current implementation the filters and index partitions
-  // are aligned, an index/filter block is created when either index or filter
-  // block size reaches the specified limit.
-  // Note: this limit is currently applied to only index blocks; a filter
-  // partition is cut right after an index block is cut
-  // TODO(myabandeh): remove the note above when filter partitions are cut
-  // separately
+  // Target block size for partitioned metadata. Currently applied to indexes
+  // when kTwoLevelIndexSearch is used and to filters when partition_filters is
+  // used. When decouple_partitioned_filters=false (original behavior), there is
+  // much more deviation from this target size. See the comment on
+  // decouple_partitioned_filters.
   uint64_t metadata_block_size = 4096;
 
   // `cache_usage_options` allows users to specify the default
@@ -399,6 +518,26 @@ struct BlockBasedTableOptions {
   // block cache even when cache_index_and_filter_blocks=false.
   bool partition_filters = false;
 
+  // When both partitioned indexes and partitioned filters are enabled,
+  // this enables independent partitioning boundaries between the two. Most
+  // notably, this enables these metadata blocks to hit their target size much
+  // more accurately, as there is often a disparity between index sizes and
+  // filter sizes. This should reduce fragmentation and metadata overheads in
+  // the block cache, as well as treat blocks more fairly for cache eviction
+  // purposes.
+  //
+  // There are no SST format compatibility issues with this option. (All
+  // versions of RocksDB able to read partitioned filters are able to read
+  // decoupled partitioned filters.)
+  //
+  // decouple_partitioned_filters = true is the new default. This option is now
+  // DEPRECATED and might be ignored and/or removed in a future release.
+  //
+  // NOTE: decouple_partitioned_filters = false with partition_filters = true
+  // disables parallel compression (CompressionOptions::parallel_threads
+  // sanitized to 1).
+  bool decouple_partitioned_filters = true;
+
   // Option to generate Bloom/Ribbon filters that minimize memory
   // internal fragmentation.
   //
@@ -427,12 +566,12 @@ struct BlockBasedTableOptions {
   // the block cache better at using space it is allowed. (These issues
   // should not arise with partitioned filters.)
   //
-  // NOTE: Do not set to true if you do not trust malloc_usable_size. With
-  // this option, RocksDB might access an allocated memory object beyond its
-  // original size if malloc_usable_size says it is safe to do so. While this
-  // can be considered bad practice, it should not produce undefined behavior
-  // unless malloc_usable_size is buggy or broken.
-  bool optimize_filters_for_memory = false;
+  // NOTE: Set to false if you do not trust malloc_usable_size. When set to
+  // true, RocksDB might access an allocated memory object beyond its original
+  // size if malloc_usable_size says it is safe to do so. While this can be
+  // considered bad practice, it should not produce undefined behavior unless
+  // malloc_usable_size is buggy or broken.
+  bool optimize_filters_for_memory = true;
 
   // Use delta encoding to compress keys in blocks.
   // ReadOptions::pin_data requires this option to be disabled.
@@ -443,7 +582,80 @@ struct BlockBasedTableOptions {
   // If non-nullptr, use the specified filter policy to reduce disk reads.
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
+  //
+  // Because filters only impact performance and are not data-critical, an
+  // SST file can be opened and used without filters if (a) the filter
+  // policy name or schema is unrecognized, or (b) filter_policy is nullptr.
+  // See filter_policy regarding filters.
   std::shared_ptr<const FilterPolicy> filter_policy = nullptr;
+
+  // EXPERIMENTAL
+  //
+  // If non-nullptr, use the specified factory to build user-defined index.
+  // This allows users to define their own index format and build the index
+  // during table building.
+  //
+  // NOTE: UserDefinedIndexFactory currently disables parallel compression
+  // (CompressionOptions::parallel_threads sanitized to 1).
+  std::shared_ptr<UserDefinedIndexFactory> user_defined_index_factory = nullptr;
+
+  // EXPERIMENTAL
+  //
+  // When true and user_defined_index_factory is set, the UDI becomes the
+  // primary index for reads. All reads (including internal operations like
+  // compaction and VerifyChecksum) automatically route through the UDI
+  // without needing ReadOptions::table_index_factory.
+  //
+  // Both the standard binary search index and the UDI are always fully
+  // built. The standard index serves as a safety fallback (e.g., for
+  // backup/restore or rollback to a non-UDI configuration). A future
+  // refactor will extract the index abstraction to allow skipping the
+  // standard index build when the UDI is primary.
+  //
+  // When the UDI is primary:
+  // - All reads automatically use the UDI (ReadOptions::table_index_factory
+  //   does not need to be set)
+  // - Partitioned index (kTwoLevelIndexSearch) and partitioned filters are
+  //   incompatible with this option
+  // - fail_if_no_udi_on_open is automatically enforced to prevent silent
+  //   data loss if these SSTs are opened without UDI support
+  //
+  // Recommended migration path:
+  //
+  // 1. Deploy with user_defined_index_factory set but
+  //    use_udi_as_primary_index=false (secondary mode). New SSTs are written
+  //    with both indexes. Reads use the standard index by default.
+  //
+  // 2. Validate reads through the UDI by setting
+  //    ReadOptions::table_index_factory on a subset of reads.
+  //
+  // 3. Compact the entire DB to rewrite all pre-existing SSTs with both
+  //    indexes. All SSTs must have a UDI block before proceeding.
+  //
+  // 4. Enable use_udi_as_primary_index=true. All reads use the UDI.
+  //
+  // Rollback: set use_udi_as_primary_index=false. Since the standard index
+  // is always fully populated, SSTs are immediately readable through the
+  // standard index. No compaction is required. All reads immediately
+  // revert to the standard index path.
+  //
+  // Backup/restore: the user_defined_index_factory is a shared_ptr that
+  // cannot survive Options serialization (e.g., GetStringFromDBOptions).
+  // Since the standard index is always fully populated, a restored DB can
+  // be opened and read without the factory (reads fall back to the standard
+  // index). Set the factory when opening the restored DB to resume using
+  // the UDI.
+  //
+  // Default: false (UDI is built alongside the standard index as a secondary)
+  bool use_udi_as_primary_index = false;
+
+  // EXPERIMENTAL
+  //
+  // Return an error Status if a user_defined_index_factory is configured,
+  // but there's no corresponding UDI block in the SST file being opened.
+  // When use_udi_as_primary_index is true, this check is automatically
+  // enforced (a missing UDI block is always an error in primary mode).
+  bool fail_if_no_udi_on_open = false;
 
   // If true, place whole keys in the filter (not just prefixes).
   // This must generally be true for gets to be efficient.
@@ -455,10 +667,6 @@ struct BlockBasedTableOptions {
   // This is an extra check that is only
   // useful in detecting software bugs or CPU+memory malfunction.
   // Turning on this feature increases filter construction time by 30%.
-  //
-  // This parameter can be changed dynamically by
-  // DB::SetOptions({{"block_based_table_factory",
-  //                  "{detect_filter_construct_corruption=true;}"}});
   //
   // TODO: optimize this performance
   bool detect_filter_construct_corruption = false;
@@ -491,13 +699,10 @@ struct BlockBasedTableOptions {
   // Default: 0 (disabled)
   uint32_t read_amp_bytes_per_bit = 0;
 
-  // We currently have these versions:
-  // 0 -- This version can be read by really old RocksDB's. Doesn't support
-  // changing checksum type (default is CRC32).
-  // 1 -- Can be read by RocksDB's versions since 3.0. Supports non-default
-  // checksum, like xxHash. It is written by RocksDB when
-  // BlockBasedTableOptions::checksum is something other than kCRC32c. (version
-  // 0 is silently upconverted)
+  // We currently have these format versions:
+  // 0 - 1 -- No longer supported. Attempting to read files with these format
+  // versions will return an error. To upgrade, load the data with RocksDB
+  // >= 4.6.0 and < 11.0.0, then run a full compaction.
   // 2 -- Can be read by RocksDB's versions since 3.10. Changes the way we
   // encode compressed blocks with LZ4, BZip2 and Zlib compression. If you
   // don't plan to run RocksDB before version 3.10, you should probably use
@@ -520,6 +725,10 @@ struct BlockBasedTableOptions {
   // misplaced within or between files is as likely to fail checksum
   // verification as random corruption. Also checksum-protects SST footer.
   // Can be read by RocksDB versions >= 8.6.0.
+  // 7 -- Support for custom compression algorithms with a CompressionManager
+  // using a non-built-in CompatibilityName(). See `compression_manager` in
+  // ColumnFamilyOptions. Also changes the format of TableProperties field
+  // `compression_name`. Can be read by RocksDB versions >= 10.4.0.
   //
   // Using the default setting of format_version is strongly recommended, so
   // that available enhancements are adopted eventually and automatically. The
@@ -527,7 +736,32 @@ struct BlockBasedTableOptions {
   // validation and sufficient time and number of releases have elapsed
   // (6 months recommended) to ensure a clean downgrade/revert path for users
   // who might only upgrade a few times per year.
-  uint32_t format_version = 6;
+  uint32_t format_version = 7;
+
+  // When true, data blocks store keys and values separately. Keys are stored
+  // at the beginning of the block, followed by values at the end. This can
+  // improve read performance at a cost of a varint per restart interval (~1 bit
+  // per key by default), in addition to improving compression. Small values or
+  // low block_restart_interval may prefer to set this as false.
+  //
+  // Default: false
+  bool separate_key_value_in_data_block = false;
+
+  // Coefficient of variation (CV) threshold used to determine if keys in an
+  // index block are uniformly distributed. Lower CV means more "uniform", and
+  // the more likely interpolation search will outperform binary search.
+  //
+  // On the write path, if the CV of key gaps in an index
+  // block is less than this threshold, the "is_uniform" hint is set in that
+  // block's footer. To disable (i.e. always have "is_uniform=false"), set value
+  // to -1.
+  //
+  // On the read path, if `BlockSearchType::kAuto` is set, then it will use the
+  // is_uniform hint to select an appropriate search algorithm for the block.
+  //
+  // NOTE: Currently only supports index blocks. May update to include data
+  // blocks in the future.
+  double uniform_cv_threshold = -1;
 
   // Store index blocks on disk in compressed format. Changing this option to
   // false  will avoid the overhead of decompression if index blocks are evicted
@@ -536,6 +770,30 @@ struct BlockBasedTableOptions {
 
   // Align data blocks on lesser of page size and block size
   bool block_align = false;
+
+  // Align data blocks on super block alignment. Avoid a data block split across
+  // super block boundaries. Works with/without compression.
+  //
+  // Here a "super block" refers to an aligned unit of underlying Filesystem
+  // storage for which there is an extra cost when a random read involves two
+  // such super blocks instead of just one. Configuring that size here suggests
+  // inserting padding in the SST file to avoid a single SST block splitting
+  // across two super blocks. Only power-of-two sizes are supported. See also
+  // super_block_alignment_space_overhead_ratio. Default to 0, which means super
+  // block alignment is disabled.
+  //
+  // Super block alignment size. Default to 0, which means super block alignment
+  // is disabled. If it is enabled, it needs to be a power of 2 and higher than
+  // block size.
+  size_t super_block_alignment_size = 0;
+
+  // This option constrols the storage space overhead of super block alignment.
+  // It is used to calculate the max padding size allowed for super block
+  // alignment. It is calculated in this way. If super_block_alignment_size is
+  // 2MB, and super_block_alignment_overhead_ratio is 128, then the max padding
+  // size allowed for super block alignment is 2MB / 128 = 16KB.
+  // Note that, when it is set to 0, super block alignment is disabled.
+  size_t super_block_alignment_space_overhead_ratio = 128;
 
   // This enum allows trading off increased index size for improved iterator
   // seek performance in some situations, particularly when block cache is
@@ -590,37 +848,39 @@ struct BlockBasedTableOptions {
   // Found that 256 KB readahead size provides the best performance, based on
   // experiments, for auto readahead. Experiment data is in PR #3282.
   //
-  // This parameter can be changed dynamically by
-  // DB::SetOptions({{"block_based_table_factory",
-  //                  "{max_auto_readahead_size=0;}"}}));
-  //
-  // Changing the value dynamically will only affect files opened after the
-  // change.
-  //
   // Default: 256 KB (256 * 1024).
   size_t max_auto_readahead_size = 256 * 1024;
 
   // If enabled, prepopulate warm/hot blocks (data, uncompressed dict, index and
   // filter blocks) which are already in memory into block cache at the time of
-  // flush. On a flush, the block that is in memory (in memtables) get flushed
-  // to the device. If using Direct IO, additional IO is incurred to read this
-  // data back into memory again, which is avoided by enabling this option. This
+  // flush or compaction.
+  //
+  // On a flush, the data block that is in memory (in memtables) gets flushed to
+  // the device. If using Direct IO, additional IO is incurred to read this data
+  // back into memory again, which is avoided by enabling this option. This
   // further helps if the workload exhibits high temporal locality, where most
   // of the reads go to recently written data. This also helps in case of
   // Distributed FileSystem.
   //
-  // This parameter can be changed dynamically by
-  // DB::SetOptions({{"block_based_table_factory",
-  //                  "{prepopulate_block_cache=kFlushOnly;}"}}));
+  // On a compaction, output SST files are written to disk but not placed in the
+  // block cache by default. With tiered or remote storage (e.g., HDFS, S3),
+  // reading recently compacted data back incurs high latency.
+  // Enabling compaction warming avoids these cold reads. However, unlike flush
+  // output, it is hard to distinguish hot from cold blocks in compaction
+  // output, so warming all of it risks polluting the cache. To mitigate this,
+  // compaction-warmed blocks are inserted at BOTTOM priority (vs LOW for flush)
+  // so they are evicted first under cache pressure. Even so,
+  // kFlushAndCompaction is recommended only when most or all of the database is
+  // expected to reside in cache. For workloads where only a fraction of the
+  // data is hot, kFlushOnly is the safer choice.
   enum class PrepopulateBlockCache : char {
     // Disable prepopulate block cache.
     kDisable,
     // Prepopulate blocks during flush only.
     kFlushOnly,
-    // Prepopulate blocks during flush and compaction. For compaction, only
-    // blocks of sst files pass `compaction_prepopulate_block_cache_filter`
-    // are applied
-    kFlushAndCompaction
+    // Prepopulate blocks during flush and compaction. Flush-warmed blocks are
+    // inserted at LOW priority, compaction-warmed blocks at BOTTOM priority.
+    kFlushAndCompaction,
   };
 
   PrepopulateBlockCache prepopulate_block_cache =
@@ -645,13 +905,6 @@ struct BlockBasedTableOptions {
   // Value should be provided along with KB i.e. 8 * 1024 as it will prefetch
   // the blocks.
   //
-  // This parameter can be changed dynamically by
-  // DB::SetOptions({{"block_based_table_factory",
-  //                  "{initial_auto_readahead_size=0;}"}}));
-  //
-  // Changing the value dynamically will only affect files opened after the
-  // change.
-  //
   // Default: 8 KB (8 * 1024).
   size_t initial_auto_readahead_size = 8 * 1024;
 
@@ -674,11 +927,6 @@ struct BlockBasedTableOptions {
   //
   // Default: 2
   uint64_t num_file_reads_for_auto_readahead = 2;
-
-  // Whether to prepopulate blocks generated by compaction.
-  // Only applied when `prepopulate_block_cache=kFlushAndCompaction`
-  std::function<bool(const TableProperties&)>
-      compaction_prepopulate_block_cache_filter;
 };
 
 // Table Properties that are specific to block-based table properties.
@@ -689,6 +937,11 @@ struct BlockBasedTablePropertyNames {
   static const std::string kWholeKeyFiltering;
   // value is "1" for true and "0" for false.
   static const std::string kPrefixFiltering;
+  // Set to "1" when partitioned filters are decoupled from partitioned indexes.
+  // This metadata is recorded in case a read-time optimization for coupled
+  // filter+index partitioning is ever developed; that optimization/assumption
+  // would be disabled when this is set.
+  static const std::string kDecoupledPartitionedFilters;
 };
 
 // Create default block based table factory.
@@ -925,6 +1178,11 @@ class TableFactory : public Customizable {
   virtual TableBuilder* NewTableBuilder(
       const TableBuilderOptions& table_builder_options,
       WritableFileWriter* file) const = 0;
+
+  // Clone this TableFactory with the same options, ideally a "shallow" clone
+  // in which shared_ptr members and hidden state are (safely) shared between
+  // this original and the returned clone.
+  virtual std::unique_ptr<TableFactory> Clone() const = 0;
 
   // Return is delete range supported
   virtual bool IsDeleteRangeSupported() const { return false; }

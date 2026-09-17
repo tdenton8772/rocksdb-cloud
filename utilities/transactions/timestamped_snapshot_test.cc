@@ -1,4 +1,4 @@
-//  Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+//  Copyright (c) Meta Platforms, Inc. and affiliates.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
@@ -9,17 +9,26 @@
 #include "utilities/transactions/transaction_test.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+constexpr std::array TimestampedSnapshotWithTsSanityCheck_Params = {
+    std::make_tuple(false, false, WRITE_PREPARED, kOrderedWrite),
+    std::make_tuple(false, true, WRITE_PREPARED, kUnorderedWrite),
+    std::make_tuple(false, false, WRITE_UNPREPARED, kOrderedWrite)};
+
 INSTANTIATE_TEST_CASE_P(
     Unsupported, TimestampedSnapshotWithTsSanityCheck,
-    ::testing::Values(
-        std::make_tuple(false, false, WRITE_PREPARED, kOrderedWrite),
-        std::make_tuple(false, true, WRITE_PREPARED, kUnorderedWrite),
-        std::make_tuple(false, false, WRITE_UNPREPARED, kOrderedWrite)));
+    ::testing::ValuesIn(WRAP_PARAM_WITH_PER_KEY_POINT_LOCK_MANAGER_PARAMS(
+        WRAP_PARAM(bool, bool, TxnDBWritePolicy, WriteOrdering),
+        TimestampedSnapshotWithTsSanityCheck_Params)));
 
-INSTANTIATE_TEST_CASE_P(WriteCommitted, TransactionTest,
-                        ::testing::Combine(::testing::Bool(), ::testing::Bool(),
-                                           ::testing::Values(WRITE_COMMITTED),
-                                           ::testing::Values(kOrderedWrite)));
+INSTANTIATE_TEST_CASE_P(
+    WriteCommitted, TransactionTest,
+    ::testing::Combine(/*use_stackable_db=*/::testing::Bool(),
+                       /*two_write_queue=*/::testing::Bool(),
+                       ::testing::Values(WRITE_COMMITTED),
+                       ::testing::Values(kOrderedWrite),
+                       /*use_per_key_point_lock_mgr=*/::testing::Bool(),
+                       /*deadlock_timeout_us=*/::testing::Values(0, 1000)));
 
 namespace {
 // Not thread-safe. Caller needs to provide external synchronization.

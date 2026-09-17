@@ -22,19 +22,23 @@
 #include "options/cf_options.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table_properties.h"
+#include "table/embedded_blob_sst.h"
 #include "table/unique_id_impl.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 class Status;
+class BlobSource;
 
 struct TableReaderOptions {
   // @param skip_filters Disables loading/accessing the filter block
   TableReaderOptions(
       const ImmutableOptions& _ioptions,
       const std::shared_ptr<const SliceTransform>& _prefix_extractor,
+      UnownedPtr<CompressionManager> _compression_manager,
       const EnvOptions& _env_options,
       const InternalKeyComparator& _internal_comparator,
       uint8_t _block_protection_bytes_per_key, bool _skip_filters = false,
@@ -43,9 +47,11 @@ struct TableReaderOptions {
       size_t _max_file_size_for_l0_meta_pin = 0,
       const std::string& _cur_db_session_id = "", uint64_t _cur_file_num = 0,
       UniqueId64x2 _unique_id = {}, SequenceNumber _largest_seqno = 0,
-      uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true)
+      uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true,
+      bool _avoid_shared_metadata_cache = false)
       : ioptions(_ioptions),
         prefix_extractor(_prefix_extractor),
+        compression_manager(_compression_manager),
         env_options(_env_options),
         internal_comparator(_internal_comparator),
         skip_filters(_skip_filters),
@@ -60,10 +66,14 @@ struct TableReaderOptions {
         unique_id(_unique_id),
         block_protection_bytes_per_key(_block_protection_bytes_per_key),
         tail_size(_tail_size),
-        user_defined_timestamps_persisted(_user_defined_timestamps_persisted) {}
+        user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
+        avoid_shared_metadata_cache(_avoid_shared_metadata_cache) {}
 
   const ImmutableOptions& ioptions;
   const std::shared_ptr<const SliceTransform>& prefix_extractor;
+  // NOTE: the compression manager is not saved, just potentially a decompressor
+  // from it, so we don't need a shared_ptr copy
+  UnownedPtr<CompressionManager> compression_manager;
   const EnvOptions& env_options;
   const InternalKeyComparator& internal_comparator;
   // This is only used for BlockBasedTable (reader)
@@ -97,9 +107,21 @@ struct TableReaderOptions {
 
   // Whether the key in the table contains user-defined timestamps.
   bool user_defined_timestamps_persisted;
+
+  // Open-time metadata reads should not insert index/filter/dictionary blocks
+  // into the shared block cache.
+  bool avoid_shared_metadata_cache;
+
+  // Blob source for routing same-file ("embedded") blob reads through the blob
+  // value cache + BLOB_DB_* statistics. Owned by the ColumnFamilyData; the
+  // table reader's lifetime is a subset of the CFD's (it is owned via the CFD's
+  // TableCache), so a raw pointer is lifetime-safe. nullptr for non-DB openers
+  // (SstFileReader, sst_dump, repair, external-file ingestion prevalidation,
+  // etc.), in which case embedded reads fall back to a direct (uncached) read.
+  BlobSource* blob_source = nullptr;
 };
 
-struct TableBuilderOptions {
+struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {
   TableBuilderOptions(
       const ImmutableOptions& _ioptions, const MutableCFOptions& _moptions,
       const ReadOptions& _read_options, const WriteOptions& _write_options,
@@ -108,13 +130,19 @@ struct TableBuilderOptions {
       CompressionType _compression_type,
       const CompressionOptions& _compression_opts, uint32_t _column_family_id,
       const std::string& _column_family_name, int _level,
-      bool _is_bottommost = false,
+      const int64_t _newest_key_time, bool _is_bottommost = false,
       TableFileCreationReason _reason = TableFileCreationReason::kMisc,
       const int64_t _oldest_key_time = 0,
       const uint64_t _file_creation_time = 0, const std::string& _db_id = "",
       const std::string& _db_session_id = "",
-      const uint64_t _target_file_size = 0, const uint64_t _cur_file_num = 0)
-      : ioptions(_ioptions),
+      const uint64_t _target_file_size = 0, const uint64_t _cur_file_num = 0,
+      const SequenceNumber _last_level_inclusive_max_seqno_threshold =
+          kMaxSequenceNumber,
+      const EmbeddedBlobSstBuilderOptions* _embedded_blob_options = nullptr)
+      : TablePropertiesCollectorFactory::Context(
+            _column_family_id, _level, _ioptions.num_levels,
+            _last_level_inclusive_max_seqno_threshold),
+        ioptions(_ioptions),
         moptions(_moptions),
         read_options(_read_options),
         write_options(_write_options),
@@ -122,17 +150,17 @@ struct TableBuilderOptions {
         internal_tbl_prop_coll_factories(_internal_tbl_prop_coll_factories),
         compression_type(_compression_type),
         compression_opts(_compression_opts),
-        column_family_id(_column_family_id),
         column_family_name(_column_family_name),
         oldest_key_time(_oldest_key_time),
+        newest_key_time(_newest_key_time),
         target_file_size(_target_file_size),
         file_creation_time(_file_creation_time),
         db_id(_db_id),
         db_session_id(_db_session_id),
-        level_at_creation(_level),
         is_bottommost(_is_bottommost),
         reason(_reason),
-        cur_file_num(_cur_file_num) {}
+        cur_file_num(_cur_file_num),
+        embedded_blob_options(_embedded_blob_options) {}
 
   const ImmutableOptions& ioptions;
   const MutableCFOptions& moptions;
@@ -142,24 +170,23 @@ struct TableBuilderOptions {
   const InternalTblPropCollFactories* internal_tbl_prop_coll_factories;
   const CompressionType compression_type;
   const CompressionOptions& compression_opts;
-  const uint32_t column_family_id;
   const std::string& column_family_name;
   const int64_t oldest_key_time;
+  const int64_t newest_key_time;
   const uint64_t target_file_size;
   const uint64_t file_creation_time;
   const std::string db_id;
   const std::string db_session_id;
   // BEGIN for FilterBuildingContext
-  const int level_at_creation;
   const bool is_bottommost;
   const TableFileCreationReason reason;
   // END for FilterBuildingContext
 
-  // XXX: only used by BlockBasedTableBuilder for SstFileWriter. If you
-  // want to skip filters, that should be (for example) null filter_policy
-  // in the table options of the ioptions.table_factory
-  bool skip_filters = false;
   const uint64_t cur_file_num;
+  // Non-null only for table builders that should write eligible large values as
+  // same-file ("embedded") blob records. Currently only honored by
+  // BlockBasedTableBuilder.
+  const EmbeddedBlobSstBuilderOptions* embedded_blob_options;
 };
 
 // TableBuilder provides the interface used to build a Table
@@ -204,6 +231,9 @@ class TableBuilder {
     return NumEntries() == 0 && GetTableProperties().num_range_deletions == 0;
   }
 
+  // Size of the file before its content is compressed.
+  virtual uint64_t PreCompressionSize() const { return 0; }
+
   // Size of the file generated so far.  If invoked after a successful
   // Finish() call, returns the size of the final generated file.
   virtual uint64_t FileSize() const = 0;
@@ -212,6 +242,11 @@ class TableBuilder {
   // FileSize() cannot estimate final SST size, e.g. parallel compression
   // is enabled.
   virtual uint64_t EstimatedFileSize() const { return FileSize(); }
+
+  // Estimated tail size of the SST file generated so far. The "tail" refers to
+  // all blocks written after data blocks (index + filter). This value helps
+  // estimate the total file size when deciding when to cut files.
+  virtual uint64_t EstimatedTailSize() const { return 0; }
 
   virtual uint64_t GetTailSize() const { return 0; }
 
@@ -232,7 +267,12 @@ class TableBuilder {
   // enforced state (ready to encode to string).
   virtual void SetSeqnoTimeTableProperties(
       const SeqnoToTimeMapping& /*relevant_mapping*/,
-      uint64_t /*oldest_ancestor_time*/){}
+      uint64_t /*oldest_ancestor_time*/) {}
+
+  // If this builder used CPU work from threads other than the caller, return
+  // the CPU microseconds used. 0 = no work outside calling thread, or not
+  // supported.
+  virtual uint64_t GetWorkerCPUMicros() const { return 0; }
 };
 
 }  // namespace ROCKSDB_NAMESPACE

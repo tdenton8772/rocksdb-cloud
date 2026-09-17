@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <memory>
 #include <string>
 
@@ -16,15 +15,36 @@
 #include "rocksdb/types.h"
 #include "rocksdb/wide_columns.h"
 
-#if defined(__GNUC__) || defined(__clang__)
-#define ROCKSDB_DEPRECATED_FUNC __attribute__((__deprecated__))
-#elif _WIN32
-#define ROCKSDB_DEPRECATED_FUNC __declspec(deprecated)
-#endif
-
 namespace ROCKSDB_NAMESPACE {
 
 class Comparator;
+
+// Options for SstFileWriter::OpenWithEmbeddedBlobs().
+//
+// Embedded blobs are large values stored in a leading segment of the same
+// block-based SST file. The table entry stores a same-file BlobIndex reference
+// instead of the value bytes. Readers that understand the embedded blob
+// metadata return the original value to callers.
+//
+// This mode is EXPERIMENTAL. It is intended for block-based table files with
+// format_version >= 7 only. Eligible blob records are written before Finish(),
+// so Put() and PutEntity() can surface write or checksum errors that would
+// normally be deferred until Finish().
+struct SstFileWriterEmbeddedBlobOptions {
+  // Minimum value size, in bytes, to store as an embedded blob.
+  //
+  // Put() values with size >= min_blob_size are embedded. For PutEntity(), each
+  // wide-column value is considered independently. Merge operands, deletions,
+  // and range deletions are not embedded. The default embeds eligible values
+  // of at least 2KB.
+  uint64_t min_blob_size = 2048;
+
+  // PLACEHOLDER: Not yet implemented (ignored).
+  CompressionType compression_type = kDisableCompressionOption;
+
+  // PLACEHOLDER: Not yet implemented (ignored).
+  CompressionOptions compression_options;
+};
 
 // ExternalSstFileInfo include information about sst files created
 // using SstFileWriter.
@@ -41,7 +61,8 @@ struct ExternalSstFileInfo {
         file_size(0),
         num_entries(0),
         num_range_del_entries(0),
-        version(0) {}
+        version(0),
+        prepared_file_info(nullptr) {}
 
   ExternalSstFileInfo(const std::string& _file_path,
                       const std::string& _smallest_key,
@@ -59,7 +80,8 @@ struct ExternalSstFileInfo {
         file_size(_file_size),
         num_entries(_num_entries),
         num_range_del_entries(0),
-        version(_version) {}
+        version(_version),
+        prepared_file_info(nullptr) {}
 
   std::string file_path;     // external sst file path
   std::string smallest_key;  // smallest user key in file
@@ -74,6 +96,9 @@ struct ExternalSstFileInfo {
   uint64_t num_entries;                 // number of entries in file
   uint64_t num_range_del_entries;  // number of range deletion entries in file
   int32_t version;                 // file version
+  // Opaque metadata that can be passed to IngestExternalFileArg::file_infos to
+  // skip re-opening and scanning the file during ingestion.
+  std::shared_ptr<const PreparedFileInfo> prepared_file_info;
 };
 
 // SstFileWriter is used to create sst files that can be added to database later
@@ -89,31 +114,19 @@ class SstFileWriter {
   // hint that this file pages is not needed every time we write 1MB to the
   // file. To use the rate limiter an io_priority smaller than IO_TOTAL can be
   // passed.
-  // If unsafe_add is true, SstFileWriter doesn't check that keys are written in
-  // ascending order.
-  // If unsafe_disable_sync is false, SstFileWriter will not sync new sst file
-  // on close.
-  // The `skip_filters` option is DEPRECATED and could be removed in the
-  // future. Use `BlockBasedTableOptions::filter_policy` to control filter
-  // generation.
   SstFileWriter(const EnvOptions& env_options, const Options& options,
                 ColumnFamilyHandle* column_family = nullptr,
                 bool invalidate_page_cache = true,
-                Env::IOPriority io_priority = Env::IOPriority::IO_TOTAL,
-                bool skip_filters = false, bool unsafe_add = false,
-                bool unsafe_disable_sync = false)
+                Env::IOPriority io_priority = Env::IOPriority::IO_TOTAL)
       : SstFileWriter(env_options, options, options.comparator, column_family,
-                      invalidate_page_cache, io_priority, skip_filters,
-                      unsafe_add, unsafe_disable_sync) {}
+                      invalidate_page_cache, io_priority) {}
 
   // Deprecated API
   SstFileWriter(const EnvOptions& env_options, const Options& options,
                 const Comparator* user_comparator,
                 ColumnFamilyHandle* column_family = nullptr,
                 bool invalidate_page_cache = true,
-                Env::IOPriority io_priority = Env::IOPriority::IO_TOTAL,
-                bool skip_filters = false, bool unsafe_add = false,
-                bool unsafe_disable_sync = false);
+                Env::IOPriority io_priority = Env::IOPriority::IO_TOTAL);
 
   ~SstFileWriter();
 
@@ -121,11 +134,19 @@ class SstFileWriter {
   Status Open(const std::string& file_path,
               Temperature temp = Temperature::kUnknown);
 
-  // Add a Put key with value to currently opened file (deprecated)
-  // REQUIRES: user_key is after any previously added point (Put/Merge/Delete)
-  //           key according to the comparator.
-  // REQUIRES: comparator is *not* timestamp-aware.
-  ROCKSDB_DEPRECATED_FUNC Status Add(const Slice& user_key, const Slice& value);
+  // EXPERIMENTAL: opens an SST writer mode that stores eligible blob payloads
+  // inside the same block-based SST file and stores same-file BlobIndex
+  // references in table entries. This is a special-purpose mode that doesn't
+  // offer write-amp improvements under compaction like standard blob support
+  // does. Blob records are written inline (interleaved with data blocks) as
+  // eligible values are added.
+  //
+  // Requires the writer to use block-based table format_version >= 7. The
+  // resulting SST can be consumed by RocksDB >= 11.6.0.
+  Status OpenWithEmbeddedBlobs(
+      const std::string& file_path,
+      const SstFileWriterEmbeddedBlobOptions& embedded_blob_options,
+      Temperature temp = Temperature::kUnknown);
 
   // Add a Put key with value to currently opened file
   // REQUIRES: user_key is after any previously added point (Put/Merge/Delete)
@@ -142,7 +163,9 @@ class SstFileWriter {
   Status Put(const Slice& user_key, const Slice& timestamp, const Slice& value);
 
   // Add a PutEntity (key with the wide-column entity defined by "columns") to
-  // the currently opened file
+  // the currently opened file. `columns` is a non-owning view, so the backing
+  // storage for each column name and value must remain valid until this method
+  // returns.
   Status PutEntity(const Slice& user_key, const WideColumns& columns);
 
   // Add a Merge key with value to currently opened file
@@ -201,6 +224,9 @@ class SstFileWriter {
 
   // Return the current file size.
   uint64_t FileSize();
+
+  // Check if a file with input table property is created by SstFileWriter.
+  static bool CreatedBySstFileWriter(const TableProperties&);
 
  private:
   void InvalidatePageCache(bool closing);

@@ -8,22 +8,105 @@
 
 #if defined(WITHOUT_COROUTINES) || \
     (defined(USE_COROUTINES) && defined(WITH_COROUTINES))
+
 namespace ROCKSDB_NAMESPACE {
 
-#if defined(WITHOUT_COROUTINES)
-#endif
+DEFINE_SYNC_AND_ASYNC(Status, TableCache::Get)
+(const ReadOptions& options, const InternalKeyComparator& internal_comparator,
+ const FileMetaData& file_meta, const Slice& k, GetContext* get_context,
+ const MutableCFOptions& mutable_cf_options, HistogramImpl* file_read_hist,
+ bool skip_filters, int level, size_t max_file_size_for_l0_meta_pin) {
+  auto& fd = file_meta.fd;
+  std::string* row_cache_entry = nullptr;
+  bool done = false;
+  IterKey row_cache_key;
+  std::string row_cache_entry_buffer;
+
+  // Check row cache if enabled.
+  // Reuse row_cache_key sequence number when row cache hits.
+  Status s;
+  if (ioptions_.row_cache && !get_context->NeedToReadSequence()) {
+    auto user_key = ExtractUserKey(k);
+    uint64_t cache_entry_seq_no =
+        CreateRowCacheKeyPrefix(options, fd, k, get_context, row_cache_key);
+    done = GetFromRowCache(user_key, row_cache_key, row_cache_key.Size(),
+                           get_context, &s, cache_entry_seq_no);
+    if (!done) {
+      row_cache_entry = &row_cache_entry_buffer;
+    }
+  }
+  TEST_SYNC_POINT_CALLBACK("TableCache::Get::BeforeFindTable",
+                           const_cast<FileDescriptor*>(&fd));
+  TableReader* t = nullptr;
+  TypedHandle* handle = nullptr;
+  if (s.ok() && !done) {
+    s = FindTable(options, file_options_, internal_comparator, file_meta,
+                  &handle, mutable_cf_options, &t,
+                  options.read_tier == kBlockCacheTier /* no_io */,
+                  file_read_hist, skip_filters, level,
+                  true /* prefetch_index_and_filter_in_cache */,
+                  max_file_size_for_l0_meta_pin, file_meta.temperature,
+                  should_pin_table_handles_);
+    SequenceNumber* max_covering_tombstone_seq =
+        get_context->max_covering_tombstone_seq();
+    if (s.ok() && max_covering_tombstone_seq != nullptr &&
+        !options.ignore_range_deletions) {
+      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+          t->NewRangeTombstoneIterator(options));
+      if (range_del_iter != nullptr) {
+        SequenceNumber seq =
+            range_del_iter->MaxCoveringTombstoneSeqnum(ExtractUserKey(k));
+        if (seq > *max_covering_tombstone_seq) {
+          *max_covering_tombstone_seq = seq;
+          if (get_context->NeedTimestamp()) {
+            get_context->SetTimestampFromRangeTombstone(
+                range_del_iter->timestamp());
+          }
+        }
+      }
+    }
+    if (s.ok()) {
+      get_context->SetReplayLog(row_cache_entry);  // nullptr if no cache.
+      s = CO_AWAIT(t->Get, options, k, get_context,
+                   mutable_cf_options.prefix_extractor.get(), skip_filters);
+      get_context->SetReplayLog(nullptr);
+    } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
+      // Couldn't find table in cache and couldn't open it because of no_io.
+      get_context->MarkKeyMayExist();
+      done = true;
+    }
+  }
+
+  // Put the replay log in row cache only if something was found.
+  if (!done && s.ok() && row_cache_entry && !row_cache_entry->empty()) {
+    RowCacheInterface row_cache{ioptions_.row_cache.get()};
+    size_t charge = row_cache_entry->capacity() + sizeof(std::string);
+    auto row_ptr = new std::string(std::move(*row_cache_entry));
+    Status rcs = row_cache.Insert(row_cache_key.GetUserKey(), row_ptr, charge);
+    if (!rcs.ok()) {
+      // If row cache is full, it's OK to continue, but we keep ownership of
+      // row_ptr.
+      delete row_ptr;
+    }
+  }
+
+  if (handle != nullptr) {
+    cache_.Release(handle);
+  }
+  CO_RETURN s;
+}
 
 // Batched version of TableCache::MultiGet.
 DEFINE_SYNC_AND_ASYNC(Status, TableCache::MultiGet)
 (const ReadOptions& options, const InternalKeyComparator& internal_comparator,
  const FileMetaData& file_meta, const MultiGetContext::Range* mget_range,
- uint8_t block_protection_bytes_per_key,
- const std::shared_ptr<const SliceTransform>& prefix_extractor,
- HistogramImpl* file_read_hist, bool skip_filters, bool skip_range_deletions,
- int level, TypedHandle* handle) {
+ const MutableCFOptions& mutable_cf_options, HistogramImpl* file_read_hist,
+ bool skip_filters, bool skip_range_deletions, int level, TypedHandle* handle) {
   auto& fd = file_meta.fd;
   Status s;
-  TableReader* t = fd.table_reader;
+  TEST_SYNC_POINT_CALLBACK("TableCache::MultiGet::BeforeFindTable",
+                           const_cast<FileDescriptor*>(&fd));
+  TableReader* t = fd.pinned_reader.Get();
   MultiGetRange table_range(*mget_range, mget_range->begin(),
                             mget_range->end());
   if (handle != nullptr && t == nullptr) {
@@ -72,23 +155,21 @@ DEFINE_SYNC_AND_ASYNC(Status, TableCache::MultiGet)
     if (t == nullptr) {
       assert(handle == nullptr);
       s = FindTable(options, file_options_, internal_comparator, file_meta,
-                    &handle, block_protection_bytes_per_key, prefix_extractor,
+                    &handle, mutable_cf_options, &t,
                     options.read_tier == kBlockCacheTier /* no_io */,
                     file_read_hist, skip_filters, level,
                     true /* prefetch_index_and_filter_in_cache */,
-                    0 /*max_file_size_for_l0_meta_pin*/, file_meta.temperature);
+                    0 /*max_file_size_for_l0_meta_pin*/, file_meta.temperature,
+                    should_pin_table_handles_);
       TEST_SYNC_POINT_CALLBACK("TableCache::MultiGet:FindTable", &s);
-      if (s.ok()) {
-        t = cache_.Value(handle);
-        assert(t);
-      }
+      assert(!s.ok() || t);
     }
     if (s.ok() && !options.ignore_range_deletions && !skip_range_deletions) {
       UpdateRangeTombstoneSeqnums(options, t, table_range);
     }
     if (s.ok()) {
-      CO_AWAIT(t->MultiGet)
-      (options, &table_range, prefix_extractor.get(), skip_filters);
+      CO_AWAIT(t->MultiGet, options, &table_range,
+               mutable_cf_options.prefix_extractor.get(), skip_filters);
     } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
       for (auto iter = table_range.begin(); iter != table_range.end(); ++iter) {
         Status* status = iter->s;

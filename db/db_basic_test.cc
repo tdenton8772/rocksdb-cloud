@@ -10,6 +10,9 @@
 #include <cstring>
 
 #include "db/db_test_util.h"
+#include "db/log_writer.h"
+#include "db/version_edit.h"
+#include "file/writable_file_writer.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/filter_policy.h"
@@ -78,6 +81,7 @@ class MyFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
  private:
   const int num_keys_in_block_;
 };
+
 }  // namespace
 
 static bool enable_io_uring = true;
@@ -88,20 +92,1019 @@ class DBBasicTest : public DBTestBase {
   DBBasicTest() : DBTestBase("db_basic_test", /*env_do_fsync=*/false) {}
 };
 
+class DBBasicGetWithParam : public DBBasicTest,
+                            public testing::WithParamInterface<bool> {
+ public:
+  DBBasicGetWithParam() : DBBasicTest(), use_coroutine_(GetParam()) {}
+
+ protected:
+  const bool use_coroutine_;
+};
+
 TEST_F(DBBasicTest, OpenWhenOpen) {
   Options options = CurrentOptions();
   options.env = env_;
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   Status s = DB::Open(options, dbname_, &db2);
-  ASSERT_NOK(s) << [db2]() {
-    delete db2;
+  ASSERT_NOK(s) << [&db2]() {
+    db2.reset();
     return "db2 open: ok";
   }();
   ASSERT_EQ(Status::Code::kIOError, s.code());
   ASSERT_EQ(Status::SubCode::kNone, s.subcode());
   ASSERT_TRUE(strstr(s.getState(), "lock ") != nullptr);
+}
 
-  delete db2;
+namespace {
+// Helper that captures per-branch SkippedNoopEdit counts for tests.
+struct RecoveryOptimizationCounters {
+  std::atomic<int> setup_dbid{0};
+  std::atomic<int> per_cf{0};
+  std::atomic<int> wal_deletion{0};
+  std::atomic<int> next_file_number{0};
+
+  void Install() {
+    auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+    sp->SetCallBack("DBImpl::Recovery:SkippedNoopEdit:SetupDBId",
+                    [this](void*) { setup_dbid.fetch_add(1); });
+    sp->SetCallBack("DBImpl::Recovery:SkippedNoopEdit:PerCF",
+                    [this](void*) { per_cf.fetch_add(1); });
+    sp->SetCallBack("DBImpl::Recovery:SkippedNoopEdit:WalDeletion",
+                    [this](void*) { wal_deletion.fetch_add(1); });
+    sp->SetCallBack("DBImpl::Recovery:SkippedNoopEdit:NextFileNumber",
+                    [this](void*) { next_file_number.fetch_add(1); });
+    sp->EnableProcessing();
+  }
+  void Uninstall() {
+    auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+    sp->DisableProcessing();
+    sp->ClearAllCallBacks();
+  }
+};
+}  // namespace
+
+// optimize_manifest_for_recovery=true: a clean reopen of a flushed DB must
+// append fewer individual records to the MANIFEST than the default-off path.
+// Verified by counting AddRecord calls (one per VersionEdit written to the
+// MANIFEST log).
+TEST_F(DBBasicTest,
+       OptimizeManifestForRecoveryReducesManifestWritesOnCleanReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+
+  // Measure MANIFEST records with optimize_manifest_for_recovery OFF (default).
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k1", "v1"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::atomic<int> records_off{0};
+  std::atomic<int> next_file_skips_off{0};
+  sp->SetCallBack("VersionSet::ProcessManifestWrites:AddRecord",
+                  [&](void*) { records_off.fetch_add(1); });
+  sp->SetCallBack("DBImpl::Recovery:SkippedNoopEdit:NextFileNumber",
+                  [&](void*) { next_file_skips_off.fetch_add(1); });
+  sp->EnableProcessing();
+  Reopen(options);
+  sp->DisableProcessing();
+  sp->ClearAllCallBacks();
+  ASSERT_EQ("v1", Get("k1"));
+  int off_count = records_off.load();
+  ASSERT_GT(off_count, 0);
+  ASSERT_EQ(0, next_file_skips_off.load());
+  Close();
+
+  // Measure MANIFEST records with optimize_manifest_for_recovery ON.
+  options.optimize_manifest_for_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::atomic<int> records_on{0};
+  std::atomic<int> next_file_skips_on{0};
+  sp->SetCallBack("VersionSet::ProcessManifestWrites:AddRecord",
+                  [&](void*) { records_on.fetch_add(1); });
+  sp->SetCallBack("DBImpl::Recovery:SkippedNoopEdit:NextFileNumber",
+                  [&](void*) { next_file_skips_on.fetch_add(1); });
+  sp->EnableProcessing();
+  Reopen(options);
+  sp->DisableProcessing();
+  sp->ClearAllCallBacks();
+  ASSERT_EQ("v2", Get("k2"));
+  int on_count = records_on.load();
+  ASSERT_GT(next_file_skips_on.load(), 0);
+  ASSERT_LT(on_count, off_count);
+}
+
+// When the per-CF log_number actually advances, the per-CF skip must NOT
+// fire -- the edit carries real information and must be emitted.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryEmitsPerCFWhenLogAdvances) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  // Write data and close WITHOUT flushing -- the WAL has un-replayed
+  // records, so on reopen recovery flushes the memtable and the per-CF
+  // edit's log_number must advance past the prior WAL.
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  counters.Install();
+  Reopen(options);
+  counters.Uninstall();
+
+  ASSERT_EQ(0, counters.per_cf.load());
+  ASSERT_EQ("v", Get("k"));
+}
+
+// With track_and_verify_wals_in_manifest=true and a clean close, the
+// close-time code already advances WalSet markers. Recovery's
+// DeleteWalsBefore is redundant and should be skipped.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryPreservesWalTracking) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  options.track_and_verify_wals_in_manifest = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  counters.Install();
+  Reopen(options);
+  counters.Uninstall();
+
+  ASSERT_EQ(1, counters.wal_deletion.load());
+}
+
+// best_efforts_recovery requires a fresh MANIFEST + CURRENT to be
+// produced on every open (the salvage contract). Even with the option
+// on, none of the SkippedNoopEdit branches must fire under
+// best_efforts_recovery -- otherwise CURRENT can be left missing or
+// stale (regression caught by DBBasicTest.RecoverWithNoCurrentFile and
+// DBTest2.BestEffortsRecoveryWithSstUniqueIdVerification under an
+// option-on default).
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryDisabledByBestEffortsRecovery) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  options.best_efforts_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  counters.Install();
+  Reopen(options);
+  counters.Uninstall();
+
+  ASSERT_EQ(0, counters.setup_dbid.load());
+  ASSERT_EQ(0, counters.per_cf.load());
+  ASSERT_EQ(0, counters.wal_deletion.load());
+  ASSERT_EQ(0, counters.next_file_number.load());
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Multi-column-family coverage: with one CF flushed and another not,
+// the un-flushed CF's edit must still be emitted.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryMultiCF) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  CreateAndReopenWithCF({"pikachu", "raichu"}, options);
+  ASSERT_OK(Put(0, "k", "v0"));
+  ASSERT_OK(Put(1, "k", "v1"));
+  ASSERT_OK(Put(2, "k", "v2"));
+  ASSERT_OK(Flush(0));
+  // CF 1 and 2 keep dirty memtables -- recovery must emit their per-CF
+  // edits (log_number advance from WAL replay).
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  counters.Install();
+  ReopenWithColumnFamilies({"default", "pikachu", "raichu"}, options);
+  counters.Uninstall();
+
+  ASSERT_EQ("v0", Get(0, "k"));
+  ASSERT_EQ("v1", Get(1, "k"));
+  ASSERT_EQ("v2", Get(2, "k"));
+}
+
+// MaybeUpdateNextFileNumber's seed value (next_file_number_) makes the
+// post-loop comparison trivially true on every clean recovery, causing a
+// no-op SetNextFile edit to be appended to the MANIFEST. With
+// optimize_manifest_for_recovery=true, that emission is gated and
+// the SkippedNoopEdit:NextFileNumber sync point fires in its place.
+TEST_F(DBBasicTest, OptimizeManifestForRecoverySkipsNextFileNumber) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  counters.Install();
+  Reopen(options);
+  counters.Uninstall();
+
+  ASSERT_EQ(1, counters.next_file_number.load());
+}
+
+// With option=true and a synthetic on-disk file whose number is at or
+// above next_file_number_, MaybeUpdateNextFileNumber MUST emit the
+// SetNextFile edit and advance the counter past the synthetic number.
+TEST_F(DBBasicTest,
+       OptimizeManifestForRecoveryEmitsNextFileNumberWhenJustified) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+
+  const uint64_t next_before_close =
+      dbfull()->GetVersionSet()->current_next_file_number();
+  Close();
+
+  // Drop an empty .sst with a number well above next_file_number into
+  // the DB dir. MaybeUpdateNextFileNumber must observe it and advance.
+  const uint64_t synthetic_number = next_before_close + 100;
+  const std::string synthetic_sst =
+      dbname_ + "/" + MakeTableFileName("", synthetic_number);
+  ASSERT_OK(WriteStringToFile(env_, "" /*data*/, synthetic_sst,
+                              /*should_sync=*/true));
+
+  RecoveryOptimizationCounters counters;
+  counters.Install();
+  Reopen(options);
+  counters.Uninstall();
+
+  ASSERT_EQ(0, counters.next_file_number.load());
+  ASSERT_GT(dbfull()->GetVersionSet()->current_next_file_number(),
+            synthetic_number);
+}
+
+// optimize_manifest_for_recovery=true: after a clean Put + Flush + Close, the
+// next Open's min_log_number_to_keep equals (max_wal_before_close + 1),
+// proving the close-time MANIFEST write took effect.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryAdvancesWalMarkersOnClose) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+
+  uint64_t max_wal_before_close = 0;
+  auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+  sp->SetCallBack("DBImpl::CloseHelper:CapturedMaxWal", [&](void* arg) {
+    max_wal_before_close = *static_cast<uint64_t*>(arg);
+  });
+  sp->EnableProcessing();
+  Close();
+  sp->DisableProcessing();
+  sp->ClearAllCallBacks();
+  ASSERT_GT(max_wal_before_close, 0u);
+
+  Reopen(options);
+  ASSERT_EQ(max_wal_before_close + 1,
+            dbfull()->GetVersionSet()->min_log_number_to_keep());
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Shared-option matrix: default-off and disable-before-close should both fall
+// back to recovery-time MANIFEST work, while enable-through-close should avoid
+// MANIFEST appends on a clean reopen.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryCleanReopenMatrix) {
+  struct TestCase {
+    const char* name;
+    bool enable_on_open;
+    bool disable_before_close;
+    bool expect_close_write;
+  };
+  const TestCase test_cases[] = {
+      {"default_off", false, false, false},
+      {"enabled", true, false, true},
+      {"disabled_before_close", true, true, false},
+  };
+
+  auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+  for (const auto& test_case : test_cases) {
+    SCOPED_TRACE(test_case.name);
+    Options options = CurrentOptions();
+    options.create_if_missing = true;
+    options.optimize_manifest_for_recovery = test_case.enable_on_open;
+    DestroyAndReopen(options);
+    ASSERT_OK(Put("k", test_case.name));
+    ASSERT_OK(Flush());
+
+    if (test_case.disable_before_close) {
+      ASSERT_OK(dbfull()->SetDBOptions(
+          {{"optimize_manifest_for_recovery", "false"}}));
+    }
+
+    std::atomic<int> entered{0};
+    sp->SetCallBack("DBImpl::CloseHelper:WriteWalMarkersOnCloseEntered",
+                    [&](void*) { entered.fetch_add(1); });
+    sp->EnableProcessing();
+    Close();
+    sp->DisableProcessing();
+    sp->ClearAllCallBacks();
+
+    std::atomic<int> records{0};
+    RecoveryOptimizationCounters counters;
+    counters.Install();
+    sp->SetCallBack("VersionSet::ProcessManifestWrites:AddRecord",
+                    [&](void*) { records.fetch_add(1); });
+    Reopen(options);
+    counters.Uninstall();
+
+    if (test_case.expect_close_write) {
+      ASSERT_EQ(1, entered.load());
+      ASSERT_EQ(0, records.load());
+      ASSERT_GT(counters.per_cf.load(), 0);
+    } else {
+      ASSERT_EQ(0, entered.load());
+      ASSERT_GT(records.load(), 0);
+    }
+    ASSERT_EQ(test_case.name, Get("k"));
+    Close();
+  }
+}
+
+// allow_2pc=true: even with the option on, the close-time write must NOT
+// advance MinLogNumberToKeep / DeleteWalsBefore (2pc requires the WAL to
+// remain replayable for uncommitted prepared transactions).
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryRespectsTwoPC) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  options.allow_2pc = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+
+  const uint64_t min_log_before_close =
+      dbfull()->GetVersionSet()->min_log_number_to_keep();
+  Close();
+  Reopen(options);
+  ASSERT_EQ(min_log_before_close,
+            dbfull()->GetVersionSet()->min_log_number_to_keep());
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Mixed-CF emptiness: on reopen, recovery should still have MANIFEST work to
+// do for the dirty CF while skipping per-CF recovery edits for the empty CFs
+// whose markers were persisted at close.
+TEST_F(DBBasicTest, OptimizeManifestForRecoverySkipsNonEmptyCF) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  CreateAndReopenWithCF({"empty_cf", "dirty_cf"}, options);
+  ASSERT_OK(Put(1, "k", "v1"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Put(2, "k", "v2"));
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  std::atomic<int> records{0};
+  auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+  counters.Install();
+  sp->SetCallBack("VersionSet::ProcessManifestWrites:AddRecord",
+                  [&](void*) { records.fetch_add(1); });
+  ReopenWithColumnFamilies({"default", "empty_cf", "dirty_cf"}, options);
+  counters.Uninstall();
+
+  ASSERT_GT(counters.per_cf.load(), 0);
+  ASSERT_GT(records.load(), 0);
+  ASSERT_EQ("v1", Get(1, "k"));
+  ASSERT_EQ("v2", Get(2, "k"));
+}
+
+// track_and_verify_wals_in_manifest=true: the close-time write must leave
+// recovery with only the mandatory WAL-tracking MANIFEST work. The per-CF
+// recovery edits should still skip.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryEmitsWalDeletionWhenTracking) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  options.track_and_verify_wals_in_manifest = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  RecoveryOptimizationCounters counters;
+  std::atomic<int> records{0};
+  auto* sp = ROCKSDB_NAMESPACE::SyncPoint::GetInstance();
+  counters.Install();
+  sp->SetCallBack("VersionSet::ProcessManifestWrites:AddRecord",
+                  [&](void*) { records.fetch_add(1); });
+  Reopen(options);
+  counters.Uninstall();
+
+  ASSERT_GT(counters.per_cf.load(), 0);
+  ASSERT_EQ(0, records.load());
+  ASSERT_GT(dbfull()->GetVersionSet()->GetWalSet().GetMinWalNumberToKeep(), 0u);
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Zero MANIFEST growth on clean reopen with optimize_manifest_for_recovery=1,
+// reuse_manifest_on_open=1, and track_and_verify_wals_in_manifest=1.
+// Regression test for the stress test failure where a redundant
+// DeleteWalsBefore edit was written during recovery.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryZeroGrowthOnCleanReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  options.reuse_manifest_on_open = true;
+  options.track_and_verify_wals_in_manifest = true;
+  options.avoid_flush_during_recovery = true;
+  options.write_dbid_to_manifest = false;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  // Get MANIFEST size after close
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  uint64_t manifest_size_before = 0;
+  for (const auto& f : files) {
+    if (f.find("MANIFEST-") == 0) {
+      ASSERT_OK(env_->GetFileSize(dbname_ + "/" + f, &manifest_size_before));
+      break;
+    }
+  }
+  ASSERT_GT(manifest_size_before, 0u);
+
+  // Reopen - should not grow MANIFEST at all
+  Reopen(options);
+
+  // Get MANIFEST size after reopen
+  files.clear();
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  uint64_t manifest_size_after = 0;
+  for (const auto& f : files) {
+    if (f.find("MANIFEST-") == 0) {
+      ASSERT_OK(env_->GetFileSize(dbname_ + "/" + f, &manifest_size_after));
+      break;
+    }
+  }
+
+  ASSERT_EQ(manifest_size_before, manifest_size_after)
+      << "MANIFEST grew by " << (manifest_size_after - manifest_size_before)
+      << " bytes on clean reopen; expected zero growth";
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Regression for the close-time marker path: if a new WAL is created while an
+// otherwise-empty user CF stays empty, Close() must reserve the next file
+// number before persisting SetLogNumber(cur_wal + 1) for that CF.
+TEST_F(DBBasicTest, OptimizeManifestForRecoveryImmediateCloseAfterWarmReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  CreateAndReopenWithCF({"empty_cf"}, options);
+
+  ASSERT_OK(Put(0, "k", "v"));
+  const uint64_t wal_before_switch = dbfull()->TEST_LogfileNumber();
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_GT(dbfull()->TEST_LogfileNumber(), wal_before_switch);
+
+  const uint64_t expected_new_log_num = dbfull()->TEST_LogfileNumber() + 1;
+  ASSERT_EQ(expected_new_log_num,
+            dbfull()->GetVersionSet()->current_next_file_number());
+
+  Close();
+  ReopenWithColumnFamilies({"default", "empty_cf"}, options);
+
+  ASSERT_GT(dbfull()->GetVersionSet()->current_next_file_number(),
+            expected_new_log_num);
+  ASSERT_EQ("v", Get(0, "k"));
+}
+
+// Dropped-CF safety: dropped column families must NOT have markers written for
+// them at close time (the !IsDropped() guard protects against attaching the
+// global edit to a dropped CF, which would later trip MANIFEST replay
+// assertions).
+TEST_F(DBBasicTest, OptimizeManifestForRecoverySkipsDroppedCF) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  CreateAndReopenWithCF({"to_drop", "keeper"}, options);
+  ASSERT_OK(Put(1, "k", "v1"));
+  ASSERT_OK(Put(2, "k", "v2"));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Flush(2));
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  Close();
+
+  ReopenWithColumnFamilies({"default", "keeper"}, options);
+  ASSERT_EQ("v2", Get(1, "k"));
+}
+
+// reuse_manifest_on_open=true: the next LogAndApply after Recover must
+// append to the existing MANIFEST file instead of allocating a fresh
+// one. Force a write after reopen and verify the MANIFEST file number
+// stays unchanged.
+TEST_F(DBBasicTest, ReuseManifestOnOpenAppendsToExistingFile) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  Reopen(options);
+  const uint64_t manifest_after_reopen =
+      dbfull()->TEST_Current_Manifest_FileNo();
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+  const uint64_t manifest_after_flush =
+      dbfull()->TEST_Current_Manifest_FileNo();
+
+  EXPECT_EQ(manifest_after_reopen, manifest_after_flush);
+  EXPECT_EQ("v", Get("k"));
+  EXPECT_EQ("v2", Get("k2"));
+}
+
+// Default off: ReopenManifestForAppend must NOT be invoked.
+TEST_F(DBBasicTest, ReuseManifestOnOpenDefaultOffSkipsReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  // reuse_manifest_on_open defaults to false
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::atomic<int> reopened{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ReopenManifestForAppend:Reopened",
+      [&](void* /*arg*/) { reopened.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Reopen(options);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(0, reopened.load());
+}
+
+// Regression for the WritableFileWriter::filesize_=0 bug fixed via
+// constructor-time initial_file_size: after ReopenManifestForAppend binds a
+// writer to the existing MANIFEST, GetFileSize() must return the on-disk
+// size, not 0.
+// (If it returned 0, the size-limit check in ProcessManifestWrites would
+// compare against 0 and Close-time Truncate could shrink the file.)
+TEST_F(DBBasicTest, ReuseManifestOnOpenAdoptsOnDiskSize) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  // Capture the on-disk MANIFEST size before reopen.
+  Reopen(options);
+  const uint64_t manifest_no = dbfull()->TEST_Current_Manifest_FileNo();
+  const std::string manifest_path = DescriptorFileName(dbname_, manifest_no);
+  uint64_t on_disk_size = 0;
+  ASSERT_OK(env_->GetFileSize(manifest_path, &on_disk_size));
+  ASSERT_GT(on_disk_size, 0u);
+
+  // Force a write to flush the writer's buffer; verify Close doesn't
+  // shrink the file (which would happen if Truncate(filesize_=0) ran).
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+  Close();
+
+  uint64_t after_close_size = 0;
+  ASSERT_OK(env_->GetFileSize(manifest_path, &after_close_size));
+  EXPECT_GE(after_close_size, on_disk_size);
+}
+
+// MANIFEST rotation continues to work under reuse: when the file grows
+// past tuned_max_manifest_file_size_, ProcessManifestWrites must rotate
+// to a fresh MANIFEST (same as legacy). Use the rotation SyncPoint to
+// observe rotation directly, since tuned_max_manifest_file_size_ is
+// auto-derived and not directly = max_manifest_file_size.
+TEST_F(DBBasicTest, ReuseManifestOnOpenStillRotatesOnSizeCap) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;  // disable amp-based tuning
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::atomic<int> rotations{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:BeforeNewManifest",
+      [&](void* /*arg*/) { rotations.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Reopen(options);
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // The Flush after Reopen must have triggered a rotation given the
+  // tiny size cap -- proves the size-driven rotation path still runs
+  // when descriptor_log_ is bound by reuse.
+  EXPECT_GT(rotations.load(), 0);
+  EXPECT_EQ("v", Get("k"));
+  EXPECT_EQ("v2", Get("k2"));
+}
+
+// Multi-CF reuse: append-mode MANIFEST must correctly handle edits
+// from multiple CFs after reopen.
+TEST_F(DBBasicTest, ReuseManifestOnOpenMultiCF) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  CreateAndReopenWithCF({"alpha", "beta"}, options);
+  ASSERT_OK(Put(0, "k", "v0"));
+  ASSERT_OK(Put(1, "k", "v1"));
+  ASSERT_OK(Put(2, "k", "v2"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Flush(2));
+  Close();
+
+  ReopenWithColumnFamilies({"default", "alpha", "beta"}, options);
+  // Trigger more writes post-reopen on each CF -- these get appended to
+  // the reused MANIFEST.
+  ASSERT_OK(Put(0, "k2", "v0b"));
+  ASSERT_OK(Put(1, "k2", "v1b"));
+  ASSERT_OK(Put(2, "k2", "v2b"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Flush(2));
+
+  EXPECT_EQ("v0", Get(0, "k"));
+  EXPECT_EQ("v1", Get(1, "k"));
+  EXPECT_EQ("v2", Get(2, "k"));
+  EXPECT_EQ("v0b", Get(0, "k2"));
+  EXPECT_EQ("v1b", Get(1, "k2"));
+  EXPECT_EQ("v2b", Get(2, "k2"));
+}
+
+// Disabled under best_efforts_recovery: that mode rebuilds CURRENT and
+// MANIFEST as the side-effect of LogAndApplyForRecovery emitting an
+// edit; reusing the prior MANIFEST contradicts the salvage contract.
+TEST_F(DBBasicTest, ReuseManifestOnOpenDisabledByBestEffortsRecovery) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  options.best_efforts_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  std::atomic<int> reopened{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ReopenManifestForAppend:Reopened",
+      [&](void* /*arg*/) { reopened.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Reopen(options);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(0, reopened.load());
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Full-stack composition: optimize_manifest_for_recovery plus
+// reuse_manifest_on_open. Verifies that Close writes recovery markers,
+// Reopen skips clean-recovery MANIFEST edits, and the MANIFEST is reused
+// instead of recreated for the next metadata update.
+TEST_F(DBBasicTest, ReuseManifestOnOpenFullStackComposition) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.optimize_manifest_for_recovery = true;
+  options.reuse_manifest_on_open = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  // Capture the MANIFEST file number before reopen.
+  std::atomic<int> reopened{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ReopenManifestForAppend:Reopened",
+      [&](void* /*arg*/) { reopened.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Reopen(options);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // All three composing: reuse fired, data is intact, no fresh MANIFEST.
+  EXPECT_EQ(1, reopened.load());
+  EXPECT_EQ("v", Get("k"));
+}
+
+// Regression test for WAL recovery while publishing a fresh MANIFEST. The test
+// stores SSTs in a separate DB path, injects failure after CURRENT points at
+// the new MANIFEST, and simulates crash cleanup; the recovered SST must survive
+// because the synced MANIFEST references it.
+TEST_F(DBBasicTest, RecoverySstDirSyncedBeforeFreshManifestPublish) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.env = fault_env.get();
+  options.reuse_manifest_on_open = false;
+  options.db_paths.emplace_back(dbname_ + "_2", 1ULL << 30);
+
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("base", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("recovered", "value"));
+  ASSERT_OK(db_->FlushWAL(true));
+  Close();
+
+  fault_fs->ResetState();
+
+  std::atomic<bool> fail_after_current_publish{true};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSetCurrentFile", [&](void* arg) {
+        if (fail_after_current_publish.exchange(false)) {
+          ASSERT_NE(nullptr, arg);
+          IOStatus* io_s = static_cast<IOStatus*>(arg);
+          ASSERT_OK(*io_s);
+          *io_s = IOStatus::IOError("injected current publish aftermath");
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(fault_fs->DeleteFilesCreatedAfterLastDirSync(IOOptions(), nullptr));
+
+  s = TryReopen(options);
+  ASSERT_OK(s);
+  ASSERT_EQ("value", Get("base"));
+  ASSERT_EQ("value", Get("recovered"));
+  Close();
+}
+
+// Regression test for WAL recovery while appending to a reused MANIFEST. The
+// first reopen forces recovery to create an SST and then fail after MANIFEST
+// sync. The simulated crash cleanup deletes files without a prior directory
+// sync; the recovered SST must survive because the synced MANIFEST references
+// it.
+TEST_F(DBBasicTest,
+       ReuseManifestOnOpenSyncsRecoverySstDirBeforeManifestAppend) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.env = fault_env.get();
+  options.reuse_manifest_on_open = true;
+
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("base", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("recovered", "value"));
+  ASSERT_OK(db_->FlushWAL(true));
+  Close();
+
+  fault_fs->ResetState();
+
+  std::atomic<bool> fail_after_manifest_sync{true};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        if (fail_after_manifest_sync.exchange(false)) {
+          ASSERT_NE(nullptr, arg);
+          IOStatus* io_s = static_cast<IOStatus*>(arg);
+          ASSERT_OK(*io_s);
+          *io_s = IOStatus::IOError("injected manifest sync aftermath");
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Status s = TryReopen(options);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(fault_fs->DeleteFilesCreatedAfterLastDirSync(IOOptions(), nullptr));
+
+  s = TryReopen(options);
+  ASSERT_OK(s);
+  ASSERT_EQ("value", Get("base"));
+  ASSERT_EQ("value", Get("recovered"));
+  Close();
+}
+
+// Direct unit test for WritableFileWriter's initial_file_size parameter:
+// verifies the visible size accessors report the existing on-disk size
+// immediately, rather than the constructor's zero default.
+TEST_F(DBBasicTest, WritableFileWriterInitialFileSizeAdoptsExistingSize) {
+  Env* env = Env::Default();
+  std::string fname = test::PerThreadDBPath("set_file_size_test");
+  ASSERT_OK(env->CreateDirIfMissing(test::TmpDir(env)));
+
+  // Create a file with some bytes, close it.
+  {
+    std::unique_ptr<WritableFile> raw;
+    ASSERT_OK(env->NewWritableFile(fname, &raw, EnvOptions()));
+    ASSERT_OK(raw->Append("hello world"));
+    ASSERT_OK(raw->Close());
+  }
+
+  // Reopen and wrap in a WritableFileWriter without initial_file_size --
+  // GetFileSize() should be 0 (the constructor's default).
+  std::unique_ptr<FSWritableFile> fs_file;
+  ASSERT_OK(env->GetFileSystem()->ReopenWritableFile(
+      fname, FileOptions(), &fs_file, /*dbg=*/nullptr));
+  std::unique_ptr<WritableFileWriter> writer(
+      new WritableFileWriter(std::move(fs_file), fname, FileOptions()));
+  EXPECT_EQ(0u, writer->GetFileSize());
+
+  // Reopen again and seed the writer's size accounting from the existing
+  // bytes. GetFileSize and GetFlushedSize must reflect it immediately.
+  ASSERT_OK(env->GetFileSystem()->ReopenWritableFile(
+      fname, FileOptions(), &fs_file, /*dbg=*/nullptr));
+  writer.reset(new WritableFileWriter(
+      std::move(fs_file), fname, FileOptions(),
+      /*clock=*/nullptr, /*io_tracer=*/nullptr, /*stats=*/nullptr,
+      Histograms::HISTOGRAM_ENUM_MAX, /*listeners=*/{},
+      /*file_checksum_gen_factory=*/nullptr,
+      /*perform_data_verification=*/false,
+      /*buffered_data_with_checksum=*/false,
+      /*initial_file_size=*/11));
+  EXPECT_EQ(11u, writer->GetFileSize());
+  EXPECT_EQ(11u, writer->GetFlushedSize());
+
+  ASSERT_OK(env->DeleteFile(fname));
+}
+
+// Tail corruption: appending garbage bytes to the MANIFEST after a
+// clean close must prevent reuse -- the physical size exceeds the
+// last valid record end.
+TEST_F(DBBasicTest, ReuseManifestOnOpenSkipsOnTailCorruption) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  // Find the MANIFEST file and append garbage to it.
+  std::string manifest_path;
+  {
+    std::vector<std::string> files;
+    ASSERT_OK(env_->GetChildren(dbname_, &files));
+    for (const auto& f : files) {
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(f, &number, &type) && type == kDescriptorFile) {
+        manifest_path = dbname_ + "/" + f;
+        break;
+      }
+    }
+  }
+  ASSERT_FALSE(manifest_path.empty());
+  {
+    std::string contents;
+    ASSERT_OK(ReadFileToString(env_, manifest_path, &contents));
+    contents.append("garbage!");
+    ASSERT_OK(WriteStringToFile(env_, contents, manifest_path));
+  }
+
+  std::atomic<int> reopened{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ReopenManifestForAppend:Reopened",
+      [&](void* /*arg*/) { reopened.fetch_add(1); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  Reopen(options);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(0, reopened.load());
+  ASSERT_EQ("v", Get("k"));
+}
+
+// Regression test for corrupted atomic group when reuse_manifest_on_open
+// appends after an incomplete atomic group at the MANIFEST tail.
+// Before the fix, last_valid_record_end_ included records from an incomplete
+// trailing atomic group, causing ReopenManifestForAppend to append new records
+// after them. On subsequent recovery the incomplete group followed by new
+// records triggers "corrupted atomic group".
+TEST_F(DBBasicTest, ReuseManifestOnOpenIncompleteAtomicGroupAtTail) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.reuse_manifest_on_open = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k", "v"));
+  ASSERT_OK(Flush());
+  Close();
+
+  // Find the MANIFEST file.
+  std::string manifest_path;
+  {
+    std::vector<std::string> files;
+    ASSERT_OK(env_->GetChildren(dbname_, &files));
+    for (const auto& f : files) {
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(f, &number, &type) && type == kDescriptorFile) {
+        manifest_path = dbname_ + "/" + f;
+        break;
+      }
+    }
+  }
+  ASSERT_FALSE(manifest_path.empty());
+
+  // Append an incomplete atomic group (2 records of a 3-member group) to the
+  // MANIFEST. These are valid log records with correct CRCs but the atomic
+  // group is not complete (missing the third record with remaining_entries=0).
+  {
+    uint64_t file_size;
+    ASSERT_OK(env_->GetFileSize(manifest_path, &file_size));
+    const auto& fs = env_->GetFileSystem();
+    std::unique_ptr<FSWritableFile> fs_file;
+    ASSERT_OK(fs->ReopenWritableFile(manifest_path, FileOptions(), &fs_file,
+                                     nullptr));
+    std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+        std::move(fs_file), manifest_path, FileOptions()));
+    log::Writer log_writer(std::move(file_writer), 0, false, false,
+                           kNoCompression, false, file_size % log::kBlockSize);
+
+    // Write 2 records of a 3-member atomic group
+    VersionEdit edit1;
+    edit1.SetLogNumber(0);
+    edit1.SetNextFile(100);
+    edit1.SetLastSequence(100);
+    edit1.MarkAtomicGroup(2);  // remaining_entries=2, expects 3 total
+    std::string record1;
+    ASSERT_TRUE(edit1.EncodeTo(&record1, 0));
+    ASSERT_OK(log_writer.AddRecord(WriteOptions(), record1));
+
+    VersionEdit edit2;
+    edit2.SetLogNumber(0);
+    edit2.SetNextFile(100);
+    edit2.SetLastSequence(100);
+    edit2.MarkAtomicGroup(1);  // remaining_entries=1
+    std::string record2;
+    ASSERT_TRUE(edit2.EncodeTo(&record2, 0));
+    ASSERT_OK(log_writer.AddRecord(WriteOptions(), record2));
+    // Deliberately NOT writing the third record (remaining_entries=0)
+  }
+
+  // Reopen: recovery should succeed (incomplete trailing group is ignored).
+  // With the fix, ReopenManifestForAppend will NOT reuse the MANIFEST because
+  // manifest_last_valid_record_end_ < physical_size (the incomplete group
+  // records are excluded from the valid end).
+  Reopen(options);
+  ASSERT_EQ("v", Get("k"));
+
+  // Write new data to create new MANIFEST records.
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+  Close();
+
+  // Final reopen: must NOT fail with "corrupted atomic group".
+  Reopen(options);
+  ASSERT_EQ("v", Get("k"));
+  ASSERT_EQ("v2", Get("k2"));
+  Close();
 }
 
 TEST_F(DBBasicTest, EnableDirectIOWithZeroBuf) {
@@ -161,6 +1164,7 @@ TEST_F(DBBasicTest, UniqueSession) {
 
   ASSERT_EQ(sid2, sid3);
 
+  DestroyAndReopen(options);
   CreateAndReopenWithCF({"goku"}, options);
   ASSERT_OK(db_->GetDbSessionId(sid1));
   ASSERT_OK(Put("bar", "e1"));
@@ -179,6 +1183,7 @@ TEST_F(DBBasicTest, UniqueSession) {
 TEST_F(DBBasicTest, ReadOnlyDB) {
   ASSERT_OK(Put("foo", "v1"));
   ASSERT_OK(Put("bar", "v2"));
+  ASSERT_OK(Flush());
   ASSERT_OK(Put("foo", "v3"));
   Close();
 
@@ -208,10 +1213,11 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
 
   auto options = CurrentOptions();
   assert(options.env == env_);
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   ASSERT_EQ("v3", Get("foo"));
   ASSERT_EQ("v2", Get("bar"));
   verify_all_iters();
+  ASSERT_EQ(Flush().code(), Status::Code::kNotSupported);
   Close();
 
   // Reopen and flush memtable.
@@ -219,26 +1225,75 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
   ASSERT_OK(Flush());
   Close();
   // Now check keys in read only mode.
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   ASSERT_EQ("v3", Get("foo"));
   ASSERT_EQ("v2", Get("bar"));
   verify_all_iters();
-  ASSERT_TRUE(db_->SyncWAL().IsNotSupported());
+  ASSERT_EQ(db_->SyncWAL().code(), Status::Code::kNotSupported);
+
+  // More ops that should fail
+  std::vector<ColumnFamilyHandle*> cfhs{{}};
+  ASSERT_EQ(db_->CreateColumnFamily(options, "blah", &cfhs[0]).code(),
+            Status::Code::kNotSupported);
+
+  ASSERT_EQ(db_->CreateColumnFamilies(options, {"blah"}, &cfhs).code(),
+            Status::Code::kNotSupported);
+
+  std::vector<ColumnFamilyDescriptor> cfds;
+  cfds.push_back({"blah", options});
+  ASSERT_EQ(db_->CreateColumnFamilies(cfds, &cfhs).code(),
+            Status::Code::kNotSupported);
 }
 
-// TODO akanksha: Update the test to check that combination
-// does not actually write to FS (use open read-only with
-// CompositeEnvWrapper+ReadOnlyFileSystem).
-TEST_F(DBBasicTest, DISABLED_ReadOnlyDBWithWriteDBIdToManifestSet) {
+TEST_F(DBBasicTest, ReadOnlyDBFlushWAL) {
+  // Test that FlushWAL returns NotSupported on read-only DB, and that
+  // GetLiveFilesStorageInfo works correctly even with manual_wal_flush=true.
+  // This is a regression test for a bug where GetLiveFilesStorageInfo would
+  // crash on read-only DBs with manual_wal_flush=true because FlushWAL
+  // accessed logs_.back() on an empty deque.
+  auto options = CurrentOptions();
+  options.manual_wal_flush = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Put("bar", "v2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("baz", "v3"));  // Unflushed data in WAL
+  Close();
+
+  // Reopen as read-only
+  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_EQ("v1", Get("foo"));
+  ASSERT_EQ("v2", Get("bar"));
+  ASSERT_EQ("v3", Get("baz"));
+
+  // FlushWAL should return NotSupported (not crash)
+  ASSERT_EQ(db_->FlushWAL(/*sync=*/false).code(), Status::Code::kNotSupported);
+  ASSERT_EQ(db_->FlushWAL(/*sync=*/true).code(), Status::Code::kNotSupported);
+
+  // GetLiveFilesStorageInfo should succeed (previously crashed with
+  // manual_wal_flush=true because it called FlushWAL which accessed
+  // logs_.back() on empty deque)
+  LiveFilesStorageInfoOptions lfsi_opts;
+  lfsi_opts.wal_size_for_flush = 0;
+  std::vector<LiveFileStorageInfo> files;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(lfsi_opts, &files));
+  ASSERT_GT(files.size(), 0);
+
+  Close();
+}
+
+TEST_F(DBBasicTest, ReadOnlyDBWithWriteDBIdToManifestSet) {
+  auto options = CurrentOptions();
+  options.write_dbid_to_manifest = false;
+  DestroyAndReopen(options);
   ASSERT_OK(Put("foo", "v1"));
   ASSERT_OK(Put("bar", "v2"));
   ASSERT_OK(Put("foo", "v3"));
   Close();
 
-  auto options = CurrentOptions();
   options.write_dbid_to_manifest = true;
   assert(options.env == env_);
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   std::string db_id1;
   ASSERT_OK(db_->GetDbIdentity(db_id1));
   ASSERT_EQ("v3", Get("foo"));
@@ -258,7 +1313,7 @@ TEST_F(DBBasicTest, DISABLED_ReadOnlyDBWithWriteDBIdToManifestSet) {
   ASSERT_OK(Flush());
   Close();
   // Now check keys in read only mode.
-  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_OK(EnforcedReadOnlyReopen(options));
   ASSERT_EQ("v3", Get("foo"));
   ASSERT_EQ("v2", Get("bar"));
   ASSERT_TRUE(db_->SyncWAL().IsNotSupported());
@@ -414,27 +1469,36 @@ TEST_F(DBBasicTest, LevelLimitReopen) {
   ASSERT_OK(TryReopenWithColumnFamilies({"default", "pikachu"}, options));
 }
 
-TEST_F(DBBasicTest, PutDeleteGet) {
+TEST_P(DBBasicGetWithParam, PutDeleteGet) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "foo", "v1"));
-    ASSERT_EQ("v1", Get(1, "foo"));
+    ASSERT_EQ("v1", Get(1, "foo", nullptr, use_coroutine_));
     ASSERT_OK(Put(1, "foo", "v2"));
-    ASSERT_EQ("v2", Get(1, "foo"));
+    ASSERT_EQ("v2", Get(1, "foo", nullptr, use_coroutine_));
     ASSERT_OK(Delete(1, "foo"));
-    ASSERT_EQ("NOT_FOUND", Get(1, "foo"));
+    ASSERT_EQ("NOT_FOUND", Get(1, "foo", nullptr, use_coroutine_));
+
+    ASSERT_OK(Put("default_foo", "default_v1"));
+    ASSERT_EQ("default_v1",
+              Get("default_foo", static_cast<const Snapshot*>(nullptr),
+                  use_coroutine_));
+
+    PinnableSlice default_pinnable_value;
+    ASSERT_OK(Get("default_foo", &default_pinnable_value, use_coroutine_));
+    ASSERT_EQ("default_v1", default_pinnable_value.ToString());
   } while (ChangeOptions());
 }
 
-TEST_F(DBBasicTest, PutSingleDeleteGet) {
+TEST_P(DBBasicGetWithParam, PutSingleDeleteGet) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "foo", "v1"));
-    ASSERT_EQ("v1", Get(1, "foo"));
+    ASSERT_EQ("v1", Get(1, "foo", nullptr, use_coroutine_));
     ASSERT_OK(Put(1, "foo2", "v2"));
-    ASSERT_EQ("v2", Get(1, "foo2"));
+    ASSERT_EQ("v2", Get(1, "foo2", nullptr, use_coroutine_));
     ASSERT_OK(SingleDelete(1, "foo"));
-    ASSERT_EQ("NOT_FOUND", Get(1, "foo"));
+    ASSERT_EQ("NOT_FOUND", Get(1, "foo", nullptr, use_coroutine_));
     // Ski FIFO and universal compaction because they do not apply to the test
     // case. Skip MergePut because single delete does not get removed when it
     // encounters a merge.
@@ -442,38 +1506,40 @@ TEST_F(DBBasicTest, PutSingleDeleteGet) {
                          kSkipMergePut));
 }
 
-TEST_F(DBBasicTest, TimedPutBasic) {
+TEST_P(DBBasicGetWithParam, TimedPutBasic) {
   do {
     Options options = CurrentOptions();
     options.merge_operator = MergeOperators::CreateStringAppendOperator();
     CreateAndReopenWithCF({"pikachu"}, options);
     ASSERT_OK(TimedPut(1, "foo", "v1", /*write_unix_time=*/0));
     // Read from memtable
-    ASSERT_EQ("v1", Get(1, "foo"));
+    ASSERT_EQ("v1", Get(1, "foo", nullptr, use_coroutine_));
     ASSERT_OK(TimedPut(1, "foo", "v2.1", /*write_unix_time=*/3));
-    ASSERT_EQ("v2.1", Get(1, "foo"));
+    ASSERT_EQ("v2.1", Get(1, "foo", nullptr, use_coroutine_));
 
     // Read from sst file
     ASSERT_OK(db_->Flush(FlushOptions(), handles_[1]));
     ASSERT_OK(Merge(1, "foo", "v2.2"));
-    ASSERT_EQ("v2.1,v2.2", Get(1, "foo"));
+    ASSERT_EQ("v2.1,v2.2", Get(1, "foo", nullptr, use_coroutine_));
     ASSERT_OK(Delete(1, "foo"));
-    ASSERT_EQ("NOT_FOUND", Get(1, "foo"));
+    ASSERT_EQ("NOT_FOUND", Get(1, "foo", nullptr, use_coroutine_));
 
     ASSERT_OK(TimedPut(1, "bar", "bv1", /*write_unix_time=*/0));
-    ASSERT_EQ("bv1", Get(1, "bar"));
+    ASSERT_EQ("bv1", Get(1, "bar", nullptr, use_coroutine_));
     ASSERT_OK(TimedPut(1, "baz", "bzv1", /*write_unix_time=*/0));
-    ASSERT_EQ("bzv1", Get(1, "baz"));
-    std::string range_del_begin = "b";
-    std::string range_del_end = "baz";
-    Slice begin_rdel = range_del_begin, end_rdel = range_del_end;
-    ASSERT_OK(
-        db_->DeleteRange(WriteOptions(), handles_[1], begin_rdel, end_rdel));
-    ASSERT_EQ("NOT_FOUND", Get(1, "bar"));
+    ASSERT_EQ("bzv1", Get(1, "baz", nullptr, use_coroutine_));
+    if (option_config_ != kRowCache) {
+      std::string range_del_begin = "b";
+      std::string range_del_end = "baz";
+      Slice begin_rdel = range_del_begin, end_rdel = range_del_end;
+      ASSERT_OK(
+          db_->DeleteRange(WriteOptions(), handles_[1], begin_rdel, end_rdel));
+      ASSERT_EQ("NOT_FOUND", Get(1, "bar", nullptr, use_coroutine_));
+    }
 
-    ASSERT_EQ("bzv1", Get(1, "baz"));
+    ASSERT_EQ("bzv1", Get(1, "baz", nullptr, use_coroutine_));
     ASSERT_OK(SingleDelete(1, "baz"));
-    ASSERT_EQ("NOT_FOUND", Get(1, "baz"));
+    ASSERT_EQ("NOT_FOUND", Get(1, "baz", nullptr, use_coroutine_));
   } while (ChangeOptions(kSkipPlainTable));
 }
 
@@ -499,17 +1565,17 @@ TEST_F(DBBasicTest, EmptyFlush) {
                          kSkipMergePut));
 }
 
-TEST_F(DBBasicTest, GetFromVersions) {
+TEST_P(DBBasicGetWithParam, GetFromVersions) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "foo", "v1"));
     ASSERT_OK(Flush(1));
-    ASSERT_EQ("v1", Get(1, "foo"));
-    ASSERT_EQ("NOT_FOUND", Get(0, "foo"));
+    ASSERT_EQ("v1", Get(1, "foo", nullptr, use_coroutine_));
+    ASSERT_EQ("NOT_FOUND", Get(0, "foo", nullptr, use_coroutine_));
   } while (ChangeOptions());
 }
 
-TEST_F(DBBasicTest, GetSnapshot) {
+TEST_P(DBBasicGetWithParam, GetSnapshot) {
   anon::OptionsOverride options_override;
   options_override.skip_policy = kSkipNoSnapshot;
   do {
@@ -520,11 +1586,11 @@ TEST_F(DBBasicTest, GetSnapshot) {
       ASSERT_OK(Put(1, key, "v1"));
       const Snapshot* s1 = db_->GetSnapshot();
       ASSERT_OK(Put(1, key, "v2"));
-      ASSERT_EQ("v2", Get(1, key));
-      ASSERT_EQ("v1", Get(1, key, s1));
+      ASSERT_EQ("v2", Get(1, key, nullptr, use_coroutine_));
+      ASSERT_EQ("v1", Get(1, key, s1, use_coroutine_));
       ASSERT_OK(Flush(1));
-      ASSERT_EQ("v2", Get(1, key));
-      ASSERT_EQ("v1", Get(1, key, s1));
+      ASSERT_EQ("v2", Get(1, key, nullptr, use_coroutine_));
+      ASSERT_EQ("v1", Get(1, key, s1, use_coroutine_));
       db_->ReleaseSnapshot(s1);
     }
   } while (ChangeOptions());
@@ -532,14 +1598,14 @@ TEST_F(DBBasicTest, GetSnapshot) {
 
 TEST_F(DBBasicTest, CheckLock) {
   do {
-    DB* localdb = nullptr;
+    std::unique_ptr<DB> localdb;
     Options options = CurrentOptions();
     ASSERT_OK(TryReopen(options));
 
     // second open should fail
     Status s = DB::Open(options, dbname_, &localdb);
-    ASSERT_NOK(s) << [localdb]() {
-      delete localdb;
+    ASSERT_NOK(s) << [&localdb]() {
+      localdb.reset();
       return "localdb open: ok";
     }();
 #ifdef OS_LINUX
@@ -658,104 +1724,104 @@ TEST_F(DBBasicTest, Flush) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBBasicTest, ManifestRollOver) {
-  do {
-    Options options;
-    options.max_manifest_file_size = 10;  // 10 bytes
-    options = CurrentOptions(options);
-    CreateAndReopenWithCF({"pikachu"}, options);
-    {
-      ASSERT_OK(Put(1, "manifest_key1", std::string(1000, '1')));
-      ASSERT_OK(Put(1, "manifest_key2", std::string(1000, '2')));
-      ASSERT_OK(Put(1, "manifest_key3", std::string(1000, '3')));
-      uint64_t manifest_before_flush = dbfull()->TEST_Current_Manifest_FileNo();
-      ASSERT_OK(Flush(1));  // This should trigger LogAndApply.
-      uint64_t manifest_after_flush = dbfull()->TEST_Current_Manifest_FileNo();
-      ASSERT_GT(manifest_after_flush, manifest_before_flush);
-      ReopenWithColumnFamilies({"default", "pikachu"}, options);
-      ASSERT_GT(dbfull()->TEST_Current_Manifest_FileNo(), manifest_after_flush);
-      // check if a new manifest file got inserted or not.
-      ASSERT_EQ(std::string(1000, '1'), Get(1, "manifest_key1"));
-      ASSERT_EQ(std::string(1000, '2'), Get(1, "manifest_key2"));
-      ASSERT_EQ(std::string(1000, '3'), Get(1, "manifest_key3"));
-    }
-  } while (ChangeCompactOptions());
-}
-
 TEST_F(DBBasicTest, IdentityAcrossRestarts) {
   constexpr size_t kMinIdSize = 10;
   do {
     for (bool with_manifest : {false, true}) {
-      std::string idfilename = IdentityFileName(dbname_);
-      std::string id1, tmp;
-      ASSERT_OK(db_->GetDbIdentity(id1));
-      ASSERT_GE(id1.size(), kMinIdSize);
+      for (bool write_file : {false, true}) {
+        std::string idfilename = IdentityFileName(dbname_);
+        std::string id1, tmp;
+        ASSERT_OK(db_->GetDbIdentity(id1));
+        ASSERT_GE(id1.size(), kMinIdSize);
 
-      Options options = CurrentOptions();
-      options.write_dbid_to_manifest = with_manifest;
-      Reopen(options);
-      std::string id2;
-      ASSERT_OK(db_->GetDbIdentity(id2));
-      // id2 should match id1 because identity was not regenerated
-      ASSERT_EQ(id1, id2);
-      ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
-      ASSERT_EQ(tmp, id2);
+        Options options = CurrentOptions();
+        options.write_dbid_to_manifest = with_manifest;
+        options.write_identity_file = true;  // initially
+        Reopen(options);
+        std::string id2;
+        ASSERT_OK(db_->GetDbIdentity(id2));
+        // id2 should match id1 because identity was not regenerated
+        ASSERT_EQ(id1, id2);
+        ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
+        ASSERT_EQ(tmp, id2);
 
-      // Recover from deleted/missing IDENTITY
-      ASSERT_OK(env_->DeleteFile(idfilename));
-      Reopen(options);
-      std::string id3;
-      ASSERT_OK(db_->GetDbIdentity(id3));
-      if (with_manifest) {
-        // id3 should match id1 because identity was restored from manifest
-        ASSERT_EQ(id1, id3);
-      } else {
-        // id3 should NOT match id1 because identity was regenerated
-        ASSERT_NE(id1, id3);
-        ASSERT_GE(id3.size(), kMinIdSize);
-      }
-      ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
-      ASSERT_EQ(tmp, id3);
+        if (write_file) {
+          // Recover from deleted/missing IDENTITY
+          ASSERT_OK(env_->DeleteFile(idfilename));
+        } else {
+          // Transition to no IDENTITY file
+          options.write_identity_file = false;
+          if (!with_manifest) {
+            // Incompatible options, should fail
+            ASSERT_NOK(TryReopen(options));
+            // Back to a usable config and continue
+            options.write_identity_file = true;
+            Reopen(options);
+            continue;
+          }
+        }
+        Reopen(options);
+        std::string id3;
+        ASSERT_OK(db_->GetDbIdentity(id3));
+        if (with_manifest) {
+          // id3 should match id1 because identity was restored from manifest
+          ASSERT_EQ(id1, id3);
+        } else {
+          // id3 should NOT match id1 because identity was regenerated
+          ASSERT_NE(id1, id3);
+          ASSERT_GE(id3.size(), kMinIdSize);
+        }
+        if (write_file) {
+          ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
+          ASSERT_EQ(tmp, id3);
 
-      // Recover from truncated IDENTITY
-      {
-        std::unique_ptr<WritableFile> w;
-        ASSERT_OK(env_->NewWritableFile(idfilename, &w, EnvOptions()));
-        ASSERT_OK(w->Close());
-      }
-      Reopen(options);
-      std::string id4;
-      ASSERT_OK(db_->GetDbIdentity(id4));
-      if (with_manifest) {
-        // id4 should match id1 because identity was restored from manifest
-        ASSERT_EQ(id1, id4);
-      } else {
-        // id4 should NOT match id1 because identity was regenerated
-        ASSERT_NE(id1, id4);
-        ASSERT_GE(id4.size(), kMinIdSize);
-      }
-      ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
-      ASSERT_EQ(tmp, id4);
+          // Recover from truncated IDENTITY
+          std::unique_ptr<WritableFile> w;
+          ASSERT_OK(env_->NewWritableFile(idfilename, &w, EnvOptions()));
+          ASSERT_OK(w->Close());
+        } else {
+          ASSERT_TRUE(env_->FileExists(idfilename).IsNotFound());
+        }
+        Reopen(options);
+        std::string id4;
+        ASSERT_OK(db_->GetDbIdentity(id4));
+        if (with_manifest) {
+          // id4 should match id1 because identity was restored from manifest
+          ASSERT_EQ(id1, id4);
+        } else {
+          // id4 should NOT match id1 because identity was regenerated
+          ASSERT_NE(id1, id4);
+          ASSERT_GE(id4.size(), kMinIdSize);
+        }
+        std::string silly_id = "asdf123456789";
+        if (write_file) {
+          ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
+          ASSERT_EQ(tmp, id4);
 
-      // Recover from overwritten IDENTITY
-      std::string silly_id = "asdf123456789";
-      {
-        std::unique_ptr<WritableFile> w;
-        ASSERT_OK(env_->NewWritableFile(idfilename, &w, EnvOptions()));
-        ASSERT_OK(w->Append(silly_id));
-        ASSERT_OK(w->Close());
+          // Recover from overwritten IDENTITY
+          std::unique_ptr<WritableFile> w;
+          ASSERT_OK(env_->NewWritableFile(idfilename, &w, EnvOptions()));
+          ASSERT_OK(w->Append(silly_id));
+          ASSERT_OK(w->Close());
+        } else {
+          ASSERT_TRUE(env_->FileExists(idfilename).IsNotFound());
+        }
+        Reopen(options);
+        std::string id5;
+        ASSERT_OK(db_->GetDbIdentity(id5));
+        if (with_manifest) {
+          // id4 should match id1 because identity was restored from manifest
+          ASSERT_EQ(id1, id5);
+        } else {
+          ASSERT_EQ(id5, silly_id);
+        }
+        if (write_file) {
+          ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
+          ASSERT_EQ(tmp, id5);
+        } else {
+          ASSERT_TRUE(env_->FileExists(idfilename).IsNotFound());
+        }
       }
-      Reopen(options);
-      std::string id5;
-      ASSERT_OK(db_->GetDbIdentity(id5));
-      if (with_manifest) {
-        // id4 should match id1 because identity was restored from manifest
-        ASSERT_EQ(id1, id5);
-      } else {
-        ASSERT_EQ(id5, silly_id);
-      }
-      ASSERT_OK(ReadFileToString(env_, idfilename, &tmp));
-      ASSERT_EQ(tmp, id5);
     }
   } while (ChangeCompactOptions());
 }
@@ -781,7 +1847,7 @@ TEST_F(DBBasicTest, LockFileRecovery) {
   }
 }
 
-TEST_F(DBBasicTest, Snapshot) {
+TEST_P(DBBasicGetWithParam, Snapshot) {
   env_->SetMockSleep();
   anon::OptionsOverride options_override;
   options_override.skip_policy = kSkipNoSnapshot;
@@ -808,38 +1874,38 @@ TEST_F(DBBasicTest, Snapshot) {
     ASSERT_OK(Put(1, "foo", "1v3"));
 
     {
-      ManagedSnapshot s3(db_);
+      ManagedSnapshot s3(db_.get());
       ASSERT_EQ(3U, GetNumSnapshots());
       ASSERT_EQ(time_snap1, GetTimeOldestSnapshots());
       ASSERT_EQ(GetSequenceOldestSnapshots(), s1->GetSequenceNumber());
 
       ASSERT_OK(Put(0, "foo", "0v4"));
       ASSERT_OK(Put(1, "foo", "1v4"));
-      ASSERT_EQ("0v1", Get(0, "foo", s1));
-      ASSERT_EQ("1v1", Get(1, "foo", s1));
-      ASSERT_EQ("0v2", Get(0, "foo", s2));
-      ASSERT_EQ("1v2", Get(1, "foo", s2));
-      ASSERT_EQ("0v3", Get(0, "foo", s3.snapshot()));
-      ASSERT_EQ("1v3", Get(1, "foo", s3.snapshot()));
-      ASSERT_EQ("0v4", Get(0, "foo"));
-      ASSERT_EQ("1v4", Get(1, "foo"));
+      ASSERT_EQ("0v1", Get(0, "foo", s1, use_coroutine_));
+      ASSERT_EQ("1v1", Get(1, "foo", s1, use_coroutine_));
+      ASSERT_EQ("0v2", Get(0, "foo", s2, use_coroutine_));
+      ASSERT_EQ("1v2", Get(1, "foo", s2, use_coroutine_));
+      ASSERT_EQ("0v3", Get(0, "foo", s3.snapshot(), use_coroutine_));
+      ASSERT_EQ("1v3", Get(1, "foo", s3.snapshot(), use_coroutine_));
+      ASSERT_EQ("0v4", Get(0, "foo", nullptr, use_coroutine_));
+      ASSERT_EQ("1v4", Get(1, "foo", nullptr, use_coroutine_));
     }
 
     ASSERT_EQ(2U, GetNumSnapshots());
     ASSERT_EQ(time_snap1, GetTimeOldestSnapshots());
     ASSERT_EQ(GetSequenceOldestSnapshots(), s1->GetSequenceNumber());
-    ASSERT_EQ("0v1", Get(0, "foo", s1));
-    ASSERT_EQ("1v1", Get(1, "foo", s1));
-    ASSERT_EQ("0v2", Get(0, "foo", s2));
-    ASSERT_EQ("1v2", Get(1, "foo", s2));
-    ASSERT_EQ("0v4", Get(0, "foo"));
-    ASSERT_EQ("1v4", Get(1, "foo"));
+    ASSERT_EQ("0v1", Get(0, "foo", s1, use_coroutine_));
+    ASSERT_EQ("1v1", Get(1, "foo", s1, use_coroutine_));
+    ASSERT_EQ("0v2", Get(0, "foo", s2, use_coroutine_));
+    ASSERT_EQ("1v2", Get(1, "foo", s2, use_coroutine_));
+    ASSERT_EQ("0v4", Get(0, "foo", nullptr, use_coroutine_));
+    ASSERT_EQ("1v4", Get(1, "foo", nullptr, use_coroutine_));
 
     db_->ReleaseSnapshot(s1);
-    ASSERT_EQ("0v2", Get(0, "foo", s2));
-    ASSERT_EQ("1v2", Get(1, "foo", s2));
-    ASSERT_EQ("0v4", Get(0, "foo"));
-    ASSERT_EQ("1v4", Get(1, "foo"));
+    ASSERT_EQ("0v2", Get(0, "foo", s2, use_coroutine_));
+    ASSERT_EQ("1v2", Get(1, "foo", s2, use_coroutine_));
+    ASSERT_EQ("0v4", Get(0, "foo", nullptr, use_coroutine_));
+    ASSERT_EQ("1v4", Get(1, "foo", nullptr, use_coroutine_));
     ASSERT_EQ(1U, GetNumSnapshots());
     ASSERT_LT(time_snap1, GetTimeOldestSnapshots());
     ASSERT_EQ(GetSequenceOldestSnapshots(), s2->GetSequenceNumber());
@@ -847,11 +1913,18 @@ TEST_F(DBBasicTest, Snapshot) {
     db_->ReleaseSnapshot(s2);
     ASSERT_EQ(0U, GetNumSnapshots());
     ASSERT_EQ(GetSequenceOldestSnapshots(), 0);
-    ASSERT_EQ("0v4", Get(0, "foo"));
-    ASSERT_EQ("1v4", Get(1, "foo"));
+    ASSERT_EQ("0v4", Get(0, "foo", nullptr, use_coroutine_));
+    ASSERT_EQ("1v4", Get(1, "foo", nullptr, use_coroutine_));
   } while (ChangeOptions());
 }
 
+#if USE_COROUTINES
+INSTANTIATE_TEST_CASE_P(DBBasicGetWithParam, DBBasicGetWithParam,
+                        testing::Bool());
+#else
+INSTANTIATE_TEST_CASE_P(DBBasicGetWithParam, DBBasicGetWithParam,
+                        testing::Values(false));
+#endif  // USE_COROUTINES
 
 class DBBasicMultiConfigs : public DBBasicTest,
                             public ::testing::WithParamInterface<int> {
@@ -932,7 +2005,7 @@ TEST_F(DBBasicTest, DBOpen_Options) {
   Destroy(options);
 
   // Does not exist, and create_if_missing == false: error
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   options.create_if_missing = false;
   Status s = DB::Open(options, dbname_, &db);
   ASSERT_TRUE(strstr(s.ToString().c_str(), "does not exist") != nullptr);
@@ -944,8 +2017,7 @@ TEST_F(DBBasicTest, DBOpen_Options) {
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
 
-  delete db;
-  db = nullptr;
+  db.reset();
 
   // Does exist, and error_if_exists == true: error
   options.create_if_missing = false;
@@ -961,8 +2033,7 @@ TEST_F(DBBasicTest, DBOpen_Options) {
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
 
-  delete db;
-  db = nullptr;
+  db.reset();
 }
 
 TEST_F(DBBasicTest, CompactOnFlush) {
@@ -1267,7 +2338,7 @@ TEST_F(DBBasicTest, DBClose) {
   std::string dbname = test::PerThreadDBPath("db_close_test");
   ASSERT_OK(DestroyDB(dbname, options));
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   TestEnv* env = new TestEnv(env_);
   std::unique_ptr<TestEnv> local_env_guard(env);
   options.create_if_missing = true;
@@ -1280,14 +2351,14 @@ TEST_F(DBBasicTest, DBClose) {
   ASSERT_EQ(env->GetCloseCount(), 1);
   ASSERT_EQ(s, Status::IOError());
 
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 1);
 
   // Do not call DB::Close() and ensure our logger Close() still gets called
   s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 2);
 
   // close by WaitForCompact() with close_db option
@@ -1302,7 +2373,7 @@ TEST_F(DBBasicTest, DBClose) {
   // see TestLogger::CloseHelper()
   ASSERT_EQ(s, Status::IOError());
 
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 3);
 
   // Provide our own logger and ensure DB::Close() does not close it
@@ -1313,7 +2384,7 @@ TEST_F(DBBasicTest, DBClose) {
 
   s = db->Close();
   ASSERT_EQ(s, Status::OK());
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 3);
   options.info_log.reset();
   ASSERT_EQ(env->GetCloseCount(), 4);
@@ -1331,7 +2402,7 @@ TEST_F(DBBasicTest, DBCloseAllDirectoryFDs) {
 
   ASSERT_OK(DestroyDB(dbname, options));
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::unique_ptr<Env> env = NewCompositeEnv(
       std::make_shared<CountedFileSystem>(FileSystem::Default()));
   options.create_if_missing = true;
@@ -1349,7 +2420,7 @@ TEST_F(DBBasicTest, DBCloseAllDirectoryFDs) {
   ASSERT_EQ(counted_fs->counters()->dir_opens,
             counted_fs->counters()->dir_closes);
   ASSERT_OK(s);
-  delete db;
+  db.reset();
 }
 
 TEST_F(DBBasicTest, DBCloseFlushError) {
@@ -1411,9 +2482,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
   }
 
   int get_sv_count = 0;
-  ROCKSDB_NAMESPACE::DBImpl* db = static_cast_with_check<DBImpl>(db_);
+  ROCKSDB_NAMESPACE::DBImpl* db = dbfull();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::AfterRefSV", [&](void* /*arg*/) {
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (++get_sv_count == 2) {
           // After MultiGet refs a couple of CFs, flush all CFs so MultiGet
           // is forced to repeat the process
@@ -1483,10 +2554,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
   ASSERT_EQ(values[2], std::get<2>(cf_kv_vec[1]) + "_2");
 
   for (int cf = 0; cf < 8; ++cf) {
-    auto* cfd =
-        static_cast_with_check<ColumnFamilyHandleImpl>(
-            static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(cf))
-            ->cfd();
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->GetColumnFamilyHandle(cf))
+                    ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVObsolete);
   }
@@ -1513,9 +2583,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
   int retries = 0;
   bool last_try = false;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::LastTry", [&](void* /*arg*/) { last_try = true; });
+      "DBImpl::MultiCFSnapshot::LastTry",
+      [&](void* /*arg*/) { last_try = true; });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::AfterRefSV", [&](void* /*arg*/) {
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (last_try) {
           return;
         }
@@ -1531,10 +2602,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
         }
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
-      {"DBImpl::MultiGet::AfterLastTryRefSV",
+      {"DBImpl::MultiCFSnapshot::AfterLastTryRefSV",
        "DBMultiGetTestWithParam::MultiGetMultiCFMutex:BeforeCreateSV"},
       {"DBMultiGetTestWithParam::MultiGetMultiCFMutex:AfterCreateSV",
-       "DBImpl::MultiGet::BeforeLastTryUnRefSV"},
+       "DBImpl::MultiCFSnapshot::BeforeLastTryUnRefSV"},
   });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
@@ -1571,10 +2642,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
               "cf" + std::to_string(j) + "_val" + std::to_string(retries));
   }
   for (int i = 0; i < 8; ++i) {
-    auto* cfd =
-        static_cast_with_check<ColumnFamilyHandleImpl>(
-            static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(i))
-            ->cfd();
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->GetColumnFamilyHandle(i))
+                    ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
   }
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
@@ -1598,9 +2668,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
   }
 
   int get_sv_count = 0;
-  ROCKSDB_NAMESPACE::DBImpl* db = static_cast_with_check<DBImpl>(db_);
+  ROCKSDB_NAMESPACE::DBImpl* db = dbfull();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::AfterRefSV", [&](void* /*arg*/) {
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (++get_sv_count == 2) {
           for (int i = 0; i < 8; ++i) {
             ASSERT_OK(Flush(i));
@@ -1639,10 +2709,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
     ASSERT_EQ(values[j], "cf" + std::to_string(j) + "_val");
   }
   for (int i = 0; i < 8; ++i) {
-    auto* cfd =
-        static_cast_with_check<ColumnFamilyHandleImpl>(
-            static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(i))
-            ->cfd();
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->GetColumnFamilyHandle(i))
+                    ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
   }
 }
@@ -2488,15 +3557,332 @@ TEST_P(DBMultiGetTestWithParam, MultiGetBatchedValueSizeMultiLevelMerge) {
   }
 }
 
+TEST_P(DBMultiGetTestWithParam, MultiGetMemtableBatchLookup) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  // Skip for unbatched MultiGet
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Insert sorted keys into memtable
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(1, Key(i), "val" + std::to_string(i)));
+  }
+  // Delete some keys
+  ASSERT_OK(Delete(1, Key(25)));
+  ASSERT_OK(Delete(1, Key(75)));
+
+  // MultiGet a batch of keys - mix of existing, deleted, and missing
+  // Store key strings to keep Slice data alive
+  std::vector<std::string> key_strs = {Key(0),  Key(10), Key(25), Key(50),
+                                       Key(75), Key(99), Key(200)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "val0");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "val10");
+  ASSERT_TRUE(statuses[2].IsNotFound());  // deleted
+  ASSERT_OK(statuses[3]);
+  ASSERT_EQ(values[3].ToString(), "val50");
+  ASSERT_TRUE(statuses[4].IsNotFound());  // deleted
+  ASSERT_OK(statuses[5]);
+  ASSERT_EQ(values[5].ToString(), "val99");
+  ASSERT_TRUE(statuses[6].IsNotFound());  // never inserted
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupOverwrite) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Insert, then overwrite some keys
+  for (int i = 0; i < 50; i++) {
+    ASSERT_OK(Put(1, Key(i), "old" + std::to_string(i)));
+  }
+  for (int i = 0; i < 50; i += 5) {
+    ASSERT_OK(Put(1, Key(i), "new" + std::to_string(i)));
+  }
+
+  std::vector<std::string> key_strs;
+  for (int i = 0; i < 50; i += 5) {
+    key_strs.push_back(Key(i));
+  }
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  for (size_t i = 0; i < keys.size(); i++) {
+    ASSERT_OK(statuses[i]);
+    ASSERT_EQ(values[i].ToString(), "new" + std::to_string(i * 5));
+  }
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupWithFlush) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Put data into SST
+  for (int i = 0; i < 50; i++) {
+    ASSERT_OK(Put(1, Key(i), "sst" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush(1));
+
+  // Put different data into memtable (overlapping some keys)
+  for (int i = 25; i < 75; i++) {
+    ASSERT_OK(Put(1, Key(i), "mem" + std::to_string(i)));
+  }
+
+  // MultiGet keys spanning both SST and memtable
+  std::vector<std::string> key_strs = {Key(10), Key(30), Key(60), Key(80)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "sst10");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "mem30");
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2].ToString(), "mem60");
+  ASSERT_TRUE(statuses[3].IsNotFound());
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupWithMerge) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Put base values
+  ASSERT_OK(Put(1, Key(1), "a"));
+  ASSERT_OK(Put(1, Key(2), "x"));
+  // Merge on top
+  ASSERT_OK(Merge(1, Key(1), "b"));
+  ASSERT_OK(Merge(1, Key(1), "c"));
+  ASSERT_OK(Merge(1, Key(2), "y"));
+
+  std::vector<std::string> key_strs = {Key(1), Key(2), Key(3)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "a,b,c");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "x,y");
+  ASSERT_TRUE(statuses[2].IsNotFound());
+}
+
+TEST_F(DBBasicTest, MultiGetBatchLookupDisabledByDefault) {
+  // Verify that finger search is off by default and MultiGet still works
+  Options options = CurrentOptions();
+  ASSERT_FALSE(options.memtable_batch_lookup_optimization);
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  ASSERT_OK(Put(1, "k1", "v1"));
+  ASSERT_OK(Put(1, "k2", "v2"));
+
+  std::vector<Slice> keys = {"k1", "k2", "k3"};
+  std::vector<PinnableSlice> values(3);
+  std::vector<Status> statuses(3);
+
+  db_->MultiGet(ReadOptions(), handles_[1], 3, keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "v1");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "v2");
+  ASSERT_TRUE(statuses[2].IsNotFound());
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupWithParanoid) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  options.paranoid_memory_checks = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Insert sorted keys into memtable
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(1, Key(i), "val" + std::to_string(i)));
+  }
+  ASSERT_OK(Delete(1, Key(25)));
+
+  // MultiGet with both batch optimization and paranoid checks enabled
+  std::vector<std::string> key_strs = {Key(0),  Key(10), Key(25),
+                                       Key(50), Key(99), Key(200)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "val0");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "val10");
+  ASSERT_TRUE(statuses[2].IsNotFound());  // deleted
+  ASSERT_OK(statuses[3]);
+  ASSERT_EQ(values[3].ToString(), "val50");
+  ASSERT_OK(statuses[4]);
+  ASSERT_EQ(values[4].ToString(), "val99");
+  ASSERT_TRUE(statuses[5].IsNotFound());  // never inserted
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupSnapshot) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  ASSERT_OK(Put(1, Key(1), "v1_old"));
+  ASSERT_OK(Put(1, Key(2), "v2_old"));
+
+  const Snapshot* snap = db_->GetSnapshot();
+
+  // Write new values after snapshot
+  ASSERT_OK(Put(1, Key(1), "v1_new"));
+  ASSERT_OK(Put(1, Key(2), "v2_new"));
+  ASSERT_OK(Put(1, Key(3), "v3_new"));
+
+  // MultiGet with snapshot should see old values
+  std::vector<std::string> key_strs = {Key(1), Key(2), Key(3)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "v1_old");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "v2_old");
+  ASSERT_TRUE(statuses[2].IsNotFound());  // didn't exist at snapshot
+
+  db_->ReleaseSnapshot(snap);
+
+  // MultiGet without snapshot should see new values
+  for (auto& v : values) {
+    v.Reset();
+  }
+  db_->MultiGet(ReadOptions(), handles_[1], keys.size(), keys.data(),
+                values.data(), statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "v1_new");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "v2_new");
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2].ToString(), "v3_new");
+}
+
 INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,
                         testing::Combine(testing::Bool(), testing::Bool()));
 
 #if USE_COROUTINES
-class DBMultiGetAsyncIOTest : public DBBasicTest,
-                              public ::testing::WithParamInterface<bool> {
+class DBMultiGetAsyncIOTest
+    : public DBBasicTest,
+      public ::testing::WithParamInterface<std::tuple<bool, bool>> {
  public:
   DBMultiGetAsyncIOTest()
-      : DBBasicTest(), statistics_(ROCKSDB_NAMESPACE::CreateDBStatistics()) {
+      : DBBasicTest(),
+        optimize_multiget_for_io_(std::get<0>(GetParam())),
+        use_coroutine_(std::get<1>(GetParam())),
+        statistics_(ROCKSDB_NAMESPACE::CreateDBStatistics()) {
     BlockBasedTableOptions bbto;
     bbto.filter_policy.reset(NewBloomFilterPolicy(10));
     options_ = CurrentOptions();
@@ -2570,6 +3956,20 @@ class DBMultiGetAsyncIOTest : public DBBasicTest,
   const std::shared_ptr<Statistics>& statistics() { return statistics_; }
 
  protected:
+  void AssertMultiGetIOBatchSize(uint64_t expected_count,
+                                 uint64_t expected_max) {
+    HistogramData multiget_io_batch_size;
+    statistics()->histogramData(MULTIGET_IO_BATCH_SIZE,
+                                &multiget_io_batch_size);
+    ASSERT_EQ(multiget_io_batch_size.count, expected_count);
+    ASSERT_EQ(multiget_io_batch_size.max, expected_max);
+  }
+
+  bool UseCoroutineRead() const {
+    return use_coroutine_ &&
+           options_.env->GetFileSystem()->GetReadExecutor() != nullptr;
+  }
+
   void PrepareDBForTest() {
 #ifdef ROCKSDB_IOURING_PRESENT
     Reopen(options_);
@@ -2577,14 +3977,16 @@ class DBMultiGetAsyncIOTest : public DBBasicTest,
     // Warm up the block cache so we don't need to use the IO uring
     Iterator* iter = dbfull()->NewIterator(ReadOptions());
     for (iter->SeekToFirst(); iter->Valid() && iter->status().ok();
-         iter->Next())
-      ;
+         iter->Next());
     EXPECT_OK(iter->status());
     delete iter;
 #endif  // ROCKSDB_IOURING_PRESENT
   }
 
   void ReopenDB() { Reopen(options_); }
+
+  const bool optimize_multiget_for_io_;
+  const bool use_coroutine_;
 
  private:
   std::shared_ptr<Statistics> statistics_;
@@ -2594,39 +3996,28 @@ class DBMultiGetAsyncIOTest : public DBBasicTest,
 TEST_P(DBMultiGetAsyncIOTest, GetFromL0) {
   // All 3 keys in L0. The L0 files should be read serially.
   std::vector<std::string> key_strs{Key(0), Key(40), Key(80)};
-  std::vector<Slice> keys{key_strs[0], key_strs[1], key_strs[2]};
-  std::vector<PinnableSlice> values(key_strs.size());
-  std::vector<Status> statuses(key_strs.size());
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 3);
-  ASSERT_OK(statuses[0]);
-  ASSERT_OK(statuses[1]);
-  ASSERT_OK(statuses[2]);
   ASSERT_EQ(values[0], "val_l0_" + std::to_string(0));
   ASSERT_EQ(values[1], "val_l0_" + std::to_string(40));
   ASSERT_EQ(values[2], "val_l0_" + std::to_string(80));
 
-  HistogramData multiget_io_batch_size;
-
-  statistics()->histogramData(MULTIGET_IO_BATCH_SIZE, &multiget_io_batch_size);
-
-  // With async IO, lookups will happen in parallel for each key
 #ifdef ROCKSDB_IOURING_PRESENT
-  if (GetParam()) {
-    ASSERT_EQ(multiget_io_batch_size.count, 1);
-    ASSERT_EQ(multiget_io_batch_size.max, 3);
+  if (UseCoroutineRead()) {
+    AssertMultiGetIOBatchSize(3, 1);
+    ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 3);
+  } else if (optimize_multiget_for_io_) {
+    AssertMultiGetIOBatchSize(1, 3);
     ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 3);
   } else {
     // Without Async IO, MultiGet will call MultiRead 3 times, once for each
     // L0 file
-    ASSERT_EQ(multiget_io_batch_size.count, 3);
+    AssertMultiGetIOBatchSize(3, 1);
   }
 #else   // ROCKSDB_IOURING_PRESENT
   ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 0);
@@ -2634,66 +4025,58 @@ TEST_P(DBMultiGetAsyncIOTest, GetFromL0) {
 }
 
 TEST_P(DBMultiGetAsyncIOTest, GetFromL1) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
-  key_strs.push_back(Key(33));
-  key_strs.push_back(Key(54));
-  key_strs.push_back(Key(102));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  keys.emplace_back(key_strs[2]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(33), Key(54), Key(102)};
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 3);
-  ASSERT_EQ(statuses[0], Status::OK());
-  ASSERT_EQ(statuses[1], Status::OK());
-  ASSERT_EQ(statuses[2], Status::OK());
   ASSERT_EQ(values[0], "val_l1_" + std::to_string(33));
   ASSERT_EQ(values[1], "val_l1_" + std::to_string(54));
   ASSERT_EQ(values[2], "val_l1_" + std::to_string(102));
 
 #ifdef ROCKSDB_IOURING_PRESENT
-  HistogramData multiget_io_batch_size;
-
-  statistics()->histogramData(MULTIGET_IO_BATCH_SIZE, &multiget_io_batch_size);
-
-#ifdef ROCKSDB_IOURING_PRESENT
-  // A batch of 3 async IOs is expected, one for each overlapping file in L1
-  ASSERT_EQ(multiget_io_batch_size.count, 1);
-  ASSERT_EQ(multiget_io_batch_size.max, 3);
-#endif  // ROCKSDB_IOURING_PRESENT
-  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 3);
+  if (UseCoroutineRead()) {
+    AssertMultiGetIOBatchSize(3, 1);
+  } else {
+    // A batch of 3 async IOs is expected, one for each overlapping file in L1.
+    AssertMultiGetIOBatchSize(1, 3);
+  }
+  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT),
+            UseCoroutineRead() ? 6 : 3);
 #else   // ROCKSDB_IOURING_PRESENT
   ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 0);
 #endif  // ROCKSDB_IOURING_PRESENT
 }
 
+TEST_P(DBMultiGetAsyncIOTest, SingleGetFromL1UsesCoroutineRead) {
+  int coroutine_read_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::ReadCoroutine:SubmitReadAsync",
+      [&](void*) { ++coroutine_read_count; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  PrepareDBForTest();
+
+  ASSERT_EQ(
+      "val_l1_" + std::to_string(33),
+      Get(Key(33), static_cast<const Snapshot*>(nullptr), use_coroutine_));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  if (UseCoroutineRead()) {
+    ASSERT_GT(coroutine_read_count, 0);
+  } else {
+    ASSERT_EQ(coroutine_read_count, 0);
+  }
+}
+
 #ifdef ROCKSDB_IOURING_PRESENT
 TEST_P(DBMultiGetAsyncIOTest, GetFromL1Error) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
-  key_strs.push_back(Key(33));
-  key_strs.push_back(Key(54));
-  key_strs.push_back(Key(102));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  keys.emplace_back(key_strs[2]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(33), Key(54), Key(102)};
 
   int count = 0;
   SyncPoint::GetInstance()->SetCallBack(
@@ -2722,147 +4105,100 @@ TEST_P(DBMultiGetAsyncIOTest, GetFromL1Error) {
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   SyncPoint::GetInstance()->DisableProcessing();
   ASSERT_EQ(values.size(), 3);
-  ASSERT_EQ(statuses[0], Status::OK());
-  ASSERT_EQ(statuses[1], Status::OK());
-  ASSERT_EQ(statuses[2], Status::IOError());
+  ASSERT_EQ(values[0], "val_l1_" + std::to_string(33));
+  ASSERT_EQ(values[1], "val_l1_" + std::to_string(54));
+  ASSERT_EQ(values[2], Status::IOError().ToString());
 
-  HistogramData multiget_io_batch_size;
-
-  statistics()->histogramData(MULTIGET_IO_BATCH_SIZE, &multiget_io_batch_size);
-
-  // A batch of 3 async IOs is expected, one for each overlapping file in L1
-  ASSERT_EQ(multiget_io_batch_size.count, 1);
-  ASSERT_EQ(multiget_io_batch_size.max, 2);
-  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 2);
+  if (UseCoroutineRead()) {
+    AssertMultiGetIOBatchSize(2, 1);
+  } else {
+    // A batch of 3 async IOs is expected, one for each overlapping file in L1.
+    AssertMultiGetIOBatchSize(1, 2);
+  }
+  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT),
+            UseCoroutineRead() ? 5 : 2);
 }
 #endif  // ROCKSDB_IOURING_PRESENT
 
 TEST_P(DBMultiGetAsyncIOTest, LastKeyInFile) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
   // 21 is the last key in the first L1 file
-  key_strs.push_back(Key(21));
-  key_strs.push_back(Key(54));
-  key_strs.push_back(Key(102));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  keys.emplace_back(key_strs[2]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(21), Key(54), Key(102)};
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 3);
-  ASSERT_EQ(statuses[0], Status::OK());
-  ASSERT_EQ(statuses[1], Status::OK());
-  ASSERT_EQ(statuses[2], Status::OK());
   ASSERT_EQ(values[0], "val_l1_" + std::to_string(21));
   ASSERT_EQ(values[1], "val_l1_" + std::to_string(54));
   ASSERT_EQ(values[2], "val_l1_" + std::to_string(102));
 
 #ifdef ROCKSDB_IOURING_PRESENT
-  HistogramData multiget_io_batch_size;
-
-  statistics()->histogramData(MULTIGET_IO_BATCH_SIZE, &multiget_io_batch_size);
-
   // Since the first MultiGet key is the last key in a file, the MultiGet is
   // expected to lookup in that file first, before moving on to other files.
   // So the first file lookup will issue one async read, and the next lookup
   // will lookup 2 files in parallel and issue 2 async reads
-  ASSERT_EQ(multiget_io_batch_size.count, 2);
-  ASSERT_EQ(multiget_io_batch_size.max, 2);
+  if (UseCoroutineRead()) {
+    AssertMultiGetIOBatchSize(3, 1);
+  } else {
+    AssertMultiGetIOBatchSize(2, 2);
+  }
 #endif  // ROCKSDB_IOURING_PRESENT
 }
 
 TEST_P(DBMultiGetAsyncIOTest, GetFromL1AndL2) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
   // 33 and 102 are in L1, and 56 is in L2
-  key_strs.push_back(Key(33));
-  key_strs.push_back(Key(56));
-  key_strs.push_back(Key(102));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  keys.emplace_back(key_strs[2]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(33), Key(56), Key(102)};
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 3);
-  ASSERT_EQ(statuses[0], Status::OK());
-  ASSERT_EQ(statuses[1], Status::OK());
-  ASSERT_EQ(statuses[2], Status::OK());
   ASSERT_EQ(values[0], "val_l1_" + std::to_string(33));
   ASSERT_EQ(values[1], "val_l2_" + std::to_string(56));
   ASSERT_EQ(values[2], "val_l1_" + std::to_string(102));
 
 #ifdef ROCKSDB_IOURING_PRESENT
-  HistogramData multiget_io_batch_size;
-
-  statistics()->histogramData(MULTIGET_IO_BATCH_SIZE, &multiget_io_batch_size);
-
   // There are 2 keys in L1 in twp separate files, and 1 in L2. With
   // optimize_multiget_for_io, all three lookups will happen in parallel.
   // Otherwise, the L2 lookup will happen after L1.
-  ASSERT_EQ(multiget_io_batch_size.count, GetParam() ? 1 : 2);
-  ASSERT_EQ(multiget_io_batch_size.max, GetParam() ? 3 : 2);
+  if (UseCoroutineRead()) {
+    AssertMultiGetIOBatchSize(3, 1);
+  } else {
+    AssertMultiGetIOBatchSize(optimize_multiget_for_io_ ? 1 : 2,
+                              optimize_multiget_for_io_ ? 3 : 2);
+  }
 #endif  // ROCKSDB_IOURING_PRESENT
 }
 
 TEST_P(DBMultiGetAsyncIOTest, GetFromL2WithRangeOverlapL0L1) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
   // 19 and 26 are in L2, but overlap with L0 and L1 file ranges
-  key_strs.push_back(Key(19));
-  key_strs.push_back(Key(26));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(19), Key(26)};
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 2);
-  ASSERT_EQ(statuses[0], Status::OK());
-  ASSERT_EQ(statuses[1], Status::OK());
   ASSERT_EQ(values[0], "val_l2_" + std::to_string(19));
   ASSERT_EQ(values[1], "val_l2_" + std::to_string(26));
 
 #ifdef ROCKSDB_IOURING_PRESENT
-  // Bloom filters in L0/L1 will avoid the coroutine calls in those levels
-  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 2);
+  // Bloom filters in L0/L1 avoid the coroutine calls in those levels. The
+  // coroutine path counts every per-file MultiGetFromSST coroutine (including
+  // serial reads), whereas the async_io path counts only the parallel overlap
+  // batch, so the coroutine path observes one more.
+  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT),
+            UseCoroutineRead() ? 3 : 2);
 #else   // ROCKSDB_IOURING_PRESENT
   ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 0);
 #endif  // ROCKSDB_IOURING_PRESENT
@@ -2870,62 +4206,35 @@ TEST_P(DBMultiGetAsyncIOTest, GetFromL2WithRangeOverlapL0L1) {
 
 #ifdef ROCKSDB_IOURING_PRESENT
 TEST_P(DBMultiGetAsyncIOTest, GetFromL2WithRangeDelInL1) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
   // 139 and 163 are in L2, but overlap with a range deletes in L1
-  key_strs.push_back(Key(139));
-  key_strs.push_back(Key(163));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(139), Key(163)};
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 2);
-  ASSERT_EQ(statuses[0], Status::NotFound());
-  ASSERT_EQ(statuses[1], Status::NotFound());
+  ASSERT_EQ(values[0], "NOT_FOUND");
+  ASSERT_EQ(values[1], "NOT_FOUND");
 
   // Bloom filters in L0/L1 will avoid the coroutine calls in those levels
   ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 2);
 }
 
 TEST_P(DBMultiGetAsyncIOTest, GetFromL1AndL2WithRangeDelInL1) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
   // 139 and 163 are in L2, but overlap with a range deletes in L1
-  key_strs.push_back(Key(139));
-  key_strs.push_back(Key(144));
-  key_strs.push_back(Key(163));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  keys.emplace_back(key_strs[2]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(139), Key(144), Key(163)};
 
   PrepareDBForTest();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
-  ASSERT_EQ(values.size(), keys.size());
-  ASSERT_EQ(statuses[0], Status::NotFound());
-  ASSERT_EQ(statuses[1], Status::OK());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
+  ASSERT_EQ(values.size(), 3);
+  ASSERT_EQ(values[0], "NOT_FOUND");
   ASSERT_EQ(values[1], "val_l1_" + std::to_string(144));
-  ASSERT_EQ(statuses[2], Status::NotFound());
+  ASSERT_EQ(values[2], "NOT_FOUND");
 
   // Bloom filters in L0/L1 will avoid the coroutine calls in those levels
   ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 3);
@@ -2933,32 +4242,18 @@ TEST_P(DBMultiGetAsyncIOTest, GetFromL1AndL2WithRangeDelInL1) {
 #endif  // ROCKSDB_IOURING_PRESENT
 
 TEST_P(DBMultiGetAsyncIOTest, GetNoIOUring) {
-  std::vector<std::string> key_strs;
-  std::vector<Slice> keys;
-  std::vector<PinnableSlice> values;
-  std::vector<Status> statuses;
-
-  key_strs.push_back(Key(33));
-  key_strs.push_back(Key(54));
-  key_strs.push_back(Key(102));
-  keys.emplace_back(key_strs[0]);
-  keys.emplace_back(key_strs[1]);
-  keys.emplace_back(key_strs[2]);
-  values.resize(keys.size());
-  statuses.resize(keys.size());
+  std::vector<std::string> key_strs{Key(33), Key(54), Key(102)};
 
   enable_io_uring = false;
   ReopenDB();
 
-  ReadOptions ro;
-  ro.async_io = true;
-  ro.optimize_multiget_for_io = GetParam();
-  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-                     keys.data(), values.data(), statuses.data());
+  std::vector<std::string> values =
+      MultiGet(key_strs, /*snapshot=*/nullptr, /*async=*/true,
+               optimize_multiget_for_io_, use_coroutine_);
   ASSERT_EQ(values.size(), 3);
-  ASSERT_EQ(statuses[0], Status::OK());
-  ASSERT_EQ(statuses[1], Status::OK());
-  ASSERT_EQ(statuses[2], Status::OK());
+  ASSERT_EQ(values[0], "val_l1_" + std::to_string(33));
+  ASSERT_EQ(values[1], "val_l1_" + std::to_string(54));
+  ASSERT_EQ(values[2], "val_l1_" + std::to_string(102));
 
   HistogramData async_read_bytes;
 
@@ -2966,11 +4261,17 @@ TEST_P(DBMultiGetAsyncIOTest, GetNoIOUring) {
 
   // A batch of 3 async IOs is expected, one for each overlapping file in L1
   ASSERT_EQ(async_read_bytes.count, 0);
-  ASSERT_EQ(statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT), 0);
+  const uint64_t coroutine_count =
+      statistics()->getTickerCount(MULTIGET_COROUTINE_COUNT);
+  if (UseCoroutineRead()) {
+    ASSERT_GT(coroutine_count, 0);
+  } else {
+    ASSERT_EQ(coroutine_count, 0);
+  }
 }
 
 INSTANTIATE_TEST_CASE_P(DBMultiGetAsyncIOTest, DBMultiGetAsyncIOTest,
-                        testing::Bool());
+                        testing::Combine(testing::Bool(), testing::Bool()));
 #endif  // USE_COROUTINES
 
 TEST_F(DBBasicTest, MultiGetStats) {
@@ -3250,9 +4551,8 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
     ASSERT_OK(Delete(std::to_string(i)));
   }
   std::vector<KeyVersion> key_versions;
-  ASSERT_OK(GetAllKeyVersions(db_, Slice(), Slice(),
-                              std::numeric_limits<size_t>::max(),
-                              &key_versions));
+  ASSERT_OK(GetAllKeyVersions(
+      db_.get(), {}, {}, std::numeric_limits<size_t>::max(), &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates, key_versions.size());
   for (size_t i = 0; i < kNumInserts + kNumDeletes + kNumUpdates; i++) {
     if (i % 3 == 0) {
@@ -3261,7 +4561,7 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
       ASSERT_EQ(key_versions[i].GetTypeName(), "TypeValue");
     }
   }
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[0], Slice(), Slice(),
+  ASSERT_OK(GetAllKeyVersions(db_.get(), handles_[0], {}, {},
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates, key_versions.size());
@@ -3276,10 +4576,17 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
   for (size_t i = 0; i + 1 != kNumDeletes; ++i) {
     ASSERT_OK(Delete(1, std::to_string(i)));
   }
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[1], Slice(), Slice(),
+  ASSERT_OK(GetAllKeyVersions(db_.get(), handles_[1], {}, {},
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates - 3, key_versions.size());
+
+  // Change from historical behavior: empty key is now interpreted literally as
+  // a legal key (rather than as a "not present" key)
+  ASSERT_OK(GetAllKeyVersions(db_.get(), handles_[1], Slice(), Slice(),
+                              std::numeric_limits<size_t>::max(),
+                              &key_versions));
+  ASSERT_EQ(key_versions.size(), 0);
 }
 
 TEST_F(DBBasicTest, ValueTypeString) {
@@ -3329,6 +4636,69 @@ TEST_F(DBBasicTest, MultiGetIOBufferOverrun) {
 
   dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
                      keys.data(), values.data(), statuses.data(), true);
+}
+
+TEST_F(DBBasicTest, MultiGetWithSnapshotsAndPersistedTier) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.atomic_flush = true;
+  DestroyAndReopen(options);
+  CreateAndReopenWithCF({"cf1", "cf2"}, options);
+
+  // Insert initial data
+  ASSERT_OK(Put(0, "key1", "value1_cf0"));
+  ASSERT_OK(Put(1, "key1", "value1_cf1"));
+  ASSERT_OK(Put(2, "key1", "value1_cf2"));
+  ASSERT_OK(Flush({0, 1, 2}));
+  for (auto cf : {0, 1, 2}) {
+    ASSERT_EQ(1, NumTableFilesAtLevel(0, cf));
+  }
+
+  ASSERT_OK(Put(0, "key1", "value2_cf0"));
+  ASSERT_OK(Put(1, "key1", "value2_cf1"));
+  ASSERT_OK(Put(2, "key1", "value2_cf2"));
+
+  // Prepare for concurrent atomic flush
+  std::atomic<bool> flush_done(false);
+  std::thread flush_thread([&]() {
+    ASSERT_OK(Flush({0, 1, 2}));
+    flush_done.store(true);
+  });
+
+  // Perform MultiGet with snapshot and read_tier = kPersistentTier
+  ReadOptions ro;
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ro.snapshot = snapshot;
+  ro.read_tier = kPersistedTier;
+
+  std::string k = "key1";
+  std::vector<Slice> keys(3, Slice(k));
+  std::vector<Status> statuses(keys.size());
+  std::vector<ColumnFamilyHandle*> cfs(keys.size());
+  std::vector<Slice> new_keys(keys.size());
+  std::vector<PinnableSlice> pin_values(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    cfs[i] = handles_[i];
+  }
+  db_->MultiGet(ro, cfs.size(), cfs.data(), keys.data(), pin_values.data(),
+                statuses.data());
+  for (const auto& s : statuses) {
+    ASSERT_OK(s);
+  }
+
+  if (pin_values[0] == "value1_cf0") {
+    // Check if the first value matches expected value
+    ASSERT_EQ(pin_values[1], "value1_cf1");
+    ASSERT_EQ(pin_values[2], "value1_cf2");
+  } else {
+    // If first value doesn't match, check if we got the updated values
+    ASSERT_EQ(pin_values[0], "value2_cf0");
+    ASSERT_EQ(pin_values[1], "value2_cf1");
+    ASSERT_EQ(pin_values[2], "value2_cf2");
+  }
+
+  flush_thread.join();
+  db_->ReleaseSnapshot(snapshot);
 }
 
 TEST_F(DBBasicTest, IncrementalRecoveryNoCorrupt) {
@@ -3405,6 +4775,46 @@ class TableFileListener : public EventListener {
  private:
   InstrumentedMutex mutex_;
   std::unordered_map<std::string, std::vector<std::string>> cf_to_paths_;
+};
+
+class FlushTableFileListener : public EventListener {
+ public:
+  void OnTableFileCreated(const TableFileCreationInfo& info) override {
+    InstrumentedMutexLock lock(&mutex_);
+    if (info.reason != TableFileCreationReason::kFlush) {
+      return;
+    }
+    cf_to_flushed_files_[info.cf_name].push_back(info.file_path);
+  }
+  std::vector<std::string>& GetFlushedFiles(const std::string& cf_name) {
+    InstrumentedMutexLock lock(&mutex_);
+    return cf_to_flushed_files_[cf_name];
+  }
+
+ private:
+  InstrumentedMutex mutex_;
+  std::unordered_map<std::string, std::vector<std::string>>
+      cf_to_flushed_files_;
+};
+
+class FlushBlobFileListener : public EventListener {
+ public:
+  void OnBlobFileCreated(const BlobFileCreationInfo& info) override {
+    InstrumentedMutexLock lock(&mutex_);
+    if (info.reason != BlobFileCreationReason::kFlush) {
+      return;
+    }
+    cf_to_flushed_blobs_files_[info.cf_name].push_back(info.file_path);
+  }
+  std::vector<std::string>& GetFlushedBlobFiles(const std::string& cf_name) {
+    InstrumentedMutexLock lock(&mutex_);
+    return cf_to_flushed_blobs_files_[cf_name];
+  }
+
+ private:
+  InstrumentedMutex mutex_;
+  std::unordered_map<std::string, std::vector<std::string>>
+      cf_to_flushed_blobs_files_;
 };
 }  // anonymous namespace
 
@@ -3510,6 +4920,121 @@ TEST_F(DBBasicTest, RecoverWithMissingFiles) {
     ASSERT_OK(iter->status());
   }
 }
+
+// Param 0: whether to enable blob DB.
+// Param 1: when blob DB is enabled, whether to also delete the missing L0
+// file's associated blob file.
+class BestEffortsRecoverIncompleteVersionTest
+    : public DBTestBase,
+      public testing::WithParamInterface<std::tuple<bool, bool>> {
+ public:
+  BestEffortsRecoverIncompleteVersionTest()
+      : DBTestBase("best_efforts_recover_incomplete_version_test",
+                   /*env_do_fsync=*/false) {}
+};
+
+TEST_P(BestEffortsRecoverIncompleteVersionTest, Basic) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = std::get<0>(GetParam());
+  bool delete_blob_file_too = std::get<1>(GetParam());
+  DestroyAndReopen(options);
+  FlushTableFileListener* flush_table_listener = new FlushTableFileListener();
+  FlushBlobFileListener* flush_blob_listener = new FlushBlobFileListener();
+  // Disable auto compaction to simplify SST file name tracking.
+  options.disable_auto_compactions = true;
+  options.listeners.emplace_back(flush_table_listener);
+  options.listeners.emplace_back(flush_blob_listener);
+  CreateAndReopenWithCF({"pikachu", "eevee"}, options);
+  std::vector<std::string> all_cf_names = {kDefaultColumnFamilyName, "pikachu",
+                                           "eevee"};
+  int num_cfs = static_cast<int>(handles_.size());
+  ASSERT_EQ(3, num_cfs);
+  std::string start = "a";
+  Slice start_slice = start;
+  std::string end = "d";
+  Slice end_slice = end;
+  for (int cf = 0; cf != num_cfs; ++cf) {
+    ASSERT_OK(Put(cf, "a", "a_value"));
+    ASSERT_OK(Flush(cf));
+    // Compact file to L1 to avoid trivial file move in the next compaction
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handles_[cf],
+                                &start_slice, &end_slice));
+    ASSERT_OK(Put(cf, "a", "a_value_new"));
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(Put(cf, "b", "b_value"));
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(Put(cf, "f", "f_value"));
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handles_[cf],
+                                &start_slice, &end_slice));
+  }
+
+  dbfull()->TEST_DeleteObsoleteFiles();
+
+  // Delete the most recent L0 file which is before a compaction.
+  for (int i = 0; i < num_cfs; ++i) {
+    std::vector<std::string>& files =
+        flush_table_listener->GetFlushedFiles(all_cf_names[i]);
+    ASSERT_EQ(4, files.size());
+    ASSERT_OK(env_->DeleteFile(files[files.size() - 1]));
+    if (options.enable_blob_files) {
+      std::vector<std::string>& blob_files =
+          flush_blob_listener->GetFlushedBlobFiles(all_cf_names[i]);
+      ASSERT_EQ(4, blob_files.size());
+      if (delete_blob_file_too) {
+        ASSERT_OK(env_->DeleteFile(blob_files[files.size() - 1]));
+      }
+    }
+  }
+  options.best_efforts_recovery = true;
+  ReopenWithColumnFamilies(all_cf_names, options);
+
+  for (int i = 0; i < num_cfs; ++i) {
+    auto cfh = static_cast<ColumnFamilyHandleImpl*>(handles_[i]);
+    ColumnFamilyData* cfd = cfh->cfd();
+    VersionStorageInfo* vstorage = cfd->current()->storage_info();
+    // The L0 file flushed right before the last compaction is missing.
+    ASSERT_EQ(0, vstorage->LevelFiles(0).size());
+    // Only the output of the last compaction is available.
+    ASSERT_EQ(1, vstorage->LevelFiles(1).size());
+  }
+  // Verify data
+  ReadOptions read_opts;
+  read_opts.total_order_seek = true;
+  for (int i = 0; i < num_cfs; ++i) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_opts, handles_[i]));
+    iter->SeekToFirst();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ("a", iter->key());
+    ASSERT_EQ("a_value_new", iter->value());
+    iter->Next();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ("b", iter->key());
+    ASSERT_EQ("b_value", iter->value());
+    iter->Next();
+    ASSERT_FALSE(iter->Valid());
+    ASSERT_OK(iter->status());
+  }
+
+  // Write more data.
+  for (int cf = 0; cf < num_cfs; ++cf) {
+    ASSERT_OK(Put(cf, "g", "g_value"));
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handles_[cf], nullptr,
+                                nullptr));
+    std::string value;
+    ASSERT_OK(db_->Get(ReadOptions(), handles_[cf], "g", &value));
+    ASSERT_EQ("g_value", value);
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(BestEffortsRecoverIncompleteVersionTest,
+                        BestEffortsRecoverIncompleteVersionTest,
+                        testing::Values(std::make_tuple(false, false),
+                                        std::make_tuple(true, false),
+                                        std::make_tuple(true, true)));
 
 TEST_F(DBBasicTest, BestEffortsRecoveryTryMultipleManifests) {
   Options options = CurrentOptions();
@@ -3628,6 +5153,75 @@ TEST_F(DBBasicTest, SkipWALIfMissingTableFiles) {
   iter->Next();
   ASSERT_FALSE(iter->Valid());
   ASSERT_OK(iter->status());
+}
+
+TEST_F(DBBasicTest, BestEffortRecoveryFailureWithTableCacheUseAfterFree) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.env = env_;
+  // Force multiple manifest files
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+
+  DestroyAndReopen(options);
+
+  // Disable file deletions to preserve old manifest files for
+  // best-efforts recovery to succeed
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  // Create multiple SST files to populate TableCache during
+  // best-efforts recovery
+  for (int i = 0; i < 10; i++) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(1000, static_cast<char>('a' + i))));
+    ASSERT_OK(Flush());
+  }
+
+  // Verify we have multiple manifest files
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  int manifest_count = 0;
+  for (const auto& file : files) {
+    if (file.find("MANIFEST") != std::string::npos) {
+      manifest_count++;
+    }
+  }
+  ASSERT_GE(manifest_count, 2);
+
+  // Inject corruption after TableCache is populated (count > 3), but only once
+  // (injected flag) to allow best-effort recovery to trigger retry and succeed.
+  // This coerce the bug: first recovery caches SSTs with reference to column
+  // family's options in table cache and retry deletes column family so the
+  // reference becomes dangling.
+  int count = 0;
+  bool injected = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        count++;
+        if (count > 3 && !injected) {
+          ASSERT_NE(nullptr, arg);
+          *(static_cast<Status*>(arg)) =
+              Status::Corruption("Injected corruption");
+          injected = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  options.best_efforts_recovery = true;
+
+  Status s = TryReopen(options);
+  ASSERT_OK(s);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  for (int i = 0; i < 10; i++) {
+    std::string value;
+    // Without the fix, ASAN detects use-after-free when accessing cached SST
+    // files that hold dangling references to deleted ioptions.
+    s = db_->Get(ReadOptions(), "key" + std::to_string(i), &value);
+    ASSERT_TRUE(s.ok() || s.IsNotFound());
+  }
 }
 
 TEST_F(DBBasicTest, DisableTrackWal) {
@@ -3953,9 +5547,9 @@ class DBBasicTestMultiGet : public DBTestBase {
   std::vector<std::string> cf_names_;
 };
 
-class DBBasicTestWithParallelIO : public DBBasicTestMultiGet,
-                                  public testing::WithParamInterface<
-                                      std::tuple<bool, bool, bool, uint32_t>> {
+class DBBasicTestWithParallelIO : public testing::WithParamInterface<
+                                      std::tuple<bool, bool, bool, uint32_t>>,
+                                  public DBBasicTestMultiGet {
  public:
   DBBasicTestWithParallelIO()
       : DBBasicTestMultiGet("/db_basic_test_with_parallel_io", 1,
@@ -4816,6 +6410,104 @@ TEST_F(DBBasicTest, VerifyFileChecksumsReadahead) {
             (sst_size + alignment - 1) / (alignment));
 }
 
+TEST_F(DBBasicTest, DisallowMemtableWrite) {
+  // This test is mostly about what you can't do with memtable writes
+  // disallowed. For what you can do, see
+  // ExternalSSTFileBasicTest.FailIfNotBottommostLevelAndDisallowMemtable
+  Options options_allow = GetDefaultOptions();
+  options_allow.create_if_missing = true;
+  Options options_disallow = options_allow;
+  options_disallow.disallow_memtable_writes = true;
+  options_disallow.paranoid_memory_checks = true;
+  options_disallow.memtable_verify_per_key_checksum_on_seek = true;
+
+  DestroyAndReopen(options_allow);
+  // CFs allowing and disallowing memtable write
+  CreateColumnFamilies({"cf1", "cf2"}, options_allow);
+  CreateColumnFamilies({"cf3"}, options_disallow);
+  // XXX: needed to get consistent handles_ mappings
+  ReopenWithColumnFamilies(
+      {"default", "cf1", "cf2", "cf3"},
+      {options_allow, options_allow, options_allow, options_disallow});
+
+  EXPECT_EQ(Put(0, "a0", "1").code(), Status::Code::kOk);
+  EXPECT_EQ(Put(1, "a1", "1").code(), Status::Code::kOk);
+  EXPECT_EQ(Put(2, "a2", "1").code(), Status::Code::kOk);
+  EXPECT_EQ(Put(3, "a3", "1").code(), Status::Code::kInvalidArgument);
+
+  EXPECT_EQ(Get(0, "a0"), "1");
+  EXPECT_EQ(Get(1, "a1"), "1");
+  EXPECT_EQ(Get(2, "a2"), "1");
+  EXPECT_EQ(Get(3, "a3"), "NOT_FOUND");
+
+  EXPECT_EQ(Delete(0, "z0").code(), Status::Code::kOk);
+  EXPECT_EQ(Delete(1, "z1").code(), Status::Code::kOk);
+  EXPECT_EQ(Delete(2, "z2").code(), Status::Code::kOk);
+  EXPECT_EQ(Delete(3, "z3").code(), Status::Code::kInvalidArgument);
+
+  WriteBatch wb;
+  EXPECT_EQ(wb.Put(handles_[0], "b0", "2").code(), Status::Code::kOk);
+  EXPECT_EQ(wb.Put(handles_[1], "b1", "2").code(), Status::Code::kOk);
+  EXPECT_EQ(wb.Put(handles_[2], "b2", "2").code(), Status::Code::kOk);
+  EXPECT_EQ(wb.Put(handles_[3], "b3", "2").code(),
+            Status::Code::kInvalidArgument);
+  ASSERT_OK(db_->Write({}, &wb));
+  wb.Clear();
+
+  EXPECT_EQ(Get(0, "b0"), "2");
+  EXPECT_EQ(Get(1, "b1"), "2");
+  EXPECT_EQ(Get(2, "b2"), "2");
+  EXPECT_EQ(Get(3, "b3"), "NOT_FOUND");
+
+  std::unique_ptr<Iterator> iter(
+      dbfull()->NewIterator(ReadOptions(), handles_[3]));
+  iter->Seek("a3");
+  ASSERT_OK(iter->status());
+  iter.reset();
+  // When the DB is re-opened with WAL entries for a CF that is newly setting
+  // disallow_memtable_writes, we detect that and fail the open gracefully.
+  ASSERT_EQ(TryReopenWithColumnFamilies(
+                {"default", "cf1", "cf2", "cf3"},
+                {options_allow, options_allow, options_disallow, options_allow})
+                .code(),
+            Status::Code::kInvalidArgument);
+
+  // Successfully opening with allow creates L0 files from the WAL
+  ReopenWithColumnFamilies({"default", "cf1", "cf2", "cf3"}, options_allow);
+
+  EXPECT_EQ(Get(0, "a0"), "1");
+  EXPECT_EQ(Get(1, "a1"), "1");
+  EXPECT_EQ(Get(2, "a2"), "1");
+  EXPECT_EQ(Get(3, "a3"), "NOT_FOUND");
+
+  // Now able to disallow on CF2 because no relevant WAL entries
+  ReopenWithColumnFamilies(
+      {"default", "cf1", "cf2", "cf3"},
+      {options_allow, options_allow, options_disallow, options_allow});
+
+  EXPECT_EQ(Get(0, "a0"), "1");
+  EXPECT_EQ(Get(1, "a1"), "1");
+  EXPECT_EQ(Get(2, "a2"), "1");
+  EXPECT_EQ(Get(3, "a3"), "NOT_FOUND");
+
+  // Now able to write to CF 3 but not CF 2
+  EXPECT_EQ(Put(0, "c0", "3").code(), Status::Code::kOk);
+  EXPECT_EQ(Put(1, "c1", "3").code(), Status::Code::kOk);
+  EXPECT_EQ(Put(2, "c2", "3").code(), Status::Code::kInvalidArgument);
+  EXPECT_EQ(Put(3, "c3", "3").code(), Status::Code::kOk);
+
+  EXPECT_EQ(Get(0, "c0"), "3");
+  EXPECT_EQ(Get(1, "c1"), "3");
+  EXPECT_EQ(Get(2, "c2"), "NOT_FOUND");
+  EXPECT_EQ(Get(3, "c3"), "3");
+
+  // disallow_memtable_writes not supported on default column family.
+  // (Would be complicated to make a WriteBatch aware of the setting in order
+  // to reject the write before entering the write path.)
+  Destroy(options_allow);
+  EXPECT_EQ(TryReopen(options_disallow).code(), Status::Code::kInvalidArgument);
+}
+
 // TODO: re-enable after we provide finer-grained control for WAL tracking to
 // meet the needs of different use cases, durability levels and recovery modes.
 TEST_F(DBBasicTest, DISABLED_ManualWalSync) {
@@ -5032,6 +6724,94 @@ INSTANTIATE_TEST_CASE_P(DBBasicTestDeadline, DBBasicTestDeadline,
                         ::testing::Values(std::make_tuple(true, false),
                                           std::make_tuple(false, true),
                                           std::make_tuple(true, true)));
+
+// FileSystemWrapper that captures FileOptions passed to NewRandomAccessFile
+// for .sst files, so we can verify file_checksum fields are populated.
+class ChecksumCapturingFS : public FileSystemWrapper {
+ public:
+  explicit ChecksumCapturingFS(const std::shared_ptr<FileSystem>& base)
+      : FileSystemWrapper(base) {}
+
+  static const char* kClassName() { return "ChecksumCapturingFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& opts,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    if (fname.find(".sst") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(mu_);
+      captured_file_checksum_ = opts.file_checksum;
+      captured_file_checksum_func_name_ = opts.file_checksum_func_name;
+      capture_count_++;
+    }
+    return target()->NewRandomAccessFile(fname, opts, result, dbg);
+  }
+
+  std::string GetCapturedFileChecksum() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return captured_file_checksum_;
+  }
+
+  std::string GetCapturedFileChecksumFuncName() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return captured_file_checksum_func_name_;
+  }
+
+  int GetCaptureCount() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return capture_count_;
+  }
+
+  void Reset() {
+    std::lock_guard<std::mutex> lock(mu_);
+    captured_file_checksum_.clear();
+    captured_file_checksum_func_name_.clear();
+    capture_count_ = 0;
+  }
+
+ private:
+  std::mutex mu_;
+  std::string captured_file_checksum_;
+  std::string captured_file_checksum_func_name_;
+  int capture_count_ = 0;
+};
+
+TEST_F(DBBasicTest, FileChecksumInFileOptions) {
+  // Verify that file_checksum and file_checksum_func_name from FileMetaData
+  // are propagated through FileOptions when opening SST files.
+  auto capturing_fs =
+      std::make_shared<ChecksumCapturingFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, capturing_fs));
+
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  options.env = env.get();
+  options.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
+  DestroyAndReopen(options);
+
+  // Write data and flush to create an SST with a file checksum.
+  ASSERT_OK(Put("key1", "value1"));
+  ASSERT_OK(Flush());
+
+  // Reset captures, then reopen to trigger TableCache SST open.
+  capturing_fs->Reset();
+  Reopen(options);
+
+  // Read to trigger SST open through TableCache::GetTableReader.
+  ASSERT_EQ("value1", Get("key1"));
+
+  // Verify that checksum fields were populated.
+  ASSERT_GT(capturing_fs->GetCaptureCount(), 0);
+  ASSERT_FALSE(capturing_fs->GetCapturedFileChecksum().empty());
+  ASSERT_NE(capturing_fs->GetCapturedFileChecksumFuncName(),
+            capturing_fs->GetCapturedFileChecksum());
+  ASSERT_EQ(capturing_fs->GetCapturedFileChecksumFuncName(),
+            "FileChecksumCrc32c");
+
+  Close();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

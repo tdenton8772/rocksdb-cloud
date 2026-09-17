@@ -44,9 +44,8 @@ InternalIteratorBase<IndexValue>* BinarySearchIndexReader::NewIterator(
     IndexBlockIter* iter, GetContext* get_context,
     BlockCacheLookupContext* lookup_context) {
   const BlockBasedTable::Rep* rep = table()->get_rep();
-  const bool no_io = (read_options.read_tier == kBlockCacheTier);
   CachableEntry<Block> index_block;
-  const Status s = GetOrReadIndexBlock(no_io, get_context, lookup_context,
+  const Status s = GetOrReadIndexBlock(get_context, lookup_context,
                                        &index_block, read_options);
   if (!s.ok()) {
     if (iter != nullptr) {
@@ -64,7 +63,8 @@ InternalIteratorBase<IndexValue>* BinarySearchIndexReader::NewIterator(
       internal_comparator()->user_comparator(),
       rep->get_global_seqno(BlockType::kIndex), iter, kNullStats, true,
       index_has_first_key(), index_key_includes_seq(), index_value_is_full(),
-      false /* block_contents_pinned */, user_defined_timestamps_persisted());
+      false /* block_contents_pinned */, user_defined_timestamps_persisted(),
+      nullptr /* prefix_index */, rep->table_options.index_block_search_type);
 
   assert(it != nullptr);
   index_block.TransferTo(it);

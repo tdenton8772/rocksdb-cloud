@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "rocksdb/env_encryption.h"
 
 #include <algorithm>
@@ -666,17 +665,52 @@ class EncryptedFileSystemImpl : public EncryptedFileSystem {
                               std::unique_ptr<FSWritableFile>* result,
                               IODebugContext* dbg) override {
     result->reset();
-    if (options.use_mmap_writes) {
+    if (options.use_mmap_reads || options.use_mmap_writes) {
       return IOStatus::InvalidArgument();
     }
+
+    size_t prefix_length = 0;
+    std::unique_ptr<BlockAccessCipherStream> stream;
+
     // Open file using underlying Env implementation
     std::unique_ptr<FSWritableFile> underlying;
-    IOStatus status =
+    auto status =
         FileSystemWrapper::ReopenWritableFile(fname, options, &underlying, dbg);
     if (!status.ok()) {
       return status;
     }
-    return CreateWritableEncryptedFile(fname, underlying, options, result, dbg);
+
+    if (underlying->GetFileSize(options.io_options, dbg) != 0) {
+      // read the cipher stream from file for non-empty file
+      std::unique_ptr<FSRandomAccessFile> underlying_file_reader;
+      status = FileSystemWrapper::NewRandomAccessFile(
+          fname, options, &underlying_file_reader, dbg);
+      if (!status.ok()) {
+        return status;
+      }
+
+      status = CreateRandomReadCipherStream(
+          fname, underlying_file_reader, options, &prefix_length, &stream, dbg);
+
+      if (!status.ok()) {
+        return status;
+      }
+    } else {
+      // create cipher stream for new or empty file
+      status = CreateWritableCipherStream(fname, underlying, options,
+                                          &prefix_length, &stream, dbg);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+
+    if (stream) {
+      result->reset(new EncryptedWritableFile(
+          std::move(underlying), std::move(stream), prefix_length));
+    } else {
+      result->reset(underlying.release());
+    }
+    return status;
   }
 
   IOStatus ReuseWritableFile(const std::string& fname,
@@ -780,6 +814,16 @@ class EncryptedFileSystemImpl : public EncryptedFileSystem {
     return status;
   }
 
+  IOStatus SyncFile(const std::string& fname, const FileOptions& file_opts,
+                    const IOOptions& io_opts, bool use_fsync,
+                    IODebugContext* dbg) override {
+    // SyncFile does not read or write file contents, so it can delegate
+    // directly to the underlying filesystem without constructing an encrypted
+    // writable wrapper.
+    return FileSystemWrapper::SyncFile(fname, file_opts, io_opts, use_fsync,
+                                       dbg);
+  }
+
  private:
   std::shared_ptr<EncryptionProvider> provider_;
 };
@@ -799,12 +843,7 @@ std::shared_ptr<FileSystem> NewEncryptedFS(
   std::unique_ptr<FileSystem> efs;
   Status s = NewEncryptedFileSystemImpl(base, provider, &efs);
   if (s.ok()) {
-    // We must call PrepareOptions() with the Env pointing to
-    // the correct base FileSystem.
-    auto env = CompositeEnvWrapper(Env::Default(), base);
-    ConfigOptions opt;
-    opt.env = &env;
-    s = efs->PrepareOptions(opt);
+    s = efs->PrepareOptions(ConfigOptions());
   }
   if (s.ok()) {
     std::shared_ptr<FileSystem> result(efs.release());
@@ -1192,6 +1231,5 @@ Status EncryptionProvider::CreateFromString(
   RegisterEncryptionBuiltins();
   return LoadSharedObject<EncryptionProvider>(config_options, value, result);
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE

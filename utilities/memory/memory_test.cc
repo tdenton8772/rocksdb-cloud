@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "db/db_impl/db_impl.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/table.h"
@@ -25,7 +24,9 @@ class MemoryTest : public testing::Test {
 
   std::string GetDBName(int id) { return kDbDir + "db_" + std::to_string(id); }
 
-  void UpdateUsagesHistory(const std::vector<DB*>& dbs) {
+  using DBVec = std::vector<std::unique_ptr<DB>>;
+
+  void UpdateUsagesHistory(const DBVec& dbs) {
     std::map<MemoryUtil::UsageType, uint64_t> usage_by_type;
     ASSERT_OK(GetApproximateMemoryUsageByType(dbs, &usage_by_type));
     for (int i = 0; i < MemoryUtil::kNumUsageTypes; ++i) {
@@ -34,25 +35,17 @@ class MemoryTest : public testing::Test {
     }
   }
 
-  void GetCachePointersFromTableFactory(
-      const TableFactory* factory,
-      std::unordered_set<const Cache*>* cache_set) {
-    const auto bbto = factory->GetOptions<BlockBasedTableOptions>();
-    if (bbto != nullptr) {
-      cache_set->insert(bbto->block_cache.get());
-    }
-  }
-
-  void GetCachePointers(const std::vector<DB*>& dbs,
+  void GetCachePointers(const DBVec& dbs,
                         std::unordered_set<const Cache*>* cache_set) {
     cache_set->clear();
 
-    for (auto* db : dbs) {
+    for (auto& db : dbs) {
       assert(db);
 
       // Cache from DBImpl
-      StackableDB* sdb = dynamic_cast<StackableDB*>(db);
-      DBImpl* db_impl = dynamic_cast<DBImpl*>(sdb ? sdb->GetBaseDB() : db);
+      StackableDB* sdb = dynamic_cast<StackableDB*>(db.get());
+      DBImpl* db_impl =
+          dynamic_cast<DBImpl*>(sdb ? sdb->GetBaseDB() : db.get());
       if (db_impl != nullptr) {
         cache_set->insert(db_impl->TEST_table_cache());
       }
@@ -61,19 +54,14 @@ class MemoryTest : public testing::Test {
       cache_set->insert(db->GetDBOptions().row_cache.get());
 
       // Cache from table factories
-      std::unordered_map<std::string, const ImmutableCFOptions*> iopts_map;
       if (db_impl != nullptr) {
-        ASSERT_OK(db_impl->TEST_GetAllImmutableCFOptions(&iopts_map));
-      }
-      for (const auto& pair : iopts_map) {
-        GetCachePointersFromTableFactory(pair.second->table_factory.get(),
-                                         cache_set);
+        db_impl->TEST_GetAllBlockCaches(cache_set);
       }
     }
   }
 
   Status GetApproximateMemoryUsageByType(
-      const std::vector<DB*>& dbs,
+      const DBVec& dbs,
       std::map<MemoryUtil::UsageType, uint64_t>* usage_by_type) {
     std::unordered_set<const Cache*> cache_set;
     GetCachePointers(dbs, &cache_set);
@@ -88,7 +76,7 @@ class MemoryTest : public testing::Test {
 };
 
 TEST_F(MemoryTest, SharedBlockCacheTotal) {
-  std::vector<DB*> dbs;
+  std::vector<std::unique_ptr<DB>> dbs;
   std::vector<uint64_t> usage_by_type;
   const int kNumDBs = 10;
   const int kKeySize = 100;
@@ -103,9 +91,7 @@ TEST_F(MemoryTest, SharedBlockCacheTotal) {
   bbt_opts.block_cache = NewLRUCache(4096 * 1000 * 10);
   for (int i = 0; i < kNumDBs; ++i) {
     ASSERT_OK(DestroyDB(GetDBName(i), opt));
-    DB* db = nullptr;
-    ASSERT_OK(DB::Open(opt, GetDBName(i), &db));
-    dbs.push_back(db);
+    ASSERT_OK(DB::Open(opt, GetDBName(i), &dbs.emplace_back()));
   }
 
   std::vector<std::string> keys_by_db[kNumDBs];
@@ -134,13 +120,10 @@ TEST_F(MemoryTest, SharedBlockCacheTotal) {
     ASSERT_EQ(usage_history_[MemoryUtil::kTableReadersTotal][i],
               usage_history_[MemoryUtil::kTableReadersTotal][i - 1]);
   }
-  for (int i = 0; i < kNumDBs; ++i) {
-    delete dbs[i];
-  }
 }
 
 TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
-  std::vector<DB*> dbs;
+  std::vector<std::unique_ptr<DB>> dbs;
   std::vector<uint64_t> usage_by_type;
   std::vector<std::vector<ColumnFamilyHandle*>> vec_handles;
   const int kNumDBs = 10;
@@ -165,10 +148,9 @@ TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
   for (int i = 0; i < kNumDBs; ++i) {
     ASSERT_OK(DestroyDB(GetDBName(i), opt));
     std::vector<ColumnFamilyHandle*> handles;
-    dbs.emplace_back();
     vec_handles.emplace_back();
     ASSERT_OK(DB::Open(DBOptions(opt), GetDBName(i), cf_descs,
-                       &vec_handles.back(), &dbs.back()));
+                       &vec_handles.back(), &dbs.emplace_back()));
   }
 
   // Fill one memtable per Put to make memtable use more memory.
@@ -252,7 +234,6 @@ TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
     for (auto* handle : vec_handles[i]) {
       delete handle;
     }
-    delete dbs[i];
   }
 }
 }  // namespace ROCKSDB_NAMESPACE
@@ -266,4 +247,3 @@ int main(int argc, char** argv) {
   return 0;
 #endif
 }
-

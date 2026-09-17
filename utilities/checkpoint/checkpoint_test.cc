@@ -13,6 +13,8 @@
 #ifndef OS_WIN
 #include <unistd.h>
 #endif
+#include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 #include <utility>
@@ -23,6 +25,12 @@
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/file_system.h"
+#include "rocksdb/metadata.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/sst_file_manager.h"
+#include "rocksdb/statistics.h"
+#include "rocksdb/utilities/backup_engine.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
@@ -43,7 +51,7 @@ class CheckpointTest : public testing::Test {
   std::string dbname_;
   std::string alternative_wal_dir_;
   Env* env_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   Options last_options_;
   std::vector<ColumnFamilyHandle*> handles_;
   std::string snapshot_name_;
@@ -62,7 +70,7 @@ class CheckpointTest : public testing::Test {
     EXPECT_OK(DestroyDB(dbname_, delete_options));
     // Destroy it for not alternative WAL dir is used.
     EXPECT_OK(DestroyDB(dbname_, options));
-    db_ = nullptr;
+    db_.reset();
     snapshot_name_ = test::PerThreadDBPath(env_, "snapshot");
     std::string snapshot_tmp_name = snapshot_name_ + ".tmp";
     EXPECT_OK(DestroyDB(snapshot_name_, options));
@@ -98,6 +106,8 @@ class CheckpointTest : public testing::Test {
     EXPECT_OK(DestroyDB(snapshot_name_, options));
     DestroyDir(env_, export_path_).PermitUncheckedError();
   }
+
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
 
   // Return the current option configuration.
   Options CurrentOptions() {
@@ -167,8 +177,7 @@ class CheckpointTest : public testing::Test {
       delete h;
     }
     handles_.clear();
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
   }
 
   void DestroyAndReopen(const Options& options) {
@@ -253,19 +262,24 @@ class CheckpointTest : public testing::Test {
     }
     return result;
   }
+
+  int NumTableFilesAtLevel(int level) {
+    std::string property;
+    EXPECT_TRUE(db_->GetProperty(
+        "rocksdb.num-files-at-level" + std::to_string(level), &property));
+    return atoi(property.c_str());
+  }
 };
 
 TEST_F(CheckpointTest, GetSnapshotLink) {
   for (uint64_t log_size_for_flush : {0, 1000000}) {
     Options options;
-    DB* snapshotDB;
     ReadOptions roptions;
     std::string result;
     Checkpoint* checkpoint;
 
     options = CurrentOptions();
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     ASSERT_OK(DestroyDB(dbname_, options));
 
     // Create a database
@@ -274,7 +288,7 @@ TEST_F(CheckpointTest, GetSnapshotLink) {
     std::string key = std::string("foo");
     ASSERT_OK(Put(key, "v1"));
     // Take a snapshot
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
     ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, log_size_for_flush));
     ASSERT_OK(Put(key, "v2"));
     ASSERT_EQ("v2", Get(key));
@@ -282,13 +296,12 @@ TEST_F(CheckpointTest, GetSnapshotLink) {
     ASSERT_EQ("v2", Get(key));
     // Open snapshot and verify contents while DB is running
     options.create_if_missing = false;
+    std::unique_ptr<DB> snapshotDB;
     ASSERT_OK(DB::Open(options, snapshot_name_, &snapshotDB));
     ASSERT_OK(snapshotDB->Get(roptions, key, &result));
     ASSERT_EQ("v1", result);
-    delete snapshotDB;
-    snapshotDB = nullptr;
-    delete db_;
-    db_ = nullptr;
+    snapshotDB.reset();
+    db_.reset();
 
     // Destroy original DB
     ASSERT_OK(DestroyDB(dbname_, options));
@@ -298,8 +311,7 @@ TEST_F(CheckpointTest, GetSnapshotLink) {
     dbname_ = snapshot_name_;
     ASSERT_OK(DB::Open(options, dbname_, &db_));
     ASSERT_EQ("v1", Get(key));
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     ASSERT_OK(DestroyDB(dbname_, options));
     delete checkpoint;
 
@@ -325,7 +337,7 @@ TEST_F(CheckpointTest, CheckpointWithBlob) {
 
   // Create a checkpoint
   Checkpoint* checkpoint = nullptr;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
 
   std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
 
@@ -350,10 +362,8 @@ TEST_F(CheckpointTest, CheckpointWithBlob) {
 
   // Make sure the checkpoint can be opened and the blob value read
   options.create_if_missing = false;
-  DB* checkpoint_db = nullptr;
+  std::unique_ptr<DB> checkpoint_db;
   ASSERT_OK(DB::Open(options, snapshot_name_, &checkpoint_db));
-
-  std::unique_ptr<DB> checkpoint_db_guard(checkpoint_db);
 
   PinnableSlice value;
   ASSERT_OK(checkpoint_db->Get(
@@ -383,7 +393,7 @@ TEST_F(CheckpointTest, ExportColumnFamilyWithLinks) {
     ASSERT_OK(Put(key, "v1"));
 
     Checkpoint* checkpoint;
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
 
     // Export the Tables and verify
     ASSERT_OK(checkpoint->ExportColumnFamily(db_->DefaultColumnFamily(),
@@ -417,7 +427,7 @@ TEST_F(CheckpointTest, ExportColumnFamilyWithLinks) {
     ASSERT_OK(db_->Put(WriteOptions(), cfh_reverse_comp_, key, "v1"));
 
     Checkpoint* checkpoint;
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
 
     // Export the Tables and verify
     ASSERT_OK(checkpoint->ExportColumnFamily(cfh_reverse_comp_, export_path_,
@@ -427,6 +437,28 @@ TEST_F(CheckpointTest, ExportColumnFamilyWithLinks) {
               ReverseBytewiseComparator()->Name());
     delete checkpoint;
   }
+}
+
+TEST_F(CheckpointTest, ExportEmptyColumnFamily) {
+  // Verify that exporting a column family with no levels (empty CF) does not
+  // leak the allocated ExportImportFilesMetaData and correctly sets *metadata.
+  auto options = CurrentOptions();
+  options.create_if_missing = true;
+  CreateAndReopenWithCF({}, options);
+
+  // Do NOT put any data -- the default CF has no levels.
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+
+  ASSERT_OK(checkpoint->ExportColumnFamily(db_->DefaultColumnFamily(),
+                                           export_path_, &metadata_));
+  // metadata_ must be set even when the CF has no files.
+  ASSERT_NE(metadata_, nullptr);
+  ASSERT_EQ(metadata_->files.size(), 0);
+  ASSERT_EQ(metadata_->db_comparator_name, options.comparator->Name());
+
+  delete checkpoint;
 }
 
 TEST_F(CheckpointTest, ExportColumnFamilyNegativeTest) {
@@ -439,7 +471,7 @@ TEST_F(CheckpointTest, ExportColumnFamilyNegativeTest) {
   ASSERT_OK(Put(key, "v1"));
 
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
 
   // Export onto existing directory
   ASSERT_OK(env_->CreateDirIfMissing(export_path_));
@@ -472,7 +504,6 @@ TEST_F(CheckpointTest, CheckpointCF) {
   ASSERT_OK(Put(4, "four", "four"));
   ASSERT_OK(Put(5, "five", "five"));
 
-  DB* snapshotDB;
   ReadOptions roptions;
   std::string result;
   std::vector<ColumnFamilyHandle*> cphandles;
@@ -480,7 +511,7 @@ TEST_F(CheckpointTest, CheckpointCF) {
   // Take a snapshot
   ROCKSDB_NAMESPACE::port::Thread t([&]() {
     Checkpoint* checkpoint;
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
     ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
     delete checkpoint;
   });
@@ -509,6 +540,7 @@ TEST_F(CheckpointTest, CheckpointCF) {
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options);
   }
+  std::unique_ptr<DB> snapshotDB;
   ASSERT_OK(DB::Open(options, snapshot_name_, column_families, &cphandles,
                      &snapshotDB));
   ASSERT_OK(snapshotDB->Get(roptions, cphandles[0], "Default", &result));
@@ -520,8 +552,7 @@ TEST_F(CheckpointTest, CheckpointCF) {
     delete h;
   }
   cphandles.clear();
-  delete snapshotDB;
-  snapshotDB = nullptr;
+  snapshotDB.reset();
 }
 
 TEST_F(CheckpointTest, CheckpointCFNoFlush) {
@@ -535,7 +566,6 @@ TEST_F(CheckpointTest, CheckpointCFNoFlush) {
   ASSERT_OK(Flush());
   ASSERT_OK(Put(2, "two", "two"));
 
-  DB* snapshotDB;
   ReadOptions roptions;
   std::string result;
   std::vector<ColumnFamilyHandle*> cphandles;
@@ -548,7 +578,7 @@ TEST_F(CheckpointTest, CheckpointCFNoFlush) {
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, 1000000));
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 
@@ -567,6 +597,7 @@ TEST_F(CheckpointTest, CheckpointCFNoFlush) {
   for (size_t i = 0; i < cfs.size(); ++i) {
     column_families.emplace_back(cfs[i], options);
   }
+  std::unique_ptr<DB> snapshotDB;
   ASSERT_OK(DB::Open(options, snapshot_name_, column_families, &cphandles,
                      &snapshotDB));
   ASSERT_OK(snapshotDB->Get(roptions, cphandles[0], "Default", &result));
@@ -579,13 +610,13 @@ TEST_F(CheckpointTest, CheckpointCFNoFlush) {
     delete h;
   }
   cphandles.clear();
-  delete snapshotDB;
-  snapshotDB = nullptr;
+  snapshotDB.reset();
 }
 
 TEST_F(CheckpointTest, CurrentFileModifiedWhileCheckpointing) {
   Options options = CurrentOptions();
   options.max_manifest_file_size = 0;  // always rollover manifest for file add
+  options.max_manifest_space_amp_pct = 0;
   Reopen(options);
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
@@ -604,7 +635,7 @@ TEST_F(CheckpointTest, CurrentFileModifiedWhileCheckpointing) {
 
   ROCKSDB_NAMESPACE::port::Thread t([&]() {
     Checkpoint* checkpoint;
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
     ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
     delete checkpoint;
   });
@@ -616,12 +647,10 @@ TEST_F(CheckpointTest, CurrentFileModifiedWhileCheckpointing) {
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 
-  DB* snapshotDB;
   // Successful Open() implies that CURRENT pointed to the manifest in the
   // checkpoint.
+  std::unique_ptr<DB> snapshotDB;
   ASSERT_OK(DB::Open(options, snapshot_name_, &snapshotDB));
-  delete snapshotDB;
-  snapshotDB = nullptr;
 }
 
 TEST_F(CheckpointTest, CurrentFileModifiedWhileCheckpointing2PC) {
@@ -741,7 +770,7 @@ TEST_F(CheckpointTest, CurrentFileModifiedWhileCheckpointing2PC) {
 TEST_F(CheckpointTest, CheckpointInvalidDirectoryName) {
   for (std::string checkpoint_dir : {"", "/", "////"}) {
     Checkpoint* checkpoint;
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+    ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
     ASSERT_TRUE(
         checkpoint->CreateCheckpoint(checkpoint_dir).IsInvalidArgument());
     delete checkpoint;
@@ -754,80 +783,86 @@ TEST_F(CheckpointTest, CheckpointWithParallelWrites) {
   ASSERT_OK(Put("key1", "val1"));
   port::Thread thread([this]() { ASSERT_OK(Put("key2", "val2")); });
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
   delete checkpoint;
   thread.join();
 }
 
-TEST_F(CheckpointTest, CheckpointWithUnsyncedDataDropped) {
+class CheckpointTestWithWalParams
+    : public CheckpointTest,
+      public testing::WithParamInterface<
+          std::tuple<uint64_t, bool, bool, bool>> {
+ public:
+  uint64_t GetLogSizeForFlush() { return std::get<0>(GetParam()); }
+  bool GetWalsInManifest() { return std::get<1>(GetParam()); }
+  bool GetManualWalFlush() { return std::get<2>(GetParam()); }
+  bool GetBackgroundCloseInactiveWals() { return std::get<3>(GetParam()); }
+};
+
+INSTANTIATE_TEST_CASE_P(NormalWalParams, CheckpointTestWithWalParams,
+                        ::testing::Combine(::testing::Values(0U, 100000000U),
+                                           ::testing::Bool(), ::testing::Bool(),
+                                           ::testing::Values(false)));
+
+INSTANTIATE_TEST_CASE_P(DeprecatedWalParams, CheckpointTestWithWalParams,
+                        ::testing::Values(std::make_tuple(100000000U, true,
+                                                          false, true)));
+
+TEST_P(CheckpointTestWithWalParams, CheckpointWithUnsyncedDataDropped) {
   Options options = CurrentOptions();
-  std::unique_ptr<FaultInjectionTestEnv> env(new FaultInjectionTestEnv(env_));
-  options.env = env.get();
+  options.max_write_buffer_number = 4;
+  options.track_and_verify_wals_in_manifest = GetWalsInManifest();
+  options.manual_wal_flush = GetManualWalFlush();
+  options.background_close_inactive_wals = GetBackgroundCloseInactiveWals();
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(fault_fs));
+
+  if (options.background_close_inactive_wals) {
+    // Disable this hygiene check when the fix is disabled
+    fault_fs->SetAllowLinkOpenFile();
+  }
+
+  options.env = fault_fs_env.get();
   Reopen(options);
   ASSERT_OK(Put("key1", "val1"));
+  if (GetLogSizeForFlush() > 0) {
+    // When not flushing memtable for checkpoint, this is the simplest way
+    // to get
+    // * one inactive WAL, synced
+    // * one inactive WAL, not synced, and
+    // * one active WAL, not synced
+    // with a single thread, so that we have at least one that can be hard
+    // linked, etc.
+    ASSERT_OK(dbfull()->PauseBackgroundWork());
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+    ASSERT_OK(db_->SyncWAL());
+  }
+  ASSERT_OK(Put("key2", "val2"));
+  if (GetLogSizeForFlush() > 0) {
+    ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  }
+  ASSERT_OK(Put("key3", "val3"));
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
-  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, GetLogSizeForFlush()));
   delete checkpoint;
-  ASSERT_OK(env->DropUnsyncedFileData());
-
+  ASSERT_OK(fault_fs->DropUnsyncedFileData());
   // make sure it's openable even though whatever data that wasn't synced got
   // dropped.
   options.env = env_;
-  DB* snapshot_db;
+  std::unique_ptr<DB> snapshot_db;
   ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
   ReadOptions read_opts;
   std::string get_result;
   ASSERT_OK(snapshot_db->Get(read_opts, "key1", &get_result));
   ASSERT_EQ("val1", get_result);
-  delete snapshot_db;
-  delete db_;
-  db_ = nullptr;
-}
-
-TEST_F(CheckpointTest, CheckpointOptionsFileFailedToPersist) {
-  // Regression test for a bug where checkpoint failed on a DB where persisting
-  // OPTIONS file failed and the DB was opened with
-  // `fail_if_options_file_error == false`.
-  Options options = CurrentOptions();
-  options.fail_if_options_file_error = false;
-  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
-
-  // Setup `FaultInjectionTestFS` and `SyncPoint` callbacks to fail one
-  // operation when inside the OPTIONS file persisting code.
-  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(fault_fs));
-  fault_fs->SetRandomMetadataWriteError(1 /* one_in */);
-  SyncPoint::GetInstance()->SetCallBack(
-      "PersistRocksDBOptions:start", [fault_fs](void* /* arg */) {
-        fault_fs->EnableMetadataWriteErrorInjection();
-      });
-  SyncPoint::GetInstance()->SetCallBack(
-      "FaultInjectionTestFS::InjectMetadataWriteError:Injected",
-      [fault_fs](void* /* arg */) {
-        fault_fs->DisableMetadataWriteErrorInjection();
-      });
-  options.env = fault_fs_env.get();
-  SyncPoint::GetInstance()->EnableProcessing();
-
-  Reopen(options);
-  ASSERT_OK(Put("key1", "val1"));
-  Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
-  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
-  delete checkpoint;
-
-  // Make sure it's usable.
-  options.env = env_;
-  DB* snapshot_db;
-  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
-  ReadOptions read_opts;
-  std::string get_result;
-  ASSERT_OK(snapshot_db->Get(read_opts, "key1", &get_result));
-  ASSERT_EQ("val1", get_result);
-  delete snapshot_db;
-  delete db_;
-  db_ = nullptr;
+  ASSERT_OK(snapshot_db->Get(read_opts, "key2", &get_result));
+  ASSERT_EQ("val2", get_result);
+  ASSERT_OK(snapshot_db->Get(read_opts, "key3", &get_result));
+  ASSERT_EQ("val3", get_result);
+  snapshot_db.reset();
+  db_.reset();
 }
 
 TEST_F(CheckpointTest, CheckpointReadOnlyDB) {
@@ -837,18 +872,17 @@ TEST_F(CheckpointTest, CheckpointReadOnlyDB) {
   Options options = CurrentOptions();
   ASSERT_OK(ReadOnlyReopen(options));
   Checkpoint* checkpoint = nullptr;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
   delete checkpoint;
   checkpoint = nullptr;
   Close();
-  DB* snapshot_db = nullptr;
+  std::unique_ptr<DB> snapshot_db;
   ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
   ReadOptions read_opts;
   std::string get_result;
   ASSERT_OK(snapshot_db->Get(read_opts, "foo", &get_result));
   ASSERT_EQ("foo_value", get_result);
-  delete snapshot_db;
 }
 
 TEST_F(CheckpointTest, CheckpointWithLockWAL) {
@@ -858,7 +892,7 @@ TEST_F(CheckpointTest, CheckpointWithLockWAL) {
   ASSERT_OK(db_->LockWAL());
 
   Checkpoint* checkpoint = nullptr;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
   delete checkpoint;
   checkpoint = nullptr;
@@ -866,13 +900,99 @@ TEST_F(CheckpointTest, CheckpointWithLockWAL) {
   ASSERT_OK(db_->UnlockWAL());
   Close();
 
-  DB* snapshot_db = nullptr;
+  std::unique_ptr<DB> snapshot_db;
   ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
   ReadOptions read_opts;
   std::string get_result;
   ASSERT_OK(snapshot_db->Get(read_opts, "foo", &get_result));
   ASSERT_EQ("foo_value", get_result);
-  delete snapshot_db;
+}
+
+TEST_F(CheckpointTest, CheckpointWithLockWALNoWALSameThreadAborted) {
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(db_->Put(write_options, "foo", "foo_value"));
+  ASSERT_OK(db_->LockWAL());
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_holder(checkpoint);
+
+  Status s = checkpoint->CreateCheckpoint(snapshot_name_);
+  ASSERT_TRUE(s.IsAborted()) << s.ToString();
+  ASSERT_NE(s.ToString().find("Likely deadlock"), std::string::npos)
+      << s.ToString();
+
+  ASSERT_OK(db_->UnlockWAL());
+}
+
+TEST_F(CheckpointTest, CheckpointWithLockWALNoWALCrossThreadFlushes) {
+  Options options = CurrentOptions();
+  WriteOptions write_options;
+  write_options.disableWAL = true;
+  ASSERT_OK(db_->Put(write_options, "foo", "foo_value"));
+  ASSERT_OK(db_->LockWAL());
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_holder(checkpoint);
+
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::WaitForPendingWrites:BeforeBlock",
+        "CheckpointTest::CheckpointWithLockWALNoWALCrossThreadFlushes:"
+        "BeforeUnlock"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::atomic<bool> checkpoint_done{false};
+  Status checkpoint_status;
+  port::Thread checkpoint_thread([&]() {
+    checkpoint_status = checkpoint->CreateCheckpoint(snapshot_name_);
+    checkpoint_done.store(true);
+  });
+
+  TEST_SYNC_POINT(
+      "CheckpointTest::CheckpointWithLockWALNoWALCrossThreadFlushes:"
+      "BeforeUnlock");
+  const bool finished_early = checkpoint_done.load();
+  Status unlock_status = db_->UnlockWAL();
+  checkpoint_thread.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->LoadDependency({});
+
+  ASSERT_OK(unlock_status);
+  ASSERT_FALSE(finished_early) << checkpoint_status.ToString();
+  ASSERT_OK(checkpoint_status);
+  Close();
+
+  std::unique_ptr<DB> snapshot_db;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
+  ReadOptions read_opts;
+  std::string get_result;
+  ASSERT_OK(snapshot_db->Get(read_opts, "foo", &get_result));
+  ASSERT_EQ("foo_value", get_result);
+}
+
+TEST_F(CheckpointTest, CheckpointWithLockWALRejectsBlobDirectWrite) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_direct_write = true;
+  options.allow_concurrent_memtable_write = false;
+  options.min_blob_size = 32;
+  Reopen(options);
+
+  ASSERT_OK(Put("foo", std::string(128, 'b')));
+  ASSERT_OK(db_->LockWAL());
+
+  Checkpoint* checkpoint = nullptr;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  std::unique_ptr<Checkpoint> checkpoint_holder(checkpoint);
+
+  Status s = checkpoint->CreateCheckpoint(snapshot_name_);
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(s.ToString().find("Blob direct write"), std::string::npos)
+      << s.ToString();
+
+  ASSERT_OK(db_->UnlockWAL());
 }
 
 TEST_F(CheckpointTest, CheckpointReadOnlyDBWithMultipleColumnFamilies) {
@@ -887,7 +1007,7 @@ TEST_F(CheckpointTest, CheckpointReadOnlyDBWithMultipleColumnFamilies) {
       {kDefaultColumnFamilyName, "pikachu", "eevee"}, options);
   ASSERT_OK(s);
   Checkpoint* checkpoint = nullptr;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
   delete checkpoint;
   checkpoint = nullptr;
@@ -897,7 +1017,7 @@ TEST_F(CheckpointTest, CheckpointReadOnlyDBWithMultipleColumnFamilies) {
       {kDefaultColumnFamilyName, options},
       {"pikachu", options},
       {"eevee", options}};
-  DB* snapshot_db = nullptr;
+  std::unique_ptr<DB> snapshot_db;
   std::vector<ColumnFamilyHandle*> snapshot_handles;
   s = DB::Open(options, snapshot_name_, column_families, &snapshot_handles,
                &snapshot_db);
@@ -914,7 +1034,6 @@ TEST_F(CheckpointTest, CheckpointReadOnlyDBWithMultipleColumnFamilies) {
     delete snapshot_h;
   }
   snapshot_handles.clear();
-  delete snapshot_db;
 }
 
 TEST_F(CheckpointTest, CheckpointWithDbPath) {
@@ -924,55 +1043,645 @@ TEST_F(CheckpointTest, CheckpointWithDbPath) {
   ASSERT_OK(Put("key1", "val1"));
   ASSERT_OK(Flush());
   Checkpoint* checkpoint;
-  ASSERT_OK(Checkpoint::Create(db_, &checkpoint));
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   // Currently not supported
   ASSERT_TRUE(checkpoint->CreateCheckpoint(snapshot_name_).IsNotSupported());
   delete checkpoint;
 }
 
-TEST_F(CheckpointTest, PutRaceWithCheckpointTrackedWalSync) {
-  // Repro for a race condition where a user write comes in after the checkpoint
-  // syncs WAL for `track_and_verify_wals_in_manifest` but before the
-  // corresponding MANIFEST update. With the bug, that scenario resulted in an
-  // unopenable DB with error "Corruption: Size mismatch: WAL ...".
-  Options options = CurrentOptions();
-  std::unique_ptr<FaultInjectionTestEnv> fault_env(
-      new FaultInjectionTestEnv(env_));
-  options.env = fault_env.get();
-  options.track_and_verify_wals_in_manifest = true;
-  Reopen(options);
-
-  ASSERT_OK(Put("key1", "val1"));
-
-  SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncWAL:BeforeMarkLogsSynced:1",
-      [this](void* /* arg */) { ASSERT_OK(Put("key2", "val2")); });
+TEST_F(CheckpointTest, CheckpointWithArchievedLog) {
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
+      {{"WalManager::ArchiveWALFile",
+        "CheckpointTest:CheckpointWithArchievedLog"}});
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  Options options = CurrentOptions();
+  options.WAL_ttl_seconds = 3600;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
 
-  std::unique_ptr<Checkpoint> checkpoint;
-  {
-    Checkpoint* checkpoint_ptr;
-    ASSERT_OK(Checkpoint::Create(db_, &checkpoint_ptr));
-    checkpoint.reset(checkpoint_ptr);
+  ASSERT_OK(Put("key1", std::string(1024 * 1024, 'a')));
+  // flush and archive the first log
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key2", std::string(1024, 'a')));
+
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  TEST_SYNC_POINT("CheckpointTest:CheckpointWithArchievedLog");
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_, 1024 * 1024));
+  // unflushed log size < 1024 * 1024 < total file size including archived log,
+  // so flush shouldn't occur, there is only one file at level 0
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  delete checkpoint;
+  checkpoint = nullptr;
+
+  std::unique_ptr<DB> snapshot_db;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
+  ReadOptions read_opts;
+  std::string get_result;
+  ASSERT_OK(snapshot_db->Get(read_opts, "key1", &get_result));
+  ASSERT_EQ(std::string(1024 * 1024, 'a'), get_result);
+  get_result.clear();
+  ASSERT_OK(snapshot_db->Get(read_opts, "key2", &get_result));
+  ASSERT_EQ(std::string(1024, 'a'), get_result);
+}
+
+class CheckpointDestroyTest : public CheckpointTest,
+                              public testing::WithParamInterface<bool> {};
+
+TEST_P(CheckpointDestroyTest, DisableEnableSlowDeletion) {
+  bool slow_deletion = GetParam();
+  Options options = CurrentOptions();
+  options.num_levels = 2;
+  options.disable_auto_compactions = true;
+  Status s;
+  options.sst_file_manager.reset(NewSstFileManager(
+      options.env, options.info_log, "", slow_deletion ? 1024 * 1024 : 0,
+      false /* delete_existing_trash */, &s, 1));
+  ASSERT_OK(s);
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("foo", "a"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("bar", "b"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  for (int i = 0; i < 10; i++) {
+    ASSERT_OK(Put("bar", "val" + std::to_string(i)));
+    ASSERT_OK(Flush());
   }
+  ASSERT_EQ(NumTableFilesAtLevel(0), 10);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 2);
 
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
   ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
 
-  // Ensure callback ran.
-  ASSERT_EQ("val2", Get("key2"));
+  delete checkpoint;
+  checkpoint = nullptr;
 
-  Close();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(1), 2);
 
-  // Simulate full loss of unsynced data. This drops "key2" -> "val2" from the
-  // DB WAL.
-  ASSERT_OK(fault_env->DropUnsyncedFileData());
+  std::unique_ptr<DB> snapshot_db;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
+  ReadOptions read_opts;
+  std::string get_result;
+  ASSERT_OK(snapshot_db->Get(read_opts, "foo", &get_result));
+  ASSERT_EQ("a", get_result);
+  ASSERT_OK(snapshot_db->Get(read_opts, "bar", &get_result));
+  ASSERT_EQ("val9", get_result);
+  snapshot_db.reset();
 
-  // Before the bug fix, reopening the DB would fail because the MANIFEST's
-  // AddWal entry indicated the WAL should be synced through "key2" -> "val2".
+  // Make sure original obsolete files for hard linked files are all deleted.
+  dbfull()->TEST_DeleteObsoleteFiles();
+  auto sfm = static_cast_with_check<SstFileManagerImpl>(
+      options.sst_file_manager.get());
+  ASSERT_NE(nullptr, sfm);
+  sfm->WaitForEmptyTrash();
+  // SST file 2-12 for "bar" will be compacted into one file on L1 during the
+  // compaction  after checkpoint is created. SST file 1 on L1: foo, seq:
+  // 1 (hard links is 1 after checkpoint destroy)
+  std::atomic<int> bg_delete_sst{0};
+  std::atomic<int> fg_delete_sst{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DeleteScheduler::DeleteFile::cb", [&](void* arg) {
+        ASSERT_NE(nullptr, arg);
+        auto file_name = *static_cast<std::string*>(arg);
+        if (file_name.size() >= 4 &&
+            file_name.compare(file_name.size() - 4, 4, ".sst") == 0) {
+          fg_delete_sst.fetch_add(1);
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DeleteScheduler::DeleteTrashFile::cb", [&](void* arg) {
+        ASSERT_NE(nullptr, arg);
+        auto file_name = *static_cast<std::string*>(arg);
+        if (file_name.size() >= 10 &&
+            file_name.compare(file_name.size() - 10, 10, ".sst.trash") == 0) {
+          bg_delete_sst.fetch_add(1);
+        }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(DestroyDB(snapshot_name_, options));
+  if (slow_deletion) {
+    ASSERT_EQ(fg_delete_sst, 1);
+    ASSERT_EQ(bg_delete_sst, 11);
+  } else {
+    ASSERT_EQ(fg_delete_sst, 12);
+  }
+
+  ASSERT_EQ("a", Get("foo"));
+  ASSERT_EQ("val9", Get("bar"));
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+INSTANTIATE_TEST_CASE_P(CheckpointDestroyTest, CheckpointDestroyTest,
+                        ::testing::Values(true, false));
+
+TEST_F(CheckpointTest, CheckpointCFAtomicFlushOverride) {
+  // Test that LiveFilesStorageInfoOptions::atomic_flush forces atomic flush
+  // even when DBOptions::atomic_flush is false. Verify the checkpoint is
+  // valid by creating it, opening it, and checking data consistency.
+  Options options = CurrentOptions();
+  options.atomic_flush = false;
+  CreateAndReopenWithCF({"one", "two", "three"}, options);
+
+  // Write data to multiple CFs, flush some to SST, leave some in memtable.
+  ASSERT_OK(Put(0, "key0", "val0_old"));
+  ASSERT_OK(Put(1, "key1", "val1_old"));
+  ASSERT_OK(Flush(0));
+  ASSERT_OK(Flush(1));
+  ASSERT_OK(Put(0, "key0", "val0"));
+  ASSERT_OK(Put(1, "key1", "val1"));
+  ASSERT_OK(Put(2, "key2", "val2"));
+  ASSERT_OK(Put(3, "key3", "val3"));
+
+  // Verify that atomic flush path is taken via sync point.
+  bool atomic_flush_called = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AtomicFlushMemTables:AfterScheduleFlush",
+      [&](void* /*arg*/) { atomic_flush_called = true; });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Create checkpoint using GetLiveFilesStorageInfo with atomic_flush=true.
+  Checkpoint* checkpoint;
+  ASSERT_OK(Checkpoint::Create(db_.get(), &checkpoint));
+  // CreateCheckpoint internally calls GetLiveFilesStorageInfo.
+  // To exercise the atomic_flush flag, use GetLiveFilesStorageInfo directly
+  // and verify the path, then also create a full checkpoint to verify
+  // end-to-end correctness.
+  LiveFilesStorageInfoOptions live_opts;
+  live_opts.atomic_flush = true;
+  std::vector<LiveFileStorageInfo> files;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(live_opts, &files));
+  ASSERT_TRUE(atomic_flush_called);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Now create a standard checkpoint (after the atomic flush has happened,
+  // data is already on disk so checkpoint will capture it).
+  ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_));
+  delete checkpoint;
+
+  // Open checkpoint and verify all data across CFs is present.
+  options.create_if_missing = false;
+  std::vector<std::string> cfs = {kDefaultColumnFamilyName, "one", "two",
+                                  "three"};
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.reserve(cfs.size());
+  for (const auto& cf : cfs) {
+    column_families.emplace_back(cf, options);
+  }
+  std::vector<ColumnFamilyHandle*> cphandles;
+  std::unique_ptr<DB> snapshotDB;
+  ASSERT_OK(DB::Open(options, snapshot_name_, column_families, &cphandles,
+                     &snapshotDB));
+
+  ReadOptions roptions;
+  std::string result;
+  ASSERT_OK(snapshotDB->Get(roptions, cphandles[0], "key0", &result));
+  ASSERT_EQ("val0", result);
+  ASSERT_OK(snapshotDB->Get(roptions, cphandles[1], "key1", &result));
+  ASSERT_EQ("val1", result);
+  ASSERT_OK(snapshotDB->Get(roptions, cphandles[2], "key2", &result));
+  ASSERT_EQ("val2", result);
+  ASSERT_OK(snapshotDB->Get(roptions, cphandles[3], "key3", &result));
+  ASSERT_EQ("val3", result);
+
+  for (auto h : cphandles) {
+    delete h;
+  }
+  cphandles.clear();
+  snapshotDB.reset();
+}
+
+TEST_F(CheckpointTest, CheckpointCFDefaultNoAtomicFlush) {
+  // Negative test: verify that when LiveFilesStorageInfoOptions::atomic_flush
+  // is false (default), the non-atomic flush path is taken.
+  Options options = CurrentOptions();
+  options.atomic_flush = false;
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  ASSERT_OK(Put(0, "key0", "val0"));
+  ASSERT_OK(Put(1, "key1", "val1"));
+  ASSERT_OK(Put(2, "key2", "val2"));
+
+  bool atomic_flush_called = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AtomicFlushMemTables:AfterScheduleFlush",
+      [&](void* /*arg*/) { atomic_flush_called = true; });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Default LiveFilesStorageInfoOptions has atomic_flush=false.
+  LiveFilesStorageInfoOptions live_opts;
+  std::vector<LiveFileStorageInfo> files;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(live_opts, &files));
+  ASSERT_FALSE(atomic_flush_called);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(CheckpointTest, CheckpointAtomicFlushOverrideSingleCF) {
+  // Edge case: forced atomic flush with only the default CF.
+  Options options = CurrentOptions();
+  options.atomic_flush = false;
   Reopen(options);
 
-  // Need to close before `fault_env` goes out of scope.
+  ASSERT_OK(Put("key", "val"));
+
+  bool atomic_flush_called = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AtomicFlushMemTables:AfterScheduleFlush",
+      [&](void* /*arg*/) { atomic_flush_called = true; });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  LiveFilesStorageInfoOptions live_opts;
+  live_opts.atomic_flush = true;
+  std::vector<LiveFileStorageInfo> files;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(live_opts, &files));
+  ASSERT_TRUE(atomic_flush_called);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ("val", Get("key"));
+}
+
+TEST_F(CheckpointTest, CheckpointAtomicFlushOverrideWithDBAtomicFlush) {
+  // When DBOptions::atomic_flush is already true, the override should be
+  // harmless (atomic flush already used).
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  ASSERT_OK(Put(0, "key0", "val0"));
+  ASSERT_OK(Put(1, "key1", "val1"));
+  ASSERT_OK(Put(2, "key2", "val2"));
+
+  bool atomic_flush_called = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AtomicFlushMemTables:AfterScheduleFlush",
+      [&](void* /*arg*/) { atomic_flush_called = true; });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  LiveFilesStorageInfoOptions live_opts;
+  live_opts.atomic_flush = true;
+  std::vector<LiveFileStorageInfo> files;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(live_opts, &files));
+  ASSERT_TRUE(atomic_flush_called);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ("val0", Get(0, "key0"));
+  ASSERT_EQ("val1", Get(1, "key1"));
+  ASSERT_EQ("val2", Get(2, "key2"));
+}
+
+TEST_F(CheckpointTest, MixedAtomicAndNonAtomicFlushInQueue) {
+  // Test that both atomic and non-atomic flush requests can coexist in the
+  // flush queue. First enqueue a non-atomic flush, then an atomic flush.
+  Options options = CurrentOptions();
+  options.atomic_flush = false;
+  // Use multiple CFs so atomic flush is meaningful.
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  // Pause background flushes so requests queue up.
+  ASSERT_OK(dbfull()->PauseBackgroundWork());
+
+  // Write data to all CFs.
+  ASSERT_OK(Put(0, "k0", "v0"));
+  ASSERT_OK(Put(1, "k1", "v1"));
+  ASSERT_OK(Put(2, "k2", "v2"));
+
+  // Enqueue a non-atomic flush (default).
+  FlushOptions non_atomic_fo;
+  non_atomic_fo.wait = false;
+  non_atomic_fo.allow_write_stall = true;
+  ASSERT_OK(db_->Flush(non_atomic_fo, handles_[0]));
+
+  // Write more data so there's something new to flush atomically.
+  ASSERT_OK(Put(0, "k0_2", "v0_2"));
+  ASSERT_OK(Put(1, "k1_2", "v1_2"));
+  ASSERT_OK(Put(2, "k2_2", "v2_2"));
+
+  // Enqueue an atomic flush via force_atomic_flush.
+  FlushOptions atomic_fo;
+  atomic_fo.wait = false;
+  atomic_fo.allow_write_stall = true;
+  atomic_fo.force_atomic_flush = true;
+  ASSERT_OK(db_->Flush(atomic_fo, handles_));
+
+  // Resume and let both flushes execute.
+  ASSERT_OK(dbfull()->ContinueBackgroundWork());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  // Verify all data is readable.
+  ASSERT_EQ("v0_2", Get(0, "k0_2"));
+  ASSERT_EQ("v1_2", Get(1, "k1_2"));
+  ASSERT_EQ("v2_2", Get(2, "k2_2"));
+}
+
+TEST_F(CheckpointTest, MixedAtomicThenNonAtomicFlushInQueue) {
+  // Reverse order: first enqueue an atomic flush, then a non-atomic flush.
+  Options options = CurrentOptions();
+  options.atomic_flush = false;
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  // Pause background flushes so requests queue up.
+  ASSERT_OK(dbfull()->PauseBackgroundWork());
+
+  // Write data to all CFs.
+  ASSERT_OK(Put(0, "k0", "v0"));
+  ASSERT_OK(Put(1, "k1", "v1"));
+  ASSERT_OK(Put(2, "k2", "v2"));
+
+  // Enqueue an atomic flush first.
+  FlushOptions atomic_fo;
+  atomic_fo.wait = false;
+  atomic_fo.allow_write_stall = true;
+  atomic_fo.force_atomic_flush = true;
+  ASSERT_OK(db_->Flush(atomic_fo, handles_));
+
+  // Write more data.
+  ASSERT_OK(Put(0, "k0_2", "v0_2"));
+  ASSERT_OK(Put(1, "k1_2", "v1_2"));
+
+  // Enqueue a non-atomic flush on a single CF.
+  FlushOptions non_atomic_fo;
+  non_atomic_fo.wait = false;
+  non_atomic_fo.allow_write_stall = true;
+  ASSERT_OK(db_->Flush(non_atomic_fo, handles_[1]));
+
+  // Resume and let both flushes execute.
+  ASSERT_OK(dbfull()->ContinueBackgroundWork());
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+
+  // Verify all data is readable.
+  ASSERT_EQ("v0", Get(0, "k0"));
+  ASSERT_EQ("v0_2", Get(0, "k0_2"));
+  ASSERT_EQ("v1_2", Get(1, "k1_2"));
+  ASSERT_EQ("v2", Get(2, "k2"));
+}
+TEST_F(CheckpointTest, BackupWithAtomicFlushSkipsWAL) {
+  // Test that BackupEngine with atomic_flush=true and backup_log_files=false
+  // creates a valid, restorable backup for a multi-CF database.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  CreateAndReopenWithCF({"cf1", "cf2"}, options);
+
+  // Write data to all column families (default, cf1, cf2)
+  ASSERT_OK(Put(0, "key0", "val0"));
+  ASSERT_OK(Put(1, "key1", "val1"));
+  ASSERT_OK(Put(2, "key2", "val2"));
+
+  // Set up backup engine with backup_log_files=false
+  std::string backup_dir = test::PerThreadDBPath(env_, "backup_atomic_flush");
+  std::string restore_dir = test::PerThreadDBPath(env_, "restore_atomic_flush");
+  ASSERT_OK(DestroyDB(restore_dir, options));
+  test::DeleteDir(env_, backup_dir);
+
+  BackupEngineOptions backup_options(backup_dir);
+  backup_options.backup_log_files = false;
+  backup_options.destroy_old_data = true;
+
+  BackupEngine* backup_engine_ptr;
+  ASSERT_OK(BackupEngine::Open(env_, backup_options, &backup_engine_ptr));
+  std::unique_ptr<BackupEngine> backup_engine(backup_engine_ptr);
+
+  // Verify that the atomic flush sync point is triggered
+  bool atomic_flush_triggered = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::AtomicFlushMemTables:AfterScheduleFlush",
+      [&](void* /*arg*/) { atomic_flush_triggered = true; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // Create backup with atomic_flush=true, flush_before_backup=true
+  CreateBackupOptions create_options;
+  create_options.flush_before_backup = true;
+  create_options.atomic_flush = true;
+  ASSERT_OK(backup_engine->CreateNewBackup(create_options, db_.get()));
+
+  ASSERT_TRUE(atomic_flush_triggered);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Verify no WAL files in the backup
+  BackupInfo backup_info;
+  ASSERT_OK(backup_engine->GetLatestBackupInfo(&backup_info,
+                                               /*include_file_details=*/true));
+  for (const auto& file : backup_info.file_details) {
+    // WAL files have names like 000001.log
+    ASSERT_TRUE(file.relative_filename.find(".log") == std::string::npos)
+        << "Found WAL file in backup: " << file.relative_filename;
+  }
+
+  // Close the original DB and restore from backup
   Close();
+
+  ASSERT_OK(backup_engine->RestoreDBFromLatestBackup(restore_dir, restore_dir));
+
+  // Open the restored DB and verify data
+  std::vector<ColumnFamilyDescriptor> cf_descs;
+  cf_descs.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions(options));
+  cf_descs.emplace_back("cf1", ColumnFamilyOptions(options));
+  cf_descs.emplace_back("cf2", ColumnFamilyOptions(options));
+
+  std::unique_ptr<DB> restored_db;
+  std::vector<ColumnFamilyHandle*> restored_handles;
+  ASSERT_OK(DB::Open(DBOptions(options), restore_dir, cf_descs,
+                     &restored_handles, &restored_db));
+
+  ReadOptions ropts;
+  std::string value;
+  ASSERT_OK(restored_db->Get(ropts, restored_handles[0], "key0", &value));
+  ASSERT_EQ("val0", value);
+  ASSERT_OK(restored_db->Get(ropts, restored_handles[1], "key1", &value));
+  ASSERT_EQ("val1", value);
+  ASSERT_OK(restored_db->Get(ropts, restored_handles[2], "key2", &value));
+  ASSERT_EQ("val2", value);
+
+  for (auto* h : restored_handles) {
+    delete h;
+  }
+  restored_db.reset();
+  ASSERT_OK(DestroyDB(restore_dir, options));
+  test::DeleteDir(env_, backup_dir);
+}
+
+TEST_F(CheckpointTest, BackupWithoutFlushRejectsBlobDirectWrite) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.enable_blob_direct_write = true;
+  options.allow_concurrent_memtable_write = false;
+  options.min_blob_size = 32;
+  Reopen(options);
+
+  ASSERT_OK(Put("foo", std::string(128, 'x')));
+
+  std::string backup_dir =
+      test::PerThreadDBPath(env_, "backup_blob_direct_write_requires_flush");
+  test::DeleteDir(env_, backup_dir);
+
+  BackupEngineOptions backup_options(backup_dir);
+  backup_options.destroy_old_data = true;
+
+  BackupEngine* backup_engine_ptr = nullptr;
+  ASSERT_OK(BackupEngine::Open(env_, backup_options, &backup_engine_ptr));
+  std::unique_ptr<BackupEngine> backup_engine(backup_engine_ptr);
+
+  CreateBackupOptions create_options;
+  create_options.flush_before_backup = false;
+  Status s = backup_engine->CreateNewBackup(create_options, db_.get());
+  ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+  ASSERT_NE(s.ToString().find("Blob direct write"), std::string::npos)
+      << s.ToString();
+
+  test::DeleteDir(env_, backup_dir);
+}
+
+namespace {
+// FileSystem wrapper that fails all hard-links, forcing the copy path.
+class NoLinkFileSystem : public FileSystemWrapper {
+ public:
+  explicit NoLinkFileSystem(const std::shared_ptr<FileSystem>& base)
+      : FileSystemWrapper(base) {}
+
+  static const char* kClassName() { return "NoLinkFileSystem"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus LinkFile(const std::string& /*src*/, const std::string& /*dst*/,
+                    const IOOptions& /*options*/,
+                    IODebugContext* /*dbg*/) override {
+    return IOStatus::NotSupported("Hard links not supported");
+  }
+};
+
+}  // namespace
+
+TEST_F(CheckpointTest, CheckpointEngineParallelLink) {
+  // Default FileSystem supports hard links, so files are linked across threads.
+  constexpr int kNumFiles = 8;
+  constexpr int kKeysPerFile = 50;
+  for (int f = 0; f < kNumFiles; ++f) {
+    for (int k = 0; k < kKeysPerFile; ++k) {
+      int id = f * kKeysPerFile + k;
+      ASSERT_OK(Put("key" + std::to_string(id), "value" + std::to_string(id)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  CheckpointEngineOptions engine_options;
+  engine_options.max_background_operations = 4;
+  std::unique_ptr<CheckpointEngine> engine;
+  ASSERT_OK(CheckpointEngine::Open(engine_options, &engine));
+  if (engine == nullptr) {
+    FAIL() << "CheckpointEngine::Open returned a null engine";
+  }
+  ASSERT_OK(engine->CreateCheckpoint(db_.get(), snapshot_name_));
+
+  Options options = CurrentOptions();
+  options.create_if_missing = false;
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &checkpoint_db));
+  if (checkpoint_db == nullptr) {
+    FAIL() << "DB::Open returned a null db";
+  }
+  for (int id = 0; id < kNumFiles * kKeysPerFile; ++id) {
+    std::string value;
+    ASSERT_OK(
+        checkpoint_db->Get(ReadOptions(), "key" + std::to_string(id), &value));
+    ASSERT_EQ("value" + std::to_string(id), value);
+  }
+}
+
+TEST_F(CheckpointTest, CheckpointEngineParallelCopy) {
+  // Links fail NotSupported and fall back to parallel copies.
+  auto no_link_fs = std::make_shared<NoLinkFileSystem>(FileSystem::Default());
+  std::unique_ptr<Env> no_link_env(NewCompositeEnv(no_link_fs));
+
+  Options options = CurrentOptions();
+  options.env = no_link_env.get();
+  Reopen(options);
+
+  constexpr int kNumFiles = 8;
+  constexpr int kKeysPerFile = 50;
+  for (int f = 0; f < kNumFiles; ++f) {
+    for (int k = 0; k < kKeysPerFile; ++k) {
+      int id = f * kKeysPerFile + k;
+      ASSERT_OK(Put("key" + std::to_string(id), "value" + std::to_string(id)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  CheckpointEngineOptions engine_options;
+  engine_options.max_background_operations = 4;
+  std::unique_ptr<CheckpointEngine> engine;
+  ASSERT_OK(CheckpointEngine::Open(engine_options, &engine));
+  if (engine == nullptr) {
+    FAIL() << "CheckpointEngine::Open returned a null engine";
+  }
+  ASSERT_OK(engine->CreateCheckpoint(db_.get(), snapshot_name_));
+
+  Close();  // before tearing down the env the DB was opened with
+
+  options.env = env_;
+  options.create_if_missing = false;
+  std::unique_ptr<DB> checkpoint_db;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &checkpoint_db));
+  if (checkpoint_db == nullptr) {
+    FAIL() << "DB::Open returned a null db";
+  }
+  for (int id = 0; id < kNumFiles * kKeysPerFile; ++id) {
+    std::string value;
+    ASSERT_OK(
+        checkpoint_db->Get(ReadOptions(), "key" + std::to_string(id), &value));
+    ASSERT_EQ("value" + std::to_string(id), value);
+  }
+}
+
+TEST_F(CheckpointTest, CheckpointEngineParallelCopyRecordsCheckpointBytes) {
+  // Force copies (NoLinkFileSystem) so the parallel path actually moves bytes;
+  // hard links move no data and record nothing.
+  auto no_link_fs = std::make_shared<NoLinkFileSystem>(FileSystem::Default());
+  std::unique_ptr<Env> no_link_env(NewCompositeEnv(no_link_fs));
+
+  Options options = CurrentOptions();
+  options.env = no_link_env.get();
+  options.statistics = CreateDBStatistics();
+  Reopen(options);
+
+  constexpr int kNumFiles = 4;
+  constexpr int kKeysPerFile = 50;
+  for (int f = 0; f < kNumFiles; ++f) {
+    for (int k = 0; k < kKeysPerFile; ++k) {
+      int id = f * kKeysPerFile + k;
+      ASSERT_OK(Put("key" + std::to_string(id), "value" + std::to_string(id)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  CheckpointEngineOptions engine_options;
+  engine_options.max_background_operations = 4;
+  std::unique_ptr<CheckpointEngine> engine;
+  ASSERT_OK(CheckpointEngine::Open(engine_options, &engine));
+  if (engine == nullptr) {
+    FAIL() << "CheckpointEngine::Open returned a null engine";
+  }
+  ASSERT_OK(engine->CreateCheckpoint(db_.get(), snapshot_name_));
+
+  // Copied bytes are attributed to the checkpoint tickers, and never to the
+  // backup tickers -- this verifies both the ticker wiring and that a live
+  // Statistics* reaches the CopyEngine WorkItems.
+  EXPECT_GT(options.statistics->getTickerCount(CHECKPOINT_READ_BYTES), 0U);
+  EXPECT_GT(options.statistics->getTickerCount(CHECKPOINT_WRITE_BYTES), 0U);
+  EXPECT_EQ(options.statistics->getTickerCount(BACKUP_READ_BYTES), 0U);
+  EXPECT_EQ(options.statistics->getTickerCount(BACKUP_WRITE_BYTES), 0U);
+
+  Close();  // before tearing down the env the DB was opened with
 }
 
 }  // namespace ROCKSDB_NAMESPACE

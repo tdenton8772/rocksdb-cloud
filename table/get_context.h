@@ -7,16 +7,19 @@
 #include <string>
 
 #include "db/read_callback.h"
+#include "rocksdb/status.h"
 #include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
 class BlobFetcher;
+class Cleanable;
 class Comparator;
 class Logger;
 class MergeContext;
 class MergeOperator;
 class PinnableWideColumns;
 class PinnedIteratorsManager;
+class SameFileBlobReader;
 class Statistics;
 class SystemClock;
 struct ParsedInternalKey;
@@ -119,6 +122,10 @@ class GetContext {
              PinnedIteratorsManager* _pinned_iters_mgr = nullptr,
              ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
              uint64_t tracing_get_id = 0, BlobFetcher* blob_fetcher = nullptr);
+  // emplace-only; default construction and move assignment are intentionally
+  // disabled.
+  GetContext(GetContext&&) noexcept = default;
+  GetContext& operator=(GetContext&&) noexcept = delete;
 
   GetContext() = delete;
 
@@ -134,13 +141,23 @@ class GetContext {
   //
   // Returns True if more keys need to be read (due to merges) or
   //         False if the complete value has been found.
+  //
+  // same_file_reader: when non-null (embedded-blob SST on the Get()/MultiGet()
+  // path), same-file blob columns of a wide-column entity are resolved
+  // zero-copy through an EmbeddedAwareBlobFetcher composed over blob_fetcher_.
   bool SaveValue(const ParsedInternalKey& parsed_key, const Slice& value,
                  bool* matched, Status* read_status,
-                 Cleanable* value_pinner = nullptr);
+                 Cleanable* value_pinner = nullptr,
+                 const SameFileBlobReader* same_file_reader = nullptr);
 
   // Simplified version of the previous function. Should only be used when we
-  // know that the operation is a Put.
-  void SaveValue(const Slice& value, SequenceNumber seq);
+  // know that the operation is a Put and the column family has no
+  // user-defined timestamps.
+  //
+  // value_pinner: if non-null, ownership of the underlying buffer is
+  // transferred via PinSlice (no copy). If null, value is copied via PinSelf.
+  void SaveValue(const Slice& value, SequenceNumber seq,
+                 Cleanable* value_pinner = nullptr);
 
   GetState State() const { return state_; }
 
@@ -164,6 +181,11 @@ class GetContext {
   // logged into the string. The operations can then be replayed on
   // another GetContext with replayGetContextLog.
   void SetReplayLog(std::string* replay_log) { replay_log_ = replay_log; }
+
+  // True if SaveValue calls are being logged for the row cache. When set, the
+  // logged (and hence row-cached) entity must be fully resolved, so the
+  // Get()/MultiGet() path does not defer same-file wide-column blob resolution.
+  bool HasReplayLog() const { return replay_log_ != nullptr; }
 
   // Do we need to fetch the SequenceNumber for this key?
   bool NeedToReadSequence() const { return (seq_ != nullptr); }
@@ -194,15 +216,26 @@ class GetContext {
   void push_operand(const Slice& value, Cleanable* value_pinner);
 
  private:
+  Status SaveWideColumnEntityToPinnable(
+      const Slice& user_key, const Slice& entity, Cleanable* value_pinner,
+      const SameFileBlobReader* same_file_reader);
+  Status SaveWideColumnEntityToColumns(
+      const Slice& user_key, const Slice& entity, Cleanable* value_pinner,
+      const SameFileBlobReader* same_file_reader);
+  Status PushWideColumnEntityDefaultOperand(
+      const Slice& user_key, const Slice& entity, Cleanable* value_pinner,
+      const SameFileBlobReader* same_file_reader);
+
   // Helper method that postprocesses the results of merge operations, e.g. it
   // sets the state correctly upon merge errors.
-  void PostprocessMerge(const Status& merge_status);
+  Status PostprocessMerge(const Status& merge_status);
 
   // The following methods perform the actual merge operation for the
   // no base value/plain base value/wide-column base value cases.
-  void MergeWithNoBaseValue();
-  void MergeWithPlainBaseValue(const Slice& value);
-  void MergeWithWideColumnBaseValue(const Slice& entity);
+  Status MergeWithNoBaseValue();
+  Status MergeWithPlainBaseValue(const Slice& value);
+  Status MergeWithWideColumnBaseValue(
+      const Slice& entity, const SameFileBlobReader* same_file_reader);
 
   bool GetBlobValue(const Slice& user_key, const Slice& blob_index,
                     PinnableSlice* blob_value, Status* read_status);

@@ -1,5 +1,4 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-from __future__ import absolute_import, division, print_function, unicode_literals
 
 try:
     from builtins import object, str
@@ -9,17 +8,28 @@ import pprint
 
 import targets_cfg
 
+class LiteralValue:
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return str(self.value)
+
+def smart_quote_value(val):
+    if isinstance(val, LiteralValue):
+        return str(val)
+    return '"%s"' % val
 
 def pretty_list(lst, indent=8):
     if lst is None or len(lst) == 0:
         return ""
 
     if len(lst) == 1:
-        return '"%s"' % lst[0]
+        return smart_quote_value(lst[0])
 
-    separator = '",\n%s"' % (" " * indent)
-    res = separator.join(sorted(lst))
-    res = "\n" + (" " * indent) + '"' + res + '",\n' + (" " * (indent - 4))
+    separator = ',\n%s' % (" " * indent)
+    res = separator.join(sorted(map(smart_quote_value, lst)))
+    res = "\n" + (" " * indent) + res + ',\n' + (" " * (indent - 4))
     return res
 
 
@@ -35,6 +45,11 @@ class TARGETSBuilder:
         self.total_bin = 0
         self.total_test = 0
         self.tests_cfg = ""
+    
+    def add_oncall(self, oncall):
+       with open(self.path, "ab") as targets_file:
+            targets_file.write(targets_cfg.oncall_template.format(name=oncall).encode("utf-8"))
+                
 
     def add_library(
         self,
@@ -48,7 +63,12 @@ class TARGETSBuilder:
         extra_test_libs=False,
     ):
         if headers is not None:
-            headers = "[" + pretty_list(headers) + "]"
+            if isinstance(headers, LiteralValue):
+                headers = str(headers)
+            else:
+                headers = "[" + pretty_list(headers) + "]"
+        else:
+            headers = "[]"
         with open(self.path, "ab") as targets_file:
             targets_file.write(
                 targets_cfg.library_template.format(
@@ -65,8 +85,7 @@ class TARGETSBuilder:
         self.total_lib = self.total_lib + 1
 
     def add_rocksdb_library(self, name, srcs, headers=None, external_dependencies=None):
-        if headers is not None:
-            headers = "[" + pretty_list(headers) + "]"
+        headers = "[" + pretty_list(headers) + "]"
         with open(self.path, "ab") as targets_file:
             targets_file.write(
                 targets_cfg.rocksdb_library_template.format(
@@ -99,6 +118,12 @@ class TARGETSBuilder:
         self.total_bin = self.total_bin + 1
 
     def add_c_test(self):
+        # The actual c_test_bin target is defined by add_c_test_wrapper in the
+        # internal //rocks/buckifier:defs.bzl (not in this OSS repo). db/c_test.c
+        # #includes the generated c_api_gen/*.inc fragments, so under Buck's
+        # hermetic sandbox that wrapper must expose them as headers, e.g.
+        #   headers = native.glob(["c_api_gen/**/*.inc"])
+        # (Make/CMake resolve the include via -I. / PROJECT_SOURCE_DIR.)
         with open(self.path, "ab") as targets_file:
             targets_file.write(
                 b"""

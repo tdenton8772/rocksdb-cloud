@@ -27,6 +27,10 @@ class StackableDB : public DB {
   explicit StackableDB(std::shared_ptr<DB> db)
       : db_(db.get()), shared_db_ptr_(db) {}
 
+  // StackableDB take sole ownership of the underlying db.
+  explicit StackableDB(std::unique_ptr<DB>&& db)
+      : db_(db.get()), shared_db_ptr_(std::move(db)) {}
+
   ~StackableDB() override {
     if (shared_db_ptr_ == nullptr) {
       delete db_;
@@ -102,11 +106,19 @@ class StackableDB : public DB {
     return db_->Get(options, column_family, key, value, timestamp);
   }
 
+  using DB::GetAsync;
+
   using DB::GetEntity;
+
   Status GetEntity(const ReadOptions& options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableWideColumns* columns) override {
     return db_->GetEntity(options, column_family, key, columns);
+  }
+
+  Status GetEntity(const ReadOptions& options, const Slice& key,
+                   PinnableAttributeGroups* result) override {
+    return db_->GetEntity(options, key, result);
   }
 
   using DB::GetMergeOperands;
@@ -129,6 +141,8 @@ class StackableDB : public DB {
                          timestamps, statuses, sorted_input);
   }
 
+  using DB::MultiGetAsync;
+
   using DB::MultiGetEntity;
 
   void MultiGetEntity(const ReadOptions& options,
@@ -147,6 +161,12 @@ class StackableDB : public DB {
                         statuses, sorted_input);
   }
 
+  void MultiGetEntity(const ReadOptions& options, size_t num_keys,
+                      const Slice* keys,
+                      PinnableAttributeGroups* results) override {
+    db_->MultiGetEntity(options, num_keys, keys, results);
+  }
+
   using DB::IngestExternalFile;
   Status IngestExternalFile(ColumnFamilyHandle* column_family,
                             const std::vector<std::string>& external_files,
@@ -158,6 +178,19 @@ class StackableDB : public DB {
   Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) override {
     return db_->IngestExternalFiles(args);
+  }
+
+  using DB::PrepareFileIngestion;
+  Status PrepareFileIngestion(
+      const std::vector<IngestExternalFileArg>& args,
+      std::unique_ptr<FileIngestionHandle>* handle) override {
+    return db_->PrepareFileIngestion(args, handle);
+  }
+
+  using DB::CommitFileIngestionHandles;
+  Status CommitFileIngestionHandles(
+      std::vector<std::unique_ptr<FileIngestionHandle>> handles) override {
+    return db_->CommitFileIngestionHandles(std::move(handles));
   }
 
   using DB::CreateColumnFamilyWithImport;
@@ -259,25 +292,25 @@ class StackableDB : public DB {
     return db_->NewIterators(options, column_families, iterators);
   }
 
-  using DB::GetIteratorSequenceNumber;
-  virtual SequenceNumber GetIteratorSequenceNumber(
-      Iterator* iterator) override {
-    return db_->GetIteratorSequenceNumber(iterator);
-  }
-
-  // RocksDB-Cloud contribution begin
-  Status GetSuperSnapshots(
-      const std::vector<ColumnFamilyHandle*>& column_families,
-      std::vector<const Snapshot*>* snapshots) override {
-    return db_->GetSuperSnapshots(column_families, snapshots);
-  }
-  // RocksDB-Cloud contribution end
-
-  using DB::NewMultiCfIterator;
-  std::unique_ptr<Iterator> NewMultiCfIterator(
+  using DB::NewCoalescingIterator;
+  std::unique_ptr<Iterator> NewCoalescingIterator(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families) override {
-    return db_->NewMultiCfIterator(options, column_families);
+    return db_->NewCoalescingIterator(options, column_families);
+  }
+
+  using DB::NewAttributeGroupIterator;
+  std::unique_ptr<AttributeGroupIterator> NewAttributeGroupIterator(
+      const ReadOptions& options,
+      const std::vector<ColumnFamilyHandle*>& column_families) override {
+    return db_->NewAttributeGroupIterator(options, column_families);
+  }
+
+  using DB::NewMultiScan;
+  std::unique_ptr<MultiScan> NewMultiScan(
+      const ReadOptions& opts, ColumnFamilyHandle* column_family,
+      const MultiScanArgs& scan_opts) override {
+    return db_->NewMultiScan(opts, column_family, scan_opts);
   }
 
   const Snapshot* GetSnapshot() override { return db_->GetSnapshot(); }
@@ -359,6 +392,8 @@ class StackableDB : public DB {
   void DisableManualCompaction() override {
     return db_->DisableManualCompaction();
   }
+  void AbortAllCompactions() override { return db_->AbortAllCompactions(); }
+  void ResumeAllCompactions() override { return db_->ResumeAllCompactions(); }
 
   Status WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options) override {
@@ -368,11 +403,6 @@ class StackableDB : public DB {
   using DB::NumberLevels;
   int NumberLevels(ColumnFamilyHandle* column_family) override {
     return db_->NumberLevels(column_family);
-  }
-
-  using DB::MaxMemCompactionLevel;
-  int MaxMemCompactionLevel(ColumnFamilyHandle* column_family) override {
-    return db_->MaxMemCompactionLevel(column_family);
   }
 
   using DB::Level0StopWriteTrigger;
@@ -407,7 +437,11 @@ class StackableDB : public DB {
 
   Status SyncWAL() override { return db_->SyncWAL(); }
 
+  using DB::FlushWAL;
   Status FlushWAL(bool sync) override { return db_->FlushWAL(sync); }
+  Status FlushWAL(const FlushWALOptions& options) override {
+    return db_->FlushWAL(options);
+  }
 
   Status LockWAL() override { return db_->LockWAL(); }
 
@@ -431,9 +465,22 @@ class StackableDB : public DB {
     return db_->GetLiveFilesStorageInfo(opts, files);
   }
 
+  Status GetPreparedFileInfoForExternalSstIngestion(
+      const std::string& file_path,
+      std::shared_ptr<const PreparedFileInfo>* file_info) override {
+    return db_->GetPreparedFileInfoForExternalSstIngestion(file_path,
+                                                           file_info);
+  }
+
   void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
                                ColumnFamilyMetaData* cf_meta) override {
     db_->GetColumnFamilyMetaData(column_family, cf_meta);
+  }
+
+  void GetColumnFamilyMetaData(ColumnFamilyHandle* column_family,
+                               const GetColumnFamilyMetaDataOptions& options,
+                               ColumnFamilyMetaData* metadata) override {
+    db_->GetColumnFamilyMetaData(column_family, options, metadata);
   }
 
   using DB::StartBlockCacheTrace;
@@ -496,27 +543,23 @@ class StackableDB : public DB {
     return db_->GetFullHistoryTsLow(column_family, ts_low);
   }
 
-  Status GetSortedWalFiles(VectorLogPtr& files) override {
+  Status GetNewestUserDefinedTimestamp(ColumnFamilyHandle* column_family,
+                                       std::string* newest_timestamp) override {
+    return db_->GetNewestUserDefinedTimestamp(column_family, newest_timestamp);
+  }
+
+  Status GetSortedWalFiles(VectorWalPtr& files) override {
     return db_->GetSortedWalFiles(files);
   }
 
   Status GetCurrentWalFile(
-      std::unique_ptr<LogFile>* current_log_file) override {
-    return db_->GetCurrentWalFile(current_log_file);
+      std::unique_ptr<WalFile>* current_wal_file) override {
+    return db_->GetCurrentWalFile(current_wal_file);
   }
 
   Status GetCreationTimeOfOldestFile(uint64_t* creation_time) override {
     return db_->GetCreationTimeOfOldestFile(creation_time);
   }
-
-  // WARNING: This API is planned for removal in RocksDB 7.0 since it does not
-  // operate at the proper level of abstraction for a key-value store, and its
-  // contract/restrictions are poorly documented. For example, it returns non-OK
-  // `Status` for non-bottommost files and files undergoing compaction. Since we
-  // do not plan to maintain it, the contract will likely remain underspecified
-  // until its removal. Any user is encouraged to read the implementation
-  // carefully and migrate away from it when possible.
-  Status DeleteFile(std::string name) override { return db_->DeleteFile(name); }
 
   Status GetDbIdentity(std::string& identity) const override {
     return db_->GetDbIdentity(identity);
@@ -526,32 +569,12 @@ class StackableDB : public DB {
     return db_->GetDbSessionId(session_id);
   }
 
-  Status ApplyReplicationLogRecord(ReplicationLogRecord record,
-                                   std::string replication_sequence,
-                                   CFOptionsFactory cf_options_factory,
-                                   uint64_t snapshot_replication_epoch,
-                                   ApplyReplicationLogRecordInfo* info,
-                                   unsigned flags) override {
-    return db_->ApplyReplicationLogRecord(
-        record, replication_sequence, std::move(cf_options_factory),
-        snapshot_replication_epoch, info, flags);
-  }
-  Status GetReplicationRecordDebugString(const ReplicationLogRecord& record,
-                                         std::string* out) const override {
-    return db_->GetReplicationRecordDebugString(record, out);
-  }
-  Status GetPersistedReplicationSequence(std::string* out) override {
-    return db_->GetPersistedReplicationSequence(out);
-  }
-  Status GetManifestUpdateSequence(uint64_t* out) override {
-    return db_->GetManifestUpdateSequence(out);
-  }
-
   using DB::SetOptions;
-  Status SetOptions(ColumnFamilyHandle* column_family_handle,
-                    const std::unordered_map<std::string, std::string>&
-                        new_options) override {
-    return db_->SetOptions(column_family_handle, new_options);
+  Status SetOptions(
+      const std::unordered_map<ColumnFamilyHandle*,
+                               std::unordered_map<std::string, std::string>>&
+          column_families_opts_map) override {
+    return db_->SetOptions(column_families_opts_map);
   }
 
   Status SetDBOptions(const std::unordered_map<std::string, std::string>&
@@ -575,6 +598,14 @@ class StackableDB : public DB {
     return db_->GetPropertiesOfTablesInRange(column_family, range, n, props);
   }
 
+  using DB::GetPropertiesOfTablesByLevel;
+  Status GetPropertiesOfTablesByLevel(
+      ColumnFamilyHandle* column_family,
+      std::vector<std::unique_ptr<TablePropertiesCollection>>* props_by_level)
+      override {
+    return db_->GetPropertiesOfTablesByLevel(column_family, props_by_level);
+  }
+
   Status GetUpdatesSince(
       SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
       const TransactionLogIterator::ReadOptions& read_options) override {
@@ -593,15 +624,6 @@ class StackableDB : public DB {
 
   ColumnFamilyHandle* DefaultColumnFamily() const override {
     return db_->DefaultColumnFamily();
-  }
-
-  void NewManifestOnNextUpdate() override { db_->NewManifestOnNextUpdate(); }
-  void UpdateReplicationEpoch(uint64_t next_replication_epoch) override {
-    db_->UpdateReplicationEpoch(next_replication_epoch);
-  }
-
-  uint64_t GetNextFileNumber() const override {
-    return db_->GetNextFileNumber();
   }
 
   Status TryCatchUpWithPrimary() override {

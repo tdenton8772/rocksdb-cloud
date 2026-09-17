@@ -76,6 +76,7 @@ FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
       values.emplace_back(value.data(), value.size());
     }
   }
+  num_unfragmented_tombstones_ = keys.size();
   if (pad_min_ts_for_end) {
     total_tombstone_payload_bytes_ += num_unfragmented_tombstones_ * ts_sz;
   }
@@ -496,6 +497,9 @@ FragmentedRangeTombstoneIterator::SplitBySnapshot(
       splits;
   SequenceNumber lower = 0;
   SequenceNumber upper;
+  // Safe to dereference icmp_ below: SplitBySnapshot is construction-time work
+  // (called synchronously from the range-del aggregator while the reader that
+  // owns *icmp_ is alive). See the icmp_ note in the header.
   for (size_t i = 0; i <= snapshots.size(); i++) {
     if (i >= snapshots.size()) {
       upper = kMaxSequenceNumber;

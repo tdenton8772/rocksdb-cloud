@@ -276,16 +276,16 @@ class SpecialEnv : public EnvWrapper {
       SpecialEnv* env_;
       std::unique_ptr<WritableFile> base_;
     };
-    class WalFile : public WritableFile {
+    class SpecialWalFile : public WritableFile {
      public:
-      WalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
+      SpecialWalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
           : env_(env), base_(std::move(b)) {
         env_->num_open_wal_file_.fetch_add(1);
       }
-      virtual ~WalFile() { env_->num_open_wal_file_.fetch_add(-1); }
+      virtual ~SpecialWalFile() { env_->num_open_wal_file_.fetch_add(-1); }
       Status Append(const Slice& data) override {
 #if !(defined NDEBUG) || !defined(OS_WIN)
-        TEST_SYNC_POINT("SpecialEnv::WalFile::Append:1");
+        TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:1");
 #endif
         Status s;
         if (env_->log_write_error_.load(std::memory_order_acquire)) {
@@ -299,7 +299,7 @@ class SpecialEnv : public EnvWrapper {
           s = base_->Append(data);
         }
 #if !(defined NDEBUG) || !defined(OS_WIN)
-        TEST_SYNC_POINT("SpecialEnv::WalFile::Append:2");
+        TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:2");
 #endif
         return s;
       }
@@ -419,7 +419,7 @@ class SpecialEnv : public EnvWrapper {
       } else if (strstr(f.c_str(), "MANIFEST") != nullptr) {
         r->reset(new ManifestFile(this, std::move(*r)));
       } else if (strstr(f.c_str(), "log") != nullptr) {
-        r->reset(new WalFile(this, std::move(*r)));
+        r->reset(new SpecialWalFile(this, std::move(*r)));
       } else {
         r->reset(new OtherFile(this, std::move(*r)));
       }
@@ -452,6 +452,10 @@ class SpecialEnv : public EnvWrapper {
         return s;
       }
 
+      Status GetFileSize(uint64_t* s) override {
+        return target_->GetFileSize(s);
+      }
+
      private:
       std::unique_ptr<RandomAccessFile> target_;
       anon::AtomicCounter* counter_;
@@ -476,6 +480,10 @@ class SpecialEnv : public EnvWrapper {
 
       Status Prefetch(uint64_t offset, size_t n) override {
         return target_->Prefetch(offset, n);
+      }
+
+      Status GetFileSize(uint64_t* s) override {
+        return target_->GetFileSize(s);
       }
 
      private:
@@ -831,6 +839,15 @@ class FileTemperatureTestFS : public FileSystemWrapper {
     return count;
   }
 
+  std::map<Temperature, size_t> CountCurrentSstFilesByTemp() {
+    MutexLock lock(&mu_);
+    std::map<Temperature, size_t> ret;
+    for (const auto& e : current_sst_file_temperatures_) {
+      ret[e.second]++;
+    }
+    return ret;
+  }
+
   void OverrideSstFileTemperature(uint64_t number, Temperature temp) {
     MutexLock lock(&mu_);
     current_sst_file_temperatures_[number] = temp;
@@ -842,7 +859,7 @@ class FileTemperatureTestFS : public FileSystemWrapper {
       requested_sst_file_temperatures_;
   std::map<uint64_t, Temperature> current_sst_file_temperatures_;
 
-  std::string GetFileName(const std::string& fname) {
+  static std::string GetFileName(const std::string& fname) {
     auto filename = fname.substr(fname.find_last_of(kFilePathSeparator) + 1);
     // workaround only for Windows that the file path could contain both Windows
     // FilePathSeparator and '/'
@@ -1041,6 +1058,7 @@ class DBTestBase : public testing::Test {
     kPartitionedFilterWithNewTableReaderForCompactions,
     kUniversalSubcompactions,
     kUnorderedWrite,
+    kBlockBasedTableWithBinarySearchWithFirstKeyIndex,
     // This must be the last line
     kEnd,
   };
@@ -1052,8 +1070,9 @@ class DBTestBase : public testing::Test {
   MockEnv* mem_env_;
   Env* encrypted_env_;
   SpecialEnv* env_;
+  std::shared_ptr<Env> env_read_only_;
   std::shared_ptr<Env> env_guard_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   std::vector<ColumnFamilyHandle*> handles_;
 
   int option_config_;
@@ -1071,6 +1090,7 @@ class DBTestBase : public testing::Test {
     kSkipNoSeekToLast = 32,
     kSkipFIFOCompaction = 128,
     kSkipMmapReads = 256,
+    kSkipRowCache = 512,
   };
 
   const int kRangeDelSkipConfigs =
@@ -1078,7 +1098,9 @@ class DBTestBase : public testing::Test {
       kSkipPlainTable |
       // MmapReads disables the iterator pinning that RangeDelAggregator
       // requires.
-      kSkipMmapReads;
+      kSkipMmapReads |
+      // Not compatible yet.
+      kSkipRowCache;
 
   // `env_do_fsync` decides whether the special Env would do real
   // fsync for files and directories. Skipping fsync can speed up
@@ -1091,6 +1113,11 @@ class DBTestBase : public testing::Test {
     char buf[100];
     snprintf(buf, sizeof(buf), "key%06d", i);
     return std::string(buf);
+  }
+
+  // Expects valid key created by Key().
+  static int IdFromKey(const std::string& key) {
+    return std::stoi(key.substr(3));
   }
 
   static bool ShouldSkipOptions(int option_config, int skip_mask = kNoSkip);
@@ -1130,7 +1157,7 @@ class DBTestBase : public testing::Test {
                      const anon::OptionsOverride& options_override =
                          anon::OptionsOverride()) const;
 
-  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_); }
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
 
   void CreateColumnFamilies(const std::vector<std::string>& cfs,
                             const Options& options);
@@ -1150,6 +1177,12 @@ class DBTestBase : public testing::Test {
   Status TryReopenWithColumnFamilies(const std::vector<std::string>& cfs,
                                      const Options& options);
 
+  Status TryReopenReadOnlyWithColumnFamilies(
+      const std::vector<std::string>& cfs, const std::vector<Options>& options);
+
+  Status TryReopenReadOnlyWithColumnFamilies(
+      const std::vector<std::string>& cfs, const Options& options);
+
   void Reopen(const Options& options);
 
   void Close();
@@ -1159,6 +1192,9 @@ class DBTestBase : public testing::Test {
   void Destroy(const Options& options, bool delete_cf_paths = false);
 
   Status ReadOnlyReopen(const Options& options);
+
+  // With a filesystem wrapper that fails on attempted write
+  Status EnforcedReadOnlyReopen(const Options& options);
 
   Status TryReopen(const Options& options);
 
@@ -1195,22 +1231,30 @@ class DBTestBase : public testing::Test {
 
   Status SingleDelete(int cf, const std::string& k);
 
-  std::string Get(const std::string& k, const Snapshot* snapshot = nullptr);
+  std::string Get(const std::string& k, const Snapshot* snapshot = nullptr,
+                  bool use_coroutine = false);
 
   std::string Get(int cf, const std::string& k,
-                  const Snapshot* snapshot = nullptr);
+                  const Snapshot* snapshot = nullptr,
+                  bool use_coroutine = false);
 
-  Status Get(const std::string& k, PinnableSlice* v);
+  Status Get(const std::string& k, PinnableSlice* v,
+             bool use_coroutine = false);
 
   std::vector<std::string> MultiGet(std::vector<int> cfs,
                                     const std::vector<std::string>& k,
-                                    const Snapshot* snapshot,
-                                    const bool batched,
-                                    const bool async = false);
+                                    const Snapshot* snapshot, bool batched,
+                                    bool async = false,
+                                    bool use_coroutine = false);
 
   std::vector<std::string> MultiGet(const std::vector<std::string>& k,
                                     const Snapshot* snapshot = nullptr,
-                                    const bool async = false);
+                                    bool async = false,
+                                    bool optimize_multiget_for_io = true,
+                                    bool use_coroutine = false);
+
+  Status CompactRange(const CompactRangeOptions& options,
+                      std::optional<Slice> begin, std::optional<Slice> end);
 
   uint64_t GetNumSnapshots();
 
@@ -1247,6 +1291,9 @@ class DBTestBase : public testing::Test {
 
   int NumTableFilesAtLevel(int level, int cf = 0);
 
+  int NumTableFilesAtLevel(int level, ColumnFamilyHandle* column_family,
+                           DB* db = nullptr);
+
   double CompressionRatioAtLevel(int level, int cf = 0);
 
   int TotalTableFiles(int cf = 0, int levels = -1);
@@ -1256,9 +1303,13 @@ class DBTestBase : public testing::Test {
   // Return spread of files per level
   std::string FilesPerLevel(int cf = 0);
 
+  std::string FilesPerLevel(ColumnFamilyHandle* cfh, DB* db = nullptr);
+
   size_t CountFiles();
 
   Status CountFiles(size_t* count);
+
+  std::vector<FileMetaData*> GetLevelFileMetadatas(int level, int cf = 0);
 
   Status Size(const Slice& start, const Slice& limit, uint64_t* size) {
     return Size(start, limit, 0, size);
@@ -1284,6 +1335,9 @@ class DBTestBase : public testing::Test {
                   int cf);
 
   void MoveFilesToLevel(int level, int cf = 0);
+
+  void MoveFilesToLevel(int level, ColumnFamilyHandle* column_family,
+                        DB* db = nullptr);
 
   void DumpFileCounts(const char* label);
 
@@ -1349,7 +1403,8 @@ class DBTestBase : public testing::Test {
   void VerifyDBFromMap(
       std::map<std::string, std::string> true_data,
       size_t* total_reads_res = nullptr, bool tailing_iter = false,
-      std::map<std::string, Status> status = std::map<std::string, Status>());
+      ReadOptions* ro = nullptr, ColumnFamilyHandle* cf = nullptr,
+      std::unordered_set<std::string>* not_found = nullptr) const;
 
   void VerifyDBInternal(
       std::vector<std::pair<std::string, std::string>> true_data);
@@ -1383,6 +1438,8 @@ class DBTestBase : public testing::Test {
     tp->raw_key_size = 0;
     tp->raw_value_size = 0;
     tp->num_data_blocks = 0;
+    tp->num_data_blocks_compression_rejected = 0;
+    tp->num_data_blocks_compression_bypassed = 0;
     tp->num_entries = 0;
     tp->num_deletions = 0;
     tp->num_merge_operands = 0;
@@ -1394,20 +1451,27 @@ class DBTestBase : public testing::Test {
     std::replace(tp_string.begin(), tp_string.end(), ';', ' ');
     std::replace(tp_string.begin(), tp_string.end(), '=', ' ');
     ResetTableProperties(tp);
-    sscanf(tp_string.c_str(),
-           "# data blocks %" SCNu64 " # entries %" SCNu64
-           " # deletions %" SCNu64 " # merge operands %" SCNu64
-           " # range deletions %" SCNu64 " raw key size %" SCNu64
-           " raw average key size %lf "
-           " raw value size %" SCNu64
-           " raw average value size %lf "
-           " data block size %" SCNu64 " index block size (user-key? %" SCNu64
-           ", delta-value? %" SCNu64 ") %" SCNu64 " filter block size %" SCNu64,
-           &tp->num_data_blocks, &tp->num_entries, &tp->num_deletions,
-           &tp->num_merge_operands, &tp->num_range_deletions, &tp->raw_key_size,
-           &dummy_double, &tp->raw_value_size, &dummy_double, &tp->data_size,
-           &tp->index_key_is_user_key, &tp->index_value_is_delta_encoded,
-           &tp->index_size, &tp->filter_size);
+    int count = sscanf(
+        tp_string.c_str(),
+        "# data blocks %" SCNu64 " # data blocks compression rejected %" SCNu64
+        " # data blocks compression bypassed %" SCNu64
+        " # uniform blocks %" SCNu64 " # entries %" SCNu64
+        " # deletions %" SCNu64 " # merge operands %" SCNu64
+        " # range deletions %" SCNu64 " raw key size %" SCNu64
+        " raw average key size %lf "
+        " raw value size %" SCNu64
+        " raw average value size %lf "
+        " data block size %" SCNu64 " data uncompressed size %" SCNu64
+        " index block size (user-key? %" SCNu64 ", delta-value? %" SCNu64
+        ") %" SCNu64 " filter block size %" SCNu64,
+        &tp->num_data_blocks, &tp->num_data_blocks_compression_rejected,
+        &tp->num_data_blocks_compression_bypassed, &tp->num_uniform_blocks,
+        &tp->num_entries, &tp->num_deletions, &tp->num_merge_operands,
+        &tp->num_range_deletions, &tp->raw_key_size, &dummy_double,
+        &tp->raw_value_size, &dummy_double, &tp->data_size,
+        &tp->uncompressed_data_size, &tp->index_key_is_user_key,
+        &tp->index_value_is_delta_encoded, &tp->index_size, &tp->filter_size);
+    ASSERT_EQ(count, 18);
   }
 
  private:  // Prone to error on direct use
@@ -1419,5 +1483,9 @@ class DBTestBase : public testing::Test {
 // For verifying that all files generated by current version have SST
 // unique ids.
 void VerifySstUniqueIds(const TablePropertiesCollection& props);
+
+// Excludes kUnknown
+extern const std::vector<Temperature> kKnownTemperatures;
+Temperature RandomKnownTemperature();
 
 }  // namespace ROCKSDB_NAMESPACE

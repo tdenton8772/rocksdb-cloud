@@ -1,10 +1,26 @@
 #! /usr/bin/env bash
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# This source code is licensed under both the GPLv2 (found in the
+# COPYING file in the root directory) and Apache 2.0 License
+# (found in the LICENSE.Apache file in the root directory).
 
 set -e
 set -o pipefail
 
+cat << EOF
+Release note advice:
+* Speak to the RocksDB user and what is impacted in the public API
+
+Formatting with markdown:
+* This is an example list item referring to \`BlockBasedTableOptions\`.
+If not starting with "* " it will be inserted at release time. This is OK.
+*This asterisk begins italics, NOT a list item. PROBABLY WRONG
+
+EOF
+
 if [ "$1" ]; then
+  echo "Press return to continue"
+  read
   # Target file specified on command line
   TARGET="$1"
 else
