@@ -1,0 +1,38 @@
+# Build rocksdb-cloud static library on Ubuntu 20.04 (matching data service runtime)
+# Usage from rocksdb-cloud dir:
+#   docker buildx build --platform linux/amd64 -f Dockerfile.build -t rocksdb-build --load .
+#   docker run --rm rocksdb-build tar cf - -C /build . | tar xf - -C /path/to/.rocksdb-prebuilt/
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libsnappy-dev \
+    zlib1g-dev \
+    libbz2-dev \
+    liblz4-dev \
+    libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /src/rocksdb-cloud/
+
+WORKDIR /src/rocksdb-cloud
+
+RUN mkdir build && cd build && \
+    cmake .. \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_TESTS=OFF \
+      -DWITH_TOOLS=OFF \
+      -DWITH_BENCHMARK_TOOLS=OFF \
+      -DWITH_GFLAGS=OFF \
+      -DUSE_RTTI=1 \
+      -DWITH_NUMA=OFF \
+      -DROCKSDB_BUILD_SHARED=OFF \
+      -DFAIL_ON_WARNINGS=OFF && \
+    make -j$(nproc) rocksdb
+
+RUN mkdir -p /build/lib /build/include && \
+    cp /src/rocksdb-cloud/build/librocksdb.a /build/lib/ && \
+    cp -r /src/rocksdb-cloud/include/rocksdb /build/include/
