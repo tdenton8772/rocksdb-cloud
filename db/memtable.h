@@ -867,6 +867,9 @@ class MemTable final : public ReadOnlyMemTable {
   // MemtableListVersion::memlist_). Should be called when this memtable is
   // about to become immutable. May be called multiple times since
   // SwitchMemtable() may fail.
+  // Enable auto flush if it's previously disabled
+  void EnableAutoFlush();
+  bool TEST_IsAutoFlushEnabled() const;
   void ConstructFragmentedRangeTombstones();
 
   bool AddLogicallyRedundantRangeTombstone(
@@ -949,6 +952,7 @@ class MemTable final : public ReadOnlyMemTable {
 
   SequenceNumber creation_seq_;
 
+
   // the earliest log containing a prepared section
   // which has been inserted into this memtable.
   std::atomic<uint64_t> min_prep_log_referenced_;
@@ -975,6 +979,8 @@ class MemTable final : public ReadOnlyMemTable {
   // keep track of memory usage in table_, arena_, and range_del_table_.
   // Gets refreshed inside `ApproximateMemoryUsage()` or `ShouldFlushNow`
   RelaxedAtomic<uint64_t> approximate_memory_usage_;
+
+  std::atomic_bool disable_auto_flush_;
 
   // max range deletions in a memtable,  before automatic flushing, 0 for
   // unlimited.

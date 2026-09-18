@@ -758,6 +758,14 @@ static std::unordered_map<std::string, OptionTypeInfo>
              offsetof(struct MutableCFOptions, compression_manager),
              OptionVerificationType::kByNameAllowNull,
              (OptionTypeFlags::kMutable | OptionTypeFlags::kAllowNull))},
+        {"disable_auto_flush",
+         {offsetof(struct MutableCFOptions, disable_auto_flush),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"disable_write_stall",
+         {offsetof(struct MutableCFOptions, disable_write_stall),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         // End special case properties
         {"memtable_max_range_deletions",
          {offsetof(struct MutableCFOptions, memtable_max_range_deletions),
@@ -1354,6 +1362,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  blob_garbage_collection_force_threshold);
   ROCKS_LOG_INFO(log, "           blob_compaction_readahead_size: %" PRIu64,
                  blob_compaction_readahead_size);
+  ROCKS_LOG_INFO(log, "                       disable_auto_flush: %d",
+                 static_cast<int>(disable_auto_flush));
   ROCKS_LOG_INFO(log, "                 blob_file_starting_level: %d",
                  blob_file_starting_level);
   ROCKS_LOG_INFO(log, "                   prepopulate_blob_cache: %s",

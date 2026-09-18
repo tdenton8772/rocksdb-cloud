@@ -1013,7 +1013,11 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
     uint64_t num_compaction_needed_bytes,
     const MutableCFOptions& mutable_cf_options,
     const ImmutableCFOptions& immutable_cf_options) {
-  if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
+  if (mutable_cf_options.disable_write_stall) {
+    return {WriteStallCondition::kNormal, WriteStallCause::kNone};
+  }
+  if (!mutable_cf_options.disable_auto_flush &&
+      num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
   } else if (!mutable_cf_options.disable_auto_compactions &&
              num_l0_files >= mutable_cf_options.level0_stop_writes_trigger) {
@@ -1054,10 +1058,28 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     uint64_t compaction_needed_bytes =
         vstorage->estimated_compaction_needed_bytes();
 
-    auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
-        imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
-        vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
-        ioptions());
+    // NOTE: we should check latest `mutable_cf_options_` instead of
+    // the passed `mutable_cf_options`. We want to make sure that
+    // once `disable_write_stall=true` is set, there won't be any
+    // write stall afterwards. But it's possible for async compaction jobs
+    // to install new super version with stale `mutable_cf_options`. For
+    // example:
+    // - Compaction starts with own copy of
+    // `mutable_cf_options(disable_write_stall=false)`
+    // - `SetOptions()` with `disable_write_stall=true`
+    // - Compaction finishes and calls `InstallSuperVersion` with
+    // `mutable_cf_options(disable_write_stall=true)`
+    std::pair<WriteStallCondition, WriteStallCause>
+        write_stall_condition_and_cause;
+    if (mutable_cf_options_.disable_write_stall) {
+      write_stall_condition_and_cause = {WriteStallCondition::kNormal,
+                                         WriteStallCause::kNone};
+    } else {
+      write_stall_condition_and_cause = GetWriteStallConditionAndCause(
+          imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
+          vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
+          ioptions());
+    }
     write_stall_condition = write_stall_condition_and_cause.first;
     auto write_stall_cause = write_stall_condition_and_cause.second;
 
@@ -1448,7 +1470,9 @@ void ColumnFamilyData::InstallSuperVersion(
   super_version_ = new_superversion;
   if (old_superversion == nullptr || old_superversion->current != current() ||
       old_superversion->mem != mem_ ||
-      old_superversion->imm != imm_.current()) {
+      old_superversion->imm != imm_.current() ||
+      old_superversion->mutable_cf_options.disable_write_stall !=
+          mutable_cf_options_.disable_write_stall) {
     // Should not recalculate slow down condition if nothing has changed, since
     // currently RecalculateWriteStallConditions() treats it as further slowing
     // down is needed.
@@ -1470,6 +1494,38 @@ void ColumnFamilyData::InstallSuperVersion(
       mem_->UpdateWriteBufferSize(
           new_superversion->mutable_cf_options.write_buffer_size);
     }
+
+    // Only enabling auto flush if it's disabled in previous superversion.
+    //
+    // NOTE: we can't check
+    // `old_superversion->mutable_cf_options.disable_auto_flush !=
+    // new_superversion->mutable_cf_options.disable_auto_flush` here since
+    // following sequence of actions is possible:
+    // - Compaction starts with own copy of `mutable_cf_options`
+    // (`disable_auto_flush=true`)
+    // - `SetOptions()` with `disable_auto_flush=false`
+    // - Compaction finishes and calls `InstallSuperVersion` with
+    // `mutable_cf_options`(`disable_auto_flush=true`)
+    //
+    // At this time, old_superversion has `disable_auto_flush=false` while
+    // `new_superversion` has `disable_auto_flush=true`.
+    if (old_superversion->mutable_cf_options.disable_auto_flush &&
+        !mutable_cf_options_.disable_auto_flush) {
+      ROCKS_LOG_INFO(
+          ioptions_.info_log,
+          "Enabling auto flush for column family: %s; old super "
+          "version: %" PRIu64
+          ", disable_auto_flush: %d; new super version: %" PRIu64
+          ", disable_auto_flush: %d",
+          GetName().c_str(), old_superversion->version_number,
+          static_cast<int>(
+              old_superversion->mutable_cf_options.disable_auto_flush),
+          new_superversion->version_number,
+          static_cast<int>(
+              new_superversion->mutable_cf_options.disable_auto_flush));
+      mem_->EnableAutoFlush();
+    }
+
     if (old_superversion->write_stall_condition !=
         new_superversion->write_stall_condition) {
       sv_context->PushWriteStallNotification(
@@ -1718,6 +1774,16 @@ Status ColumnFamilyData::SetOptions(
     // FIXME: we should call SanitizeOptions() too or consolidate it with
     // ValidateOptions().
     s = ValidateOptions(db_opts, cf_opts);
+  }
+  if (s.ok()) {
+    // Disabling flush on running db is not supported due to bunch of checks we
+    // added to catch unexpected flush. But it's easy to support it later if we
+    // want to
+    // TODO: make it supported
+    if (!mutable_cf_options_.disable_auto_flush && cf_opts.disable_auto_flush) {
+      s = Status::NotSupported(
+          "Disabling flush on running db is not supported");
+    }
   }
   if (s.ok()) {
     mutable_cf_options_ = MutableCFOptions(cf_opts);

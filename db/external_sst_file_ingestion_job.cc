@@ -155,7 +155,7 @@ Status ExternalSstFileIngestionJob::Prepare(
     if (ingestion_options_.move_files || ingestion_options_.link_files) {
       status =
           fs_->LinkFile(path_outside_db, path_inside_db, IOOptions(), nullptr);
-      if (status.ok()) {
+      if (status.ok() && !ingestion_options_.unsafe_disable_sync) {
         // It is unsafe to assume application had sync the file and file
         // directory before ingest the file. For integrity of RocksDB we need
         // to sync the file.
@@ -233,7 +233,7 @@ Status ExternalSstFileIngestionJob::Prepare(
   }
 
   TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncDir");
-  if (status.ok()) {
+  if (status.ok() && !ingestion_options_.unsafe_disable_sync) {
     for (auto path_id : ingestion_path_ids) {
       status = directories_->GetDataDir(path_id)->FsyncWithDirOptions(
           IOOptions(), nullptr,

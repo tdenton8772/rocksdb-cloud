@@ -204,7 +204,9 @@ struct MutableCFOptions {
         memtable_avg_op_scan_flush_trigger(
             options.memtable_avg_op_scan_flush_trigger),
         min_tombstones_for_range_conversion(
-            options.min_tombstones_for_range_conversion) {
+            options.min_tombstones_for_range_conversion),
+        disable_auto_flush(options.disable_auto_flush),
+        disable_write_stall(options.disable_write_stall) {
     RefreshDerivedOptions(options.num_levels, options.compaction_style);
   }
 
@@ -267,7 +269,9 @@ struct MutableCFOptions {
         uncache_aggressiveness(0),
         memtable_op_scan_flush_trigger(0),
         memtable_avg_op_scan_flush_trigger(0),
-        min_tombstones_for_range_conversion(0) {}
+        min_tombstones_for_range_conversion(0),
+        disable_auto_flush(false),
+        disable_write_stall(false) {}
 
   explicit MutableCFOptions(const Options& options);
 
@@ -386,6 +390,9 @@ struct MutableCFOptions {
   // Derived options
   // Per-level target file size.
   std::vector<uint64_t> max_file_size;
+
+  bool disable_auto_flush;
+  bool disable_write_stall;
 };
 
 uint64_t MultiplyCheckOverflow(uint64_t op1, double op2);

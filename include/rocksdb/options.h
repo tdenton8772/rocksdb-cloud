@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -344,6 +345,19 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   //
   // Default: nullptr
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
+
+  // Disable automatic flush(exceed `write_buffer_size` limit). Manual flush
+  // (including exceeding `db_write_buffer_size` limit) can still be issued
+  //
+  // Dynamically changeable through SetOptions() API
+  // Default: false, auto flush is enabled
+  bool disable_auto_flush = false;
+
+  // No write stall will be triggered if true.
+  //
+  // Dynamically changeable through SetOptions() API
+  // Default: false, write stall will be enabled
+  bool disable_write_stall = false;
 
   // RocksDB will try to flush the current memtable after the number of range
   // deletions is >= this limit. For workloads with many range
@@ -1722,6 +1736,14 @@ struct DBOptions {
   // Default: false
   bool allow_data_in_errors = false;
 
+  // If disable_manifest_sync is set to true the MANIFEST file will not be
+  // synced (using fsync or fdatasync) after every write. Use this only in
+  // situations where you don't care about database integrity after a power
+  // cycle.
+  //
+  // Default: false
+  bool disable_manifest_sync = false;
+
   // A string identifying the machine hosting the DB. This
   // will be written as a property in every SST file written by the DB (or
   // by offline writers such as SstFileWriter and RepairDB). It can be useful
@@ -1781,6 +1803,13 @@ struct DBOptions {
   // inconsistency, e.g. deleted old data become visible again, etc.
   bool enforce_single_del_contracts = true;
 
+  // If set to true, obsolete file deletion will be disabled when db is opened
+  // (i.e., `delete_obsolete_files_on_open` will be initialized as 1).
+  //
+  // Default: false
+  bool disable_delete_obsolete_files_on_open = false;
+
+  // EXPERIMENTAL
   // Implementing off-peak duration awareness in RocksDB. In this context,
   // "off-peak time" signifies periods characterized by significantly less read
   // and write activity compared to other times. By leveraging this knowledge,
@@ -2352,6 +2381,17 @@ struct ReadOptions {
   // in background.
   bool background_purge_on_iterator_cleanup = false;
 
+  // This flag specifies that the implementation should optimize reads
+  // mainly for cases where keys are found rather than also optimize for keys
+  // missed. This would be used in cases where the application knows that
+  // there are very few misses or the performance in the case of misses is not
+  // important.
+  // If true, avoid checking filters for the last level i.e the largest level
+  // which contains data of the LSM store. For keys which are hits, querying
+  // filters in this level is not useful because we will search for the data
+  // anyway.
+  bool optimize_for_hits = false;
+
   // A callback to determine whether relevant keys for this scan exist in a
   // given table based on the table's properties. The callback is passed the
   // properties of each table during iteration. If the callback returns false,
@@ -2916,6 +2956,12 @@ struct IngestExternalFileOptions {
   // ingestion. However, if no checksum information is provided with the
   // ingested files, DB will generate the checksum and store in the Manifest.
   bool verify_file_checksum = true;
+
+  // Only set unsafe_disable_sync to true if you know what you're doing. If set
+  // to true no file sync operations will be performed when ingesting the
+  // external file.
+  bool unsafe_disable_sync = false;
+
   // Set to TRUE if user wants file to be ingested to the last level. An
   // error of Status::TryAgain() will be returned if a file cannot fit in the
   // last level when calling
@@ -3065,6 +3111,8 @@ enum TraceFilterType : uint64_t {
   kTraceFilterIteratorSeekForPrev = 0x1 << 3,
   // Do not trace the `MultiGet()` operations
   kTraceFilterMultiGet = 0x1 << 4,
+  // Do not include user data in the referenced_key in block cache traces
+  kTraceFilterReferencedKey = 0x1 << 5,
 };
 
 // TraceOptions is used for StartTrace

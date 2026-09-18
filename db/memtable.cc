@@ -228,6 +228,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
           ioptions.memtable_insert_with_hint_prefix_extractor.get()),
       oldest_key_time_(std::numeric_limits<uint64_t>::max()),
       approximate_memory_usage_(0),
+      disable_auto_flush_(mutable_cf_options.disable_auto_flush),
       memtable_max_range_deletions_(
           mutable_cf_options.memtable_max_range_deletions),
       key_validation_callback_(
@@ -375,9 +376,25 @@ FlushReason MemTable::GetFlushReason() const {
   return FlushReason::kWriteBufferFull;
 }
 
+void MemTable::EnableAutoFlush() {
+  bool flush_previously_disabled =
+      disable_auto_flush_.exchange(false, std::memory_order_relaxed);
+  if (!flush_previously_disabled) {
+    ROCKS_LOG_WARN(moptions_.info_log,
+                   "EnableFlush called when flush is already enabled");
+  }
+}
+
+bool MemTable::TEST_IsAutoFlushEnabled() const {
+  return !disable_auto_flush_.load(std::memory_order_relaxed);
+}
+
 void MemTable::UpdateFlushState() {
   auto state = flush_state_.load(std::memory_order_relaxed);
   if (state == FLUSH_NOT_REQUESTED && ShouldFlushNow()) {
+    if (disable_auto_flush_.load(std::memory_order_relaxed)) {
+      return;
+    }
     // ignore CAS failure, because that means somebody else requested
     // a flush
     flush_state_.compare_exchange_strong(state, FLUSH_REQUESTED,
@@ -1366,6 +1383,7 @@ static bool SaveValue(void* arg, const char* entry) {
     ValueType type;
     SequenceNumber seq;
     UnPackSequenceAndType(tag, &seq, &type);
+
     // If the value is not in the snapshot, skip it
     if (!s->CheckCallback(seq)) {
       return true;  // to continue to the next seq
