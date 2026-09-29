@@ -2,6 +2,7 @@
 #ifndef ROCKSDB_LITE
 
 #include "rocksdb/cloud/cloud_file_system_impl.h"
+#include "cloud/local_sst_cache_impl.h"
 
 #include <cinttypes>
 
@@ -44,6 +45,10 @@ CloudFileSystemImpl::CloudFileSystemImpl(
 }
 
 CloudFileSystemImpl::~CloudFileSystemImpl() {
+  // No cache worker may touch this file system after it is gone.
+  if (auto cache = ReadThroughCache()) {
+    cache->ForgetOwner(this);
+  }
   if (cloud_fs_options.cloud_log_controller) {
     cloud_fs_options.cloud_log_controller->StopTailingStream();
   }
@@ -170,6 +175,22 @@ IOStatus CloudFileSystemImpl::NewSequentialFile(
     return st;
   }
 
+  if (sstfile && cloud_fs_options.local_sst_file_mode ==
+                     LocalSstFileMode::kReadThroughCache) {
+    // One-shot sequential readers use a local copy if there is one, else read
+    // remotely; they never trigger a download.
+    st = base_fs_->NewSequentialFile(fname, file_opts, result, dbg);
+    if (st.ok()) {
+      return st;
+    }
+    std::unique_ptr<CloudStorageReadableFile> file;
+    st = NewCloudReadableFile(fname, file_opts, &file, dbg);
+    if (st.ok()) {
+      result->reset(file.release());
+    }
+    return st;
+  }
+
   if (sstfile || manifest || identity) {
     if (KeepsLocalSstFiles(cloud_fs_options.local_sst_file_mode) || !sstfile) {
       // We read first from local storage and then from cloud storage.
@@ -236,6 +257,11 @@ IOStatus CloudFileSystemImpl::NewRandomAccessFile(
   auto st = status_to_io_status(CheckOption(file_opts));
   if (!st.ok()) {
     return st;
+  }
+
+  if (sstfile && cloud_fs_options.local_sst_file_mode ==
+                     LocalSstFileMode::kReadThroughCache) {
+    return NewReadThroughFile(fname, file_opts, result, dbg);
   }
 
   const IOOptions io_opts;
@@ -727,6 +753,11 @@ IOStatus CloudFileSystemImpl::DeleteFile(const std::string& logical_fname,
   }
 
   IOStatus st;
+  if (sstfile) {
+    if (auto cache = ReadThroughCache()) {
+      cache->Remove(fname);
+    }
+  }
   // Delete from destination bucket and local dir
   if (sstfile || manifest || identity) {
     if (HasDestBucket()) {
@@ -1608,6 +1639,109 @@ IOStatus CloudFileSystemImpl::LoadCloudManifest(const std::string& local_dbname,
 // Create appropriate files in the clone dir
 //
 IOStatus CloudFileSystemImpl::SanitizeLocalDirectory(
+    const DBOptions& options, const std::string& local_name, bool read_only) {
+  IOStatus st = SanitizeLocalDirectoryInner(options, local_name, read_only);
+  if (st.ok() && cloud_fs_options.local_sst_file_mode ==
+                     LocalSstFileMode::kReadThroughCache) {
+    // Copies left by a previous process count against the budget from the
+    // first read, not only once each is reopened.
+    RegisterLocalSsts(local_name);
+  }
+  return st;
+}
+
+std::shared_ptr<LocalSstCacheImpl> CloudFileSystemImpl::ReadThroughCache()
+    const {
+  if (cloud_fs_options.local_sst_file_mode !=
+      LocalSstFileMode::kReadThroughCache) {
+    return nullptr;
+  }
+  return std::dynamic_pointer_cast<LocalSstCacheImpl>(
+      cloud_fs_options.local_sst_cache);
+}
+
+IOStatus CloudFileSystemImpl::NewReadThroughFile(
+    const std::string& fname, const FileOptions& file_opts,
+    std::unique_ptr<FSRandomAccessFile>* result, IODebugContext* dbg) {
+  auto cache = ReadThroughCache();
+  if (!cache) {
+    // No cache configured: behave as kRemotePrimary.
+    std::unique_ptr<CloudStorageReadableFile> file;
+    IOStatus st = NewCloudReadableFile(fname, file_opts, &file, dbg);
+    if (st.ok()) {
+      result->reset(file.release());
+    }
+    return st;
+  }
+
+  auto slot = cache->Acquire(fname, base_fs_, this);
+  {
+    std::lock_guard<std::mutex> sl(slot->mu);
+    slot->local_opts = file_opts;
+  }
+
+  const IOOptions io_opts;
+  uint64_t size = 0;
+  IOStatus st = base_fs_->FileExists(fname, io_opts, dbg);
+  if (st.ok()) {
+    st = base_fs_->GetFileSize(fname, io_opts, &size, dbg);
+    if (!st.ok()) {
+      return st;
+    }
+    // A complete local copy (downloads land by rename): account it.
+    cache->RegisterResident(fname, size, base_fs_, this);
+  } else {
+    st = GetCloudObjectSize(fname, &size);
+    if (!st.ok()) {
+      return st;
+    }
+  }
+
+  auto remote_factory =
+      [this, fname, file_opts](
+          std::unique_ptr<CloudStorageReadableFile>* out) -> IOStatus {
+    return NewCloudReadableFile(fname, file_opts, out, nullptr);
+  };
+  // The download writes to a temporary name and renames into place
+  // (CloudStorageProviderImpl::GetCloudObject), so a partial file is never
+  // visible at `fname`. It runs on a cache worker; ForgetOwner in the
+  // destructor guarantees it never outlives this file system.
+  auto download_factory = [this, fname]() -> std::function<IOStatus()> {
+    return [this, fname]() -> IOStatus { return GetCloudObject(fname); };
+  };
+  result->reset(new ReadThroughFile(cache, slot, size, remote_factory,
+                                    download_factory));
+  return IOStatus::OK();
+}
+
+void CloudFileSystemImpl::RegisterLocalSsts(const std::string& local_name) {
+  auto cache = ReadThroughCache();
+  if (!cache) {
+    return;
+  }
+  const IOOptions io_opts;
+  std::vector<std::string> children;
+  if (!base_fs_->GetChildren(local_name, io_opts, &children, nullptr).ok()) {
+    return;
+  }
+  for (const auto& c : children) {
+    const std::string path = local_name + pathsep + c;
+    if (c.find(".tmp-") != std::string::npos) {
+      // An interrupted download: never complete, never accounted.
+      base_fs_->DeleteFile(path, io_opts, nullptr);
+      continue;
+    }
+    if (GetFileType(path) != RocksDBFileType::kSstFile) {
+      continue;
+    }
+    uint64_t size = 0;
+    if (base_fs_->GetFileSize(path, io_opts, &size, nullptr).ok()) {
+      cache->RegisterResident(path, size, base_fs_, this);
+    }
+  }
+}
+
+IOStatus CloudFileSystemImpl::SanitizeLocalDirectoryInner(
     const DBOptions& options, const std::string& local_name, bool read_only) {
   const auto& local_fs = GetBaseFileSystem();
   const IOOptions io_opts;

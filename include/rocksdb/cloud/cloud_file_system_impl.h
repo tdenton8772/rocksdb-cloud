@@ -22,6 +22,8 @@ class CloudFileDeletionScheduler;
 //
 // The Cloud file system
 //
+class LocalSstCacheImpl;
+
 class CloudFileSystemImpl : public CloudFileSystem {
   friend class CloudFileSystemEnv;
 
@@ -419,6 +421,20 @@ class CloudFileSystemImpl : public CloudFileSystem {
   }
 
  private:
+  // kReadThroughCache: the process-wide cache, or null if none was configured.
+  std::shared_ptr<LocalSstCacheImpl> ReadThroughCache() const;
+  // kReadThroughCache: a ReadThroughFile for the (remapped) SST `fname`.
+  IOStatus NewReadThroughFile(const std::string& fname,
+                              const FileOptions& file_opts,
+                              std::unique_ptr<FSRandomAccessFile>* result,
+                              IODebugContext* dbg);
+  // kReadThroughCache: account every complete local SST under `local_name`
+  // against the cache budget, and delete interrupted downloads.
+  void RegisterLocalSsts(const std::string& local_name);
+  IOStatus SanitizeLocalDirectoryInner(const DBOptions& options,
+                                       const std::string& local_name,
+                                       bool read_only);
+
   // Files are invisibile if:
   // - It's CLOUDMANFIEST file and cookie is not active. NOTE: empty cookie is
   // always active

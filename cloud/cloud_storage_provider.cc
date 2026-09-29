@@ -6,6 +6,7 @@
 #include <cinttypes>
 
 #include "cloud/filename.h"
+#include "cloud/local_sst_cache_impl.h"
 #include "file/filename.h"
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
@@ -181,6 +182,24 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
           "[%s] CloudWritableFile closing PutObject failed on local file %s",
           Name(), fname_.c_str());
       return status_;
+    }
+
+    // kReadThroughCache: the local copy stays, now safe to evict because the
+    // object is in cloud storage, and counts against the cache budget --
+    // which may evict it (or others) straight away.
+    const auto& cfo = cfs_->GetCloudFileSystemOptions();
+    if (cfo.local_sst_file_mode == LocalSstFileMode::kReadThroughCache) {
+      auto cache =
+          std::dynamic_pointer_cast<LocalSstCacheImpl>(cfo.local_sst_cache);
+      auto* owner = dynamic_cast<CloudFileSystemImpl*>(cfs_);
+      uint64_t size = 0;
+      if (cache && owner &&
+          cfs_->GetBaseFileSystem()
+              ->GetFileSize(fname_, opts, &size, dbg)
+              .ok()) {
+        cache->RegisterResident(fname_, size, cfs_->GetBaseFileSystem(),
+                                static_cast<const void*>(owner));
+      }
     }
 
     // delete local file

@@ -57,6 +57,9 @@ void CloudFileSystemOptions::Dump(Logger* log) const {
       case LocalSstFileMode::kEagerMirror: mode_str = "eager_mirror"; break;
       case LocalSstFileMode::kCacheOnDemand: mode_str = "cache_on_demand"; break;
       case LocalSstFileMode::kTrickleSync: mode_str = "trickle_sync"; break;
+      case LocalSstFileMode::kReadThroughCache:
+        mode_str = "read_through_cache";
+        break;
     }
     Header(log, "              COptions.local_sst_file_mode: %s", mode_str);
   }
@@ -314,6 +317,7 @@ static std::unordered_map<std::string, LocalSstFileMode>
         {"kEagerMirror", LocalSstFileMode::kEagerMirror},
         {"kCacheOnDemand", LocalSstFileMode::kCacheOnDemand},
         {"kTrickleSync", LocalSstFileMode::kTrickleSync},
+        {"kReadThroughCache", LocalSstFileMode::kReadThroughCache},
 };
 
 const std::unordered_map<std::string, OptionTypeInfo>
