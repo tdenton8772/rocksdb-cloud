@@ -574,6 +574,17 @@ class CompactionService : public Customizable {
   virtual void OnInstallation(const std::string& /*scheduled_job_id*/,
                               CompactionServiceJobStatus /*status*/) {}
 
+  // rocksdb-cloud: when true, a remote job that fails -- kFailure from
+  // Schedule() or Wait(), a remote error status, an unparseable result, or an
+  // output that cannot be installed -- abandons the compaction as
+  // Status::Incomplete(kCompactionAborted) instead of failing it. An aborted
+  // compaction sets no background error, so writes continue; its inputs stay
+  // in the LSM and are picked again later. It also never falls back to a
+  // local compaction. RocksDB does not sleep between aborted compactions, so a
+  // service that opts in should pace its own retries (e.g. back off inside
+  // Schedule()).
+  virtual bool AbortCompactionOnFailure() const { return false; }
+
   ~CompactionService() override = default;
 };
 
