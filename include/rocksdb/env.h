@@ -2095,4 +2095,15 @@ Status NewEnvLogger(const std::string& fname, Env* env,
 // FileSystem.
 std::unique_ptr<Env> NewCompositeEnv(const std::shared_ptr<FileSystem>& fs);
 
+// rocksdb-cloud: like NewCompositeEnv, but the returned Env owns its own
+// background thread pools (LOW, HIGH, BOTTOM, USER) instead of sharing
+// Env::Default()'s process-wide pools. A DB opened with it schedules its
+// flushes and compactions only on its own threads, so one DB's long-running
+// jobs (e.g. a CompactionService::Wait on a remote compaction) never occupy a
+// thread another DB needs. Everything else (files, clock, StartThread,
+// thread ids) is Env::Default()'s. The Env must outlive every DB that uses it;
+// destroying it waits for queued jobs and joins its threads.
+std::unique_ptr<Env> NewCompositeEnvWithPrivateThreadPools(
+    const std::shared_ptr<FileSystem>& fs);
+
 }  // namespace ROCKSDB_NAMESPACE

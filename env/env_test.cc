@@ -19,6 +19,8 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <list>
 #include <mutex>
 #include <unordered_set>
@@ -5035,6 +5037,91 @@ TEST_F(EnvTest, WriteStringToFileCloseFailureDeletesFile) {
   // The file should have been deleted on failure
   auto exists = FileSystem::Default()->FileExists(fname, IOOptions(), nullptr);
   ASSERT_TRUE(exists.IsNotFound()) << exists.ToString();
+}
+
+
+// rocksdb-cloud: NewCompositeEnvWithPrivateThreadPools.
+TEST(PrivateThreadPoolEnvTest, PoolsAreIndependent) {
+  auto a = NewCompositeEnvWithPrivateThreadPools(FileSystem::Default());
+  auto b = NewCompositeEnvWithPrivateThreadPools(FileSystem::Default());
+  a->SetBackgroundThreads(1, Env::LOW);
+  b->SetBackgroundThreads(1, Env::LOW);
+
+  struct Gate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open = false;
+    std::atomic<bool> ran{false};
+  };
+  Gate block, done;
+  // a's only LOW thread waits until released -- a stand-in for a
+  // CompactionService::Wait on a remote job.
+  a->Schedule(
+      [](void* p) {
+        auto* g = static_cast<Gate*>(p);
+        std::unique_lock<std::mutex> lk(g->mu);
+        g->cv.wait(lk, [g] { return g->open; });
+      },
+      &block, Env::LOW);
+  b->Schedule([](void* p) { static_cast<Gate*>(p)->ran = true; }, &done,
+              Env::LOW);
+  for (int i = 0; i < 500 && !done.ran; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(done.ran) << "b's job waited behind a's blocked thread";
+
+  // A job queued on a waits behind a's blocked thread, not on b's or the
+  // default pool.
+  Gate queued;
+  a->Schedule([](void* p) { static_cast<Gate*>(p)->ran = true; }, &queued,
+              Env::LOW);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ASSERT_FALSE(queued.ran);
+  ASSERT_EQ(1u, a->GetThreadPoolQueueLen(Env::LOW));
+  ASSERT_EQ(0u, b->GetThreadPoolQueueLen(Env::LOW));
+  {
+    std::lock_guard<std::mutex> lk(block.mu);
+    block.open = true;
+  }
+  block.cv.notify_all();
+  for (int i = 0; i < 500 && !queued.ran; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(queued.ran);
+}
+
+TEST(PrivateThreadPoolEnvTest, DBRunsOnlyOnItsOwnPools) {
+  const int default_low = Env::Default()->GetBackgroundThreads(Env::LOW);
+  const int default_high = Env::Default()->GetBackgroundThreads(Env::HIGH);
+  auto env = NewCompositeEnvWithPrivateThreadPools(FileSystem::Default());
+  const std::string dbname =
+      test::PerThreadDBPath(env.get(), "private_thread_pool_env_db");
+  Options options;
+  options.env = env.get();
+  options.create_if_missing = true;
+  options.max_background_jobs = 4;
+  ASSERT_OK(DestroyDB(dbname, options));
+  {
+    std::unique_ptr<DB> db;
+    ASSERT_OK(DB::Open(options, dbname, &db));
+    for (int f = 0; f < 4; ++f) {
+      for (int i = 0; i < 100; ++i) {
+        ASSERT_OK(db->Put(WriteOptions(), "k" + std::to_string(i),
+                          "v" + std::to_string(f)));
+      }
+      ASSERT_OK(db->Flush(FlushOptions()));
+    }
+    ASSERT_OK(db->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+    std::string v;
+    ASSERT_OK(db->Get(ReadOptions(), "k7", &v));
+    ASSERT_EQ("v3", v);
+    ASSERT_GT(env->GetBackgroundThreads(Env::LOW), 0);
+    ASSERT_GT(env->GetBackgroundThreads(Env::HIGH), 0);
+    ASSERT_OK(db->Close());
+  }
+  ASSERT_EQ(default_low, Env::Default()->GetBackgroundThreads(Env::LOW));
+  ASSERT_EQ(default_high, Env::Default()->GetBackgroundThreads(Env::HIGH));
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 }  // namespace ROCKSDB_NAMESPACE
