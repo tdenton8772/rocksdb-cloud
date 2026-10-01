@@ -393,6 +393,22 @@ class CloudFileSystemOptions {
   // Default: false.
   bool skip_cloud_files_in_getchildren;
 
+  // Remote compaction: installing a worker's outputs.
+  //
+  // RocksDB installs a remote compaction's outputs by renaming each file from
+  // the job's output directory to its table name
+  // (db/compaction/compaction_service_job.cc), and RenameFile refuses SSTs. When
+  // this is non-empty, an SST whose source directory is
+  // ".../<remote_compaction_staging_dir>/<job>" is a STAGED output: the worker
+  // uploaded it to "<dest object path>/<remote_compaction_staging_dir>/<job>/<file>",
+  // and the rename becomes an S3 server-side copy to the target's cloud name
+  // followed by a delete of the staged object. The bytes never pass through
+  // this process and no local copy is made, so it is refused in kEagerMirror,
+  // which requires every SST locally.
+  //
+  // Default: "" (disabled; SST renames are refused as before).
+  std::string remote_compaction_staging_dir;
+
   // If true, the files from S3 will be downloaded using direct IO. It is
   // recommended to set this to true, the only reason the default is false is to
   // avoid behavior changes with default configuration.

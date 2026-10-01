@@ -558,6 +558,12 @@ IOStatus CloudFileSystemImpl::RenameFile(const std::string& logical_src,
        identity = (file_type == RocksDBFileType::kIdentityFile),
        logfile = (file_type == RocksDBFileType::kLogFile);
 
+  // A remote compaction's staged output: install by server-side copy.
+  std::string staged_key;
+  if (sstfile && StagedSstKey(logical_src, &staged_key)) {
+    return InstallStagedSst(staged_key, logical_target);
+  }
+
   // Rename should never be called on sst files.
   if (sstfile) {
     Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
@@ -1111,6 +1117,64 @@ std::string CloudFileSystemImpl::srcname(const std::string& localname) {
   assert(cloud_fs_options.src_bucket.IsValid());
   return cloud_fs_options.src_bucket.GetObjectPath() + "/" +
          basename(localname);
+}
+
+// ".../<staging_dir>/<job>/<file>" -> "<dest object path>/<staging_dir>/<job>/<file>"
+bool CloudFileSystemImpl::StagedSstKey(const std::string& logical_src,
+                                       std::string* key) const {
+  const std::string& dir = cloud_fs_options.remote_compaction_staging_dir;
+  if (dir.empty() || !cloud_fs_options.dest_bucket.IsValid()) {
+    return false;
+  }
+  const size_t f = logical_src.rfind('/');
+  if (f == std::string::npos || f + 1 >= logical_src.size()) {
+    return false;
+  }
+  const std::string parent = logical_src.substr(0, f);
+  const size_t j = parent.rfind('/');
+  if (j == std::string::npos || j + 1 >= parent.size()) {
+    return false;
+  }
+  const std::string job = parent.substr(j + 1);
+  const std::string above = parent.substr(0, j);
+  const size_t s = above.rfind('/');
+  const std::string staging =
+      s == std::string::npos ? above : above.substr(s + 1);
+  if (staging != dir) {
+    return false;
+  }
+  *key = cloud_fs_options.dest_bucket.GetObjectPath() + "/" + dir + "/" + job +
+         "/" + logical_src.substr(f + 1);
+  return true;
+}
+
+IOStatus CloudFileSystemImpl::InstallStagedSst(
+    const std::string& staged_key, const std::string& logical_target) {
+  if (cloud_fs_options.local_sst_file_mode == LocalSstFileMode::kEagerMirror) {
+    // kEagerMirror serves every read from a local copy; installing an output
+    // that exists only in the cloud would break that.
+    return IOStatus::NotSupported(
+        "remote compaction install is not supported in kEagerMirror",
+        staged_key);
+  }
+  const std::string target_key = destname(RemapFilename(logical_target));
+  IOStatus st = GetStorageProvider()->CopyCloudObject(
+      GetDestBucketName(), staged_key, GetDestBucketName(), target_key);
+  if (!st.ok()) {
+    Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+        "[%s] InstallStagedSst copy %s -> %s failed: %s", Name(),
+        staged_key.c_str(), target_key.c_str(), st.ToString().c_str());
+    return st;
+  }
+  // The target is in place; a staged object left behind is an orphan for the
+  // GC, never a correctness problem, so a failed delete does not fail the
+  // install.
+  IOStatus del = GetStorageProvider()->DeleteCloudObject(GetDestBucketName(),
+                                                         staged_key);
+  Log(del.ok() ? InfoLogLevel::INFO_LEVEL : InfoLogLevel::WARN_LEVEL, info_log_,
+      "[%s] InstallStagedSst %s -> %s (staged delete: %s)", Name(),
+      staged_key.c_str(), target_key.c_str(), del.ToString().c_str());
+  return IOStatus::OK();
 }
 
 //

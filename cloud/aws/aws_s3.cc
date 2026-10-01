@@ -822,7 +822,9 @@ IOStatus S3StorageProvider::CopyCloudObject(
   Aws::String src_object = ToAwsString(object_path_src);
   Aws::String dest_object = ToAwsString(object_path_dest);
 
-  Aws::String src_url = src_bucket + src_object;
+  // CopySource is "<bucket>/<key>". Without the separator the request names a
+  // bucket that does not exist ("<bucket><key-prefix>"), and every copy fails.
+  Aws::String src_url = src_bucket + "/" + src_object;
 
   // create copy request
   Aws::S3::Model::CopyObjectRequest request;
