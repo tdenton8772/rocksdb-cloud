@@ -575,8 +575,9 @@ class CompactionService : public Customizable {
                               CompactionServiceJobStatus /*status*/) {}
 
   // rocksdb-cloud: when true, a remote job that fails -- kFailure from
-  // Schedule() or Wait(), a remote error status, an unparseable result, or an
-  // output that cannot be installed -- abandons the compaction as
+  // Schedule() or Wait(), kAborted (the service canceled it, e.g. on close), a
+  // remote error status, an unparseable result, or an output that cannot be
+  // installed -- abandons the compaction as
   // Status::Incomplete(kCompactionAborted) instead of failing it. An aborted
   // compaction sets no background error, so writes continue; its inputs stay
   // in the LSM and are picked again later. It also never falls back to a

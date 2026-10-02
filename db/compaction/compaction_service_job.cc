@@ -103,6 +103,12 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       response.status == CompactionServiceJobStatus::kFailure) {
     return abandon("Schedule()", "the service could not schedule the job");
   }
+  if (abort_on_failure &&
+      response.status == CompactionServiceJobStatus::kAborted) {
+    // Status::Aborted would be a background error; a canceled job is not one.
+    abandon("Schedule()", "the service canceled the job");
+    return CompactionServiceJobStatus::kAborted;
+  }
   switch (response.status) {
     case CompactionServiceJobStatus::kSuccess:
       break;
@@ -171,6 +177,13 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     return compaction_status;
   }
 
+  if (abort_on_failure &&
+      compaction_status == CompactionServiceJobStatus::kAborted) {
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kAborted);
+    abandon("Wait()", "the service canceled the job");
+    return compaction_status;
+  }
   if (compaction_status == CompactionServiceJobStatus::kAborted) {
     sub_compact->status =
         Status::Aborted("Waiting a remote compaction job was aborted");

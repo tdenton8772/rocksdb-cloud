@@ -1736,6 +1736,17 @@ TEST_F(CompactionServiceAbortTest, WaitFailure) {
             my_cs->GetFinalCompactionServiceJobStatus());
 }
 
+TEST_F(CompactionServiceAbortTest, CanceledWaitIsNotABackgroundError) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  auto my_cs = GetCompactionService();
+  my_cs->SetAbortOnFailure(true);
+  my_cs->OverrideWaitStatus(CompactionServiceJobStatus::kAborted);
+  ExpectAbandoned(my_cs);
+}
+
 TEST_F(CompactionServiceAbortTest, InvalidResultDoesNotFallBackToLocal) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
