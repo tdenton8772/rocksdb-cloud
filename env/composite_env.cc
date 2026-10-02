@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 #include "env/composite_env_wrapper.h"
+#include "util/threadpool_imp.h"
 #include "rocksdb/utilities/options_type.h"
 #include "util/string_util.h"
 
@@ -455,6 +456,78 @@ static std::unordered_map<std::string, OptionTypeInfo>
 
 std::unique_ptr<Env> NewCompositeEnv(const std::shared_ptr<FileSystem>& fs) {
   return std::unique_ptr<Env>(new CompositeEnvWrapper(Env::Default(), fs));
+}
+
+namespace {
+// CompositeEnvWrapper whose background scheduling goes to thread pools it owns.
+class PrivateThreadPoolEnv : public CompositeEnvWrapper {
+ public:
+  explicit PrivateThreadPoolEnv(const std::shared_ptr<FileSystem>& fs)
+      : CompositeEnvWrapper(Env::Default(), fs), pools_(Priority::TOTAL) {
+    for (int p = 0; p < Priority::TOTAL; ++p) {
+      pools_[p].SetThreadPriority(static_cast<Priority>(p));
+      pools_[p].SetHostEnv(this);
+    }
+  }
+  ~PrivateThreadPoolEnv() override {
+    for (auto& pool : pools_) {
+      pool.JoinAllThreads();
+    }
+  }
+
+  static const char* kClassName() { return "PrivateThreadPoolEnv"; }
+  const char* Name() const override { return kClassName(); }
+
+  void Schedule(void (*f)(void* arg), void* a, Priority pri, void* tag,
+                void (*u)(void* arg)) override {
+    pool(pri).Schedule(f, a, tag, u);
+  }
+  int UnSchedule(void* tag, Priority pri) override {
+    return pool(pri).UnSchedule(tag);
+  }
+  unsigned int GetThreadPoolQueueLen(Priority pri) const override {
+    return pools_[Index(pri)].GetQueueLen();
+  }
+  int ReserveThreads(int n, Priority pri) override {
+    return pool(pri).ReserveThreads(n);
+  }
+  int ReleaseThreads(int n, Priority pri) override {
+    return pool(pri).ReleaseThreads(n);
+  }
+  void SetBackgroundThreads(int num, Priority pri) override {
+    pool(pri).SetBackgroundThreads(num);
+  }
+  int GetBackgroundThreads(Priority pri) override {
+    return pool(pri).GetBackgroundThreads();
+  }
+  void IncBackgroundThreadsIfNeeded(int num, Priority pri) override {
+    pool(pri).IncBackgroundThreadsIfNeeded(num);
+  }
+  void LowerThreadPoolIOPriority(Priority pri) override {
+    pool(pri).LowerIOPriority();
+  }
+  void LowerThreadPoolCPUPriority(Priority pri) override {
+    pool(pri).LowerCPUPriority(CpuPriority::kLow);
+  }
+  Status LowerThreadPoolCPUPriority(Priority pri, CpuPriority cpu) override {
+    pool(pri).LowerCPUPriority(cpu);
+    return Status::OK();
+  }
+
+ private:
+  static int Index(Priority pri) {
+    assert(pri >= Priority::BOTTOM && pri < Priority::TOTAL);
+    return static_cast<int>(pri);
+  }
+  ThreadPoolImpl& pool(Priority pri) { return pools_[Index(pri)]; }
+
+  std::vector<ThreadPoolImpl> pools_;
+};
+}  // namespace
+
+std::unique_ptr<Env> NewCompositeEnvWithPrivateThreadPools(
+    const std::shared_ptr<FileSystem>& fs) {
+  return std::unique_ptr<Env>(new PrivateThreadPoolEnv(fs));
 }
 
 CompositeEnvWrapper::CompositeEnvWrapper(Env* env,

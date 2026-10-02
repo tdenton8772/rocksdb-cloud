@@ -227,6 +227,9 @@ class MyTestCompactionService : public CompactionService {
   void SetCanceled(bool canceled) { canceled_ = canceled; }
   bool GetCanceled() { return canceled_; }
 
+  bool AbortCompactionOnFailure() const override { return abort_on_failure_; }
+  void SetAbortOnFailure(bool abort) { abort_on_failure_ = abort; }
+
   void GetResult(CompactionServiceResult* deserialized) {
     CompactionServiceResult::Read(result_, deserialized).PermitUncheckedError();
   }
@@ -268,6 +271,7 @@ class MyTestCompactionService : public CompactionService {
   std::atomic_int installation_callback_count_{0};
   std::atomic<CompactionServiceJobStatus> final_updated_status_{
       CompactionServiceJobStatus::kUseLocal};
+  std::atomic_bool abort_on_failure_{false};
 
  protected:
   std::atomic_bool canceled_{false};
@@ -1674,6 +1678,113 @@ TEST_F(CompactionServiceTest, InvalidResultFallsBackToLocal) {
   ASSERT_EQ(1, my_cs->GetOnInstallationCount());
   ASSERT_EQ(CompactionServiceJobStatus::kUseLocal,
             my_cs->GetFinalCompactionServiceJobStatus());
+}
+
+// rocksdb-cloud: AbortCompactionOnFailure(). A failed remote job abandons the
+// compaction: no background error (writes continue), no local fallback (the
+// LSM is unchanged), and the same compaction succeeds once the service does.
+class CompactionServiceAbortTest : public CompactionServiceTest {
+ protected:
+  void ExpectAbandoned(MyTestCompactionService* my_cs) {
+    const std::string shape = FilesPerLevel();
+    std::string start_str = Key(15);
+    std::string end_str = Key(45);
+    Slice start(start_str);
+    Slice end(end_str);
+    Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+    ASSERT_TRUE(s.IsCompactionAborted()) << s.ToString();
+    ASSERT_OK(dbfull()->TEST_GetBGError());
+    // No local compaction ran in place of the remote one.
+    ASSERT_EQ(shape, FilesPerLevel());
+    ASSERT_OK(Put("written-after-abort", "v"));
+    ASSERT_OK(Flush());
+    ASSERT_EQ("v", Get("written-after-abort"));
+    ASSERT_OK(Delete("written-after-abort"));
+    ASSERT_OK(Flush());
+    VerifyTestData();
+
+    // The abandoned compaction runs remotely once the service recovers.
+    const int compactions = my_cs->GetCompactionNum();
+    my_cs->ResetOverride();
+    ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+    ASSERT_GT(my_cs->GetCompactionNum(), compactions);
+    VerifyTestData();
+  }
+};
+
+TEST_F(CompactionServiceAbortTest, ScheduleFailure) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  auto my_cs = GetCompactionService();
+  my_cs->SetAbortOnFailure(true);
+  my_cs->OverrideStartStatus(CompactionServiceJobStatus::kFailure);
+  ExpectAbandoned(my_cs);
+}
+
+TEST_F(CompactionServiceAbortTest, WaitFailure) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  auto my_cs = GetCompactionService();
+  my_cs->SetAbortOnFailure(true);
+  my_cs->OverrideWaitStatus(CompactionServiceJobStatus::kFailure);
+  ExpectAbandoned(my_cs);
+  ASSERT_EQ(CompactionServiceJobStatus::kSuccess,
+            my_cs->GetFinalCompactionServiceJobStatus());
+}
+
+TEST_F(CompactionServiceAbortTest, CanceledWaitIsNotABackgroundError) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  auto my_cs = GetCompactionService();
+  my_cs->SetAbortOnFailure(true);
+  my_cs->OverrideWaitStatus(CompactionServiceJobStatus::kAborted);
+  ExpectAbandoned(my_cs);
+}
+
+TEST_F(CompactionServiceAbortTest, InvalidResultDoesNotFallBackToLocal) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  auto my_cs = GetCompactionService();
+  my_cs->SetAbortOnFailure(true);
+  my_cs->OverrideWaitResult("Invalid Str");
+  const std::string shape = FilesPerLevel();
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_TRUE(s.IsCompactionAborted()) << s.ToString();
+  ASSERT_OK(dbfull()->TEST_GetBGError());
+  ASSERT_EQ(shape, FilesPerLevel());
+  ASSERT_EQ(1, my_cs->GetOnInstallationCount());
+  ASSERT_EQ(CompactionServiceJobStatus::kFailure,
+            my_cs->GetFinalCompactionServiceJobStatus());
+  ASSERT_OK(Put("written-after-abort", "v"));
+  VerifyTestData();
+}
+
+TEST_F(CompactionServiceAbortTest, WithoutOptInFailureStillSetsBGError) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+  auto my_cs = GetCompactionService();
+  my_cs->OverrideStartStatus(CompactionServiceJobStatus::kFailure);
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_TRUE(s.IsIncomplete());
+  ASSERT_FALSE(s.IsCompactionAborted());
 }
 
 TEST_F(CompactionServiceTest, CompatCheckCountsWidthTolerance) {

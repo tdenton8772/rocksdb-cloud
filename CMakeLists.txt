@@ -1111,6 +1111,7 @@ set(SOURCES
         cloud/db_cloud_impl.cc
         cloud/cloud_file_system.cc
         cloud/cloud_file_system_impl.cc
+        cloud/local_sst_cache.cc
         cloud/cloud_log_controller.cc
         cloud/manifest_reader.cc
         cloud/purge.cc

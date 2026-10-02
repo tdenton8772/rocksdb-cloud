@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <rocksdb/cloud/cloud_storage_provider.h>
+#include <rocksdb/cloud/local_sst_cache.h>
 #include <unordered_map>
 
 #include "rocksdb/cache.h"
@@ -69,11 +70,20 @@ enum LogType : unsigned char {
 // kTrickleSync:     Like kCacheOnDemand, plus a background thread that slowly
 //                   downloads all cloud SSTs to local storage over time.
 //                   Combines fast startup with eventual full local caching.
+//
+// kReadThroughCache: The first read of a non-local SST is served from cloud
+//                   storage while the whole file is brought to local disk;
+//                   later reads use the local copy. Local copies live under a
+//                   hard byte budget (LRU, optional TTL) enforced at admission,
+//                   so a node that suddenly owns many files gets slower rather
+//                   than filling its disk. Requires local_sst_cache; one cache
+//                   is meant to be shared by every DB in the process.
 enum class LocalSstFileMode : uint8_t {
   kRemotePrimary = 0,
   kEagerMirror = 1,
   kCacheOnDemand = 2,
   kTrickleSync = 3,
+  kReadThroughCache = 4,
 };
 
 // Returns true if local SST files are retained (not deleted after upload).
@@ -267,6 +277,12 @@ class CloudFileSystemOptions {
   // Default: kRemotePrimary (equivalent to legacy keep_local_sst_files=false)
   LocalSstFileMode local_sst_file_mode;
 
+  // The byte-bounded local SST cache used by kReadThroughCache (see
+  // rocksdb/cloud/local_sst_cache.h). Share one instance across every DB in
+  // the process. If null under kReadThroughCache, SSTs are read remotely and
+  // nothing is cached.
+  std::shared_ptr<LocalSstCache> local_sst_cache;
+
   // DEPRECATED: Use local_sst_file_mode directly.
   // Provided for backwards compatibility with existing code.
   void set_keep_local_sst_files(bool v) {
@@ -376,6 +392,22 @@ class CloudFileSystemOptions {
   //
   // Default: false.
   bool skip_cloud_files_in_getchildren;
+
+  // Remote compaction: installing a worker's outputs.
+  //
+  // RocksDB installs a remote compaction's outputs by renaming each file from
+  // the job's output directory to its table name
+  // (db/compaction/compaction_service_job.cc), and RenameFile refuses SSTs. When
+  // this is non-empty, an SST whose source directory is
+  // ".../<remote_compaction_staging_dir>/<job>" is a STAGED output: the worker
+  // uploaded it to "<dest object path>/<remote_compaction_staging_dir>/<job>/<file>",
+  // and the rename becomes an S3 server-side copy to the target's cloud name
+  // followed by a delete of the staged object. The bytes never pass through
+  // this process and no local copy is made, so it is refused in kEagerMirror,
+  // which requires every SST locally.
+  //
+  // Default: "" (disabled; SST renames are refused as before).
+  std::string remote_compaction_staging_dir;
 
   // If true, the files from S3 will be downloaded using direct IO. It is
   // recommended to set this to true, the only reason the default is false is to

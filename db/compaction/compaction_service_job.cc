@@ -82,8 +82,33 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       compaction->bottommost_level(), compaction->start_level(),
       compaction->output_level());
 
+  // rocksdb-cloud: with AbortCompactionOnFailure(), every remote failure
+  // abandons the compaction (no background error, no local fallback).
+  const bool abort_on_failure =
+      db_options_.compaction_service->AbortCompactionOnFailure();
+  auto abandon = [&](const char* where, const std::string& why) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[%s] [JOB %d] Remote compaction abandoned at %s: %s",
+                   compaction->column_family_data()->GetName().c_str(), job_id_,
+                   where, why.c_str());
+    sub_compact->status =
+        Status::Incomplete(Status::SubCode::kCompactionAborted);
+    sub_compact->io_status = IOStatus::OK();
+    return CompactionServiceJobStatus::kFailure;
+  };
+
   CompactionServiceScheduleResponse response =
       db_options_.compaction_service->Schedule(info, compaction_input_binary);
+  if (abort_on_failure &&
+      response.status == CompactionServiceJobStatus::kFailure) {
+    return abandon("Schedule()", "the service could not schedule the job");
+  }
+  if (abort_on_failure &&
+      response.status == CompactionServiceJobStatus::kAborted) {
+    // Status::Aborted would be a background error; a canceled job is not one.
+    abandon("Schedule()", "the service canceled the job");
+    return CompactionServiceJobStatus::kAborted;
+  }
   switch (response.status) {
     case CompactionServiceJobStatus::kSuccess:
       break;
@@ -152,6 +177,13 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     return compaction_status;
   }
 
+  if (abort_on_failure &&
+      compaction_status == CompactionServiceJobStatus::kAborted) {
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kAborted);
+    abandon("Wait()", "the service canceled the job");
+    return compaction_status;
+  }
   if (compaction_status == CompactionServiceJobStatus::kAborted) {
     sub_compact->status =
         Status::Aborted("Waiting a remote compaction job was aborted");
@@ -165,6 +197,24 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   CompactionServiceResult compaction_result;
   s = CompactionServiceResult::Read(compaction_result_binary,
                                     &compaction_result);
+
+  if (abort_on_failure &&
+      (compaction_status == CompactionServiceJobStatus::kFailure || !s.ok() ||
+       !compaction_result.status.ok())) {
+    std::string why =
+        compaction_status == CompactionServiceJobStatus::kFailure
+            ? "the job failed"
+            : "the job returned no usable result";
+    if (!s.ok()) {
+      why += "; result unparseable: " + s.ToString();
+    } else if (!compaction_result.status.ok()) {
+      why += "; remote status: " + compaction_result.status.ToString();
+    }
+    compaction_result.status.PermitUncheckedError();
+    db_options_.compaction_service->OnInstallation(
+        response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+    return abandon("Wait()", why);
+  }
 
   if (compaction_status == CompactionServiceJobStatus::kFailure) {
     if (s.ok()) {
@@ -232,9 +282,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
                                   file_num, compaction->output_path_id());
     s = fs_->RenameFile(src_file, tgt_file, IOOptions(), nullptr);
     if (!s.ok()) {
-      sub_compact->status = s;
       db_options_.compaction_service->OnInstallation(
           response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+      if (abort_on_failure) {
+        // Outputs installed so far are in no version: orphans for the
+        // periodic full obsolete-file scan (and, in the cloud, the S3 GC).
+        return abandon("install", file.file_name + ": " + s.ToString());
+      }
+      sub_compact->status = s;
       return CompactionServiceJobStatus::kFailure;
     }
 
@@ -250,9 +305,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     }
 
     if (!s.ok()) {
-      sub_compact->status = s;
       db_options_.compaction_service->OnInstallation(
           response.scheduled_job_id, CompactionServiceJobStatus::kFailure);
+      if (abort_on_failure) {
+        // Outputs installed so far are in no version: orphans for the
+        // periodic full obsolete-file scan (and, in the cloud, the S3 GC).
+        return abandon("install", file.file_name + ": " + s.ToString());
+      }
+      sub_compact->status = s;
       return CompactionServiceJobStatus::kFailure;
     }
     assert(file_size > 0);
