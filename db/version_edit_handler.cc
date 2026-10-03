@@ -835,7 +835,12 @@ void VersionEditHandlerPointInTime::CheckIterationResult(
 
 ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
     const VersionEdit& edit) {
-  ColumnFamilyData* cfd = VersionEditHandler::DestroyCfAndCleanup(edit);
+  // Delete this CF's pending Versions BEFORE the base class unrefs the
+  // ColumnFamilyData: ~Version dereferences its cfd (GetSuperVersion(),
+  // ioptions()) when it drops the last reference to a file, and
+  // UnrefAndTryDelete() can free the cfd. In the other order a MANIFEST that
+  // drops a column family holding files is a use-after-free -- every
+  // OpenAsSecondary / OpenAndCompact replaying it crashed.
   uint32_t cfid = edit.GetColumnFamily();
   if (AtomicUpdateVersionsContains(cfid)) {
     AtomicUpdateVersionsDropCf(cfid);
@@ -848,7 +853,7 @@ ColumnFamilyData* VersionEditHandlerPointInTime::DestroyCfAndCleanup(
     delete v_iter->second;
     versions_.erase(v_iter);
   }
-  return cfd;
+  return VersionEditHandler::DestroyCfAndCleanup(edit);
 }
 
 Status VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit(
