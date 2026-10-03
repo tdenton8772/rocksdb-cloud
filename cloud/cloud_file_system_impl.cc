@@ -2509,6 +2509,66 @@ IOStatus CloudFileSystemImpl::FindLiveFilesFromLocalManifest(
   return IOStatus::OK();
 }
 
+void CloudFileSystemImpl::BeginManifestUploadBatch() {
+  std::lock_guard<std::mutex> lk(manifest_batch_mu_);
+  ++manifest_batch_depth_;
+}
+
+IOStatus CloudFileSystemImpl::EndManifestUploadBatch() {
+  std::string local, cloud;
+  {
+    std::lock_guard<std::mutex> lk(manifest_batch_mu_);
+    if (manifest_batch_depth_ > 0) {
+      --manifest_batch_depth_;
+    }
+    if (manifest_batch_depth_ > 0 || !manifest_upload_pending_) {
+      return IOStatus::OK();
+    }
+    local = pending_manifest_local_;
+    cloud = pending_manifest_cloud_;
+  }
+  // The copy runs outside the lock; a MANIFEST Sync() that lands meanwhile
+  // uploads on its own (no batch is open) and clears the pending flag, which
+  // is fine -- its copy is at least as new as this one.
+  IOStatus st = CopyLocalFileToDest(local, cloud);
+  if (st.ok()) {
+    std::lock_guard<std::mutex> lk(manifest_batch_mu_);
+    if (pending_manifest_local_ == local) {
+      manifest_upload_pending_ = false;
+    }
+    Log(InfoLogLevel::INFO_LEVEL, info_log_,
+        "[cloud_fs] deferred manifest %s made durable to %s", local.c_str(),
+        cloud.c_str());
+  } else {
+    Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+        "[cloud_fs] deferred manifest upload of %s failed (still pending): %s",
+        local.c_str(), st.ToString().c_str());
+  }
+  return st;
+}
+
+bool CloudFileSystemImpl::HasDeferredManifestUpload() const {
+  std::lock_guard<std::mutex> lk(manifest_batch_mu_);
+  return manifest_upload_pending_;
+}
+
+bool CloudFileSystemImpl::DeferManifestUpload(const std::string& local_name,
+                                              const std::string& cloud_name) {
+  std::lock_guard<std::mutex> lk(manifest_batch_mu_);
+  if (manifest_batch_depth_ == 0) {
+    return false;
+  }
+  manifest_upload_pending_ = true;
+  pending_manifest_local_ = local_name;
+  pending_manifest_cloud_ = cloud_name;
+  return true;
+}
+
+void CloudFileSystemImpl::ManifestUploaded() {
+  std::lock_guard<std::mutex> lk(manifest_batch_mu_);
+  manifest_upload_pending_ = false;
+}
+
 std::string CloudFileSystemImpl::CloudManifestFile(const std::string& dbname) {
   if (dbname.empty()) {
     return MakeCloudManifestFile(cloud_fs_options.cookie_on_open);

@@ -253,6 +253,13 @@ class CloudFileSystemImpl : public CloudFileSystem {
 
   std::string CloudManifestFile(const std::string& dbname) override;
 
+  void BeginManifestUploadBatch() override;
+  IOStatus EndManifestUploadBatch() override;
+  bool HasDeferredManifestUpload() const override;
+  bool DeferManifestUpload(const std::string& local_name,
+                           const std::string& cloud_name) override;
+  void ManifestUploaded() override;
+
   // Apply cloud manifest delta to in-memory cloud manifest. Does not change the
   // on-disk state.
   IOStatus ApplyCloudManifestDelta(const CloudManifestDelta& delta,
@@ -470,6 +477,14 @@ class CloudFileSystemImpl : public CloudFileSystem {
   std::string GenerateNewEpochId();
 
   std::unique_ptr<CloudManifest> cloud_manifest_;
+
+  // MANIFEST upload batching (see CloudFileSystem::BeginManifestUploadBatch).
+  mutable std::mutex manifest_batch_mu_;
+  int manifest_batch_depth_{0};
+  bool manifest_upload_pending_{false};
+  std::string pending_manifest_local_;
+  std::string pending_manifest_cloud_;
+
   // This runs only in tests when we want to disable cloud manifest
   // functionality
   bool test_disable_cloud_manifest_{false};

@@ -240,10 +240,16 @@ IOStatus CloudStorageWritableFileImpl::Sync(const IOOptions& opts,
     tmp_file_.clear();
   }
 
-  // We copy MANIFEST to cloud on every Sync()
+  // We copy MANIFEST to cloud on every Sync(), unless a batch defers it
+  // (CloudFileSystem::BeginManifestUploadBatch); the local file is synced
+  // above either way.
   if (is_manifest_ && stat.ok()) {
+    if (cfs_->DeferManifestUpload(fname_, cloud_fname_)) {
+      return stat;
+    }
     stat = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
     if (stat.ok()) {
+      cfs_->ManifestUploaded();
       Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),
           "[%s] CloudWritableFile made manifest %s durable to "
           "bucket %s bucketpath %s.",

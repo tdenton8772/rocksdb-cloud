@@ -602,6 +602,32 @@ class CloudFileSystem : public FileSystem {
   // Returns CloudManifest file name for a given db.
   virtual std::string CloudManifestFile(const std::string& dbname) = 0;
 
+  // MANIFEST upload batching.
+  //
+  // Every Sync() of the MANIFEST copies the whole file to the destination
+  // bucket, and every column family create or drop is its own MANIFEST
+  // commit, so changing N column families costs N full uploads. Between
+  // BeginManifestUploadBatch() and the matching EndManifestUploadBatch(),
+  // Sync() still syncs the local MANIFEST but defers the copy; the End that
+  // closes the outermost batch copies it once. Batches nest.
+  //
+  // A copy that fails stays pending: HasDeferredManifestUpload() reports it,
+  // and the next End or the next undeferred Sync() retries it. Callers that
+  // delete files the cloud MANIFEST may still name must wait until it is not
+  // pending.
+  virtual void BeginManifestUploadBatch() {}
+  virtual IOStatus EndManifestUploadBatch() { return IOStatus::OK(); }
+  virtual bool HasDeferredManifestUpload() const { return false; }
+  // For the MANIFEST writer: called on Sync(). True means the copy is
+  // deferred and the caller must not upload now.
+  virtual bool DeferManifestUpload(const std::string& /*local_name*/,
+                                   const std::string& /*cloud_name*/) {
+    return false;
+  }
+  // For the MANIFEST writer: an undeferred copy succeeded and supersedes any
+  // pending one.
+  virtual void ManifestUploaded() {}
+
   virtual CloudManifest* GetCloudManifest() = 0;
 
   // TODO(wei): this function is used to temporarily support open db and switch
