@@ -1363,8 +1363,17 @@ Status DB::OpenAndCompact(
   db_options.listeners = override_options.listeners;
   db_options.compaction_service = nullptr;
   // We will close the DB after the compaction anyway.
-  // Open as many files as needed for the compaction.
-  db_options.max_open_files = -1;
+  // Open as many files as needed for the compaction -- unless the caller set
+  // max_open_files in options_map. With -1 the open loads a table reader for
+  // EVERY file in the DB (VersionBuilder::LoadTableHandlers), and on a cloud
+  // file system that fetches files on demand, opening a table downloads it
+  // whole: a remote compaction of one input file downloaded the entire DB
+  // (556 SSTs, ~2.7 GB) before compacting. A finite limit opens the inputs on
+  // demand instead.
+  if (override_options.options_map.find("max_open_files") ==
+      override_options.options_map.end()) {
+    db_options.max_open_files = -1;
+  }
   db_options.info_log = override_options.info_log;
 
   // 4. Filter CFs that are needed for OpenAndCompact()
