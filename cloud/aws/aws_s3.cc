@@ -859,11 +859,17 @@ namespace {
 // logic, so rather than implement an O_DIRECT-friendly streambuf we just
 // forward streambuf write operations to WritableFileWriter, then wrap the
 // forwarder in an iostream.
+// The status is SHARED with the caller, not a pointer into its stack: the AWS
+// HTTP client can release a failed or retried attempt's response -- and with it
+// this stream -- on its own event-loop thread after GetObject has returned, and
+// the destructor below then wrote into a frame that no longer existed (heap
+// corruption, abort in free() under ResponseStream::ReleaseStream).
 class WritableFileStreamBuf : public std::streambuf {
  public:
-  WritableFileStreamBuf(IOStatus* fileCloseStatus,
+  WritableFileStreamBuf(std::shared_ptr<IOStatus> fileCloseStatus,
 			std::unique_ptr<WritableFileWriter>&& fileWriter)
-    : fileCloseStatus_(fileCloseStatus), fileWriter_(std::move(fileWriter)) {}
+    : fileCloseStatus_(std::move(fileCloseStatus)),
+      fileWriter_(std::move(fileWriter)) {}
 
   ~WritableFileStreamBuf() {
     *fileCloseStatus_ = fileWriter_->Close({});
@@ -900,7 +906,7 @@ class WritableFileStreamBuf : public std::streambuf {
   }
 
  private:
-  IOStatus *fileCloseStatus_;
+  std::shared_ptr<IOStatus> fileCloseStatus_;
   std::unique_ptr<WritableFileWriter> fileWriter_;
 };
 
@@ -955,12 +961,12 @@ IOStatus S3StorageProvider::DoGetCloudObject(const std::string& bucket_name,
       return IOStatus::IOError(std::move(errmsg));
     }
   } else {
-    IOStatus fileCloseStatus;
+    auto fileCloseStatus = std::make_shared<IOStatus>();
     {
       // Close() will be called in the destructor of the object returned by
       // this factory. Adding an inner scope so that the destructor is called
       // before checking fileCloseStatus.
-      auto ioStreamFactory = [this, destination, &fileCloseStatus]() -> Aws::IOStream* {
+      auto ioStreamFactory = [this, destination, fileCloseStatus]() -> Aws::IOStream* {
         FileOptions foptions;
         foptions.use_direct_writes =
             cfs_->GetCloudFileSystemOptions().use_direct_io_for_cloud_download;
@@ -976,7 +982,7 @@ IOStatus S3StorageProvider::DoGetCloudObject(const std::string& bucket_name,
         return Aws::New<IOStreamWithOwnedBuf<WritableFileStreamBuf>>(
             Aws::Utils::ARRAY_ALLOCATION_TAG,
             std::unique_ptr<WritableFileStreamBuf>(new WritableFileStreamBuf(
-                &fileCloseStatus,
+                fileCloseStatus,
                 std::unique_ptr<WritableFileWriter>(new WritableFileWriter(
                         std::move(file), destination, foptions)))));
       };
@@ -1006,8 +1012,8 @@ IOStatus S3StorageProvider::DoGetCloudObject(const std::string& bucket_name,
       }
     }
 
-    if (!fileCloseStatus.ok()) {
-      std::string errmsg = fileCloseStatus.ToString();
+    if (!fileCloseStatus->ok()) {
+      std::string errmsg = fileCloseStatus->ToString();
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),
           "[s3] GetObject %s/%s error closing file %s.", bucket_name.c_str(),
           object_path.c_str(), errmsg.c_str());
