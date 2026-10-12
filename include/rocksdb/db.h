@@ -2133,6 +2133,23 @@ class DB {
       const GetColumnFamilyMetaDataOptions& /*options*/,
       ColumnFamilyMetaData* /*metadata*/) {}
 
+  // Writes into *manifest a self-contained MANIFEST (a VersionEdit log) that
+  // describes only `column_families` -- the default column family is always
+  // included -- as they are now: each one's live files with their full
+  // metadata, plus the DB-wide fields recovery needs (next file number, last
+  // sequence, log numbers, max column family, DB id). A DB opened on it, with
+  // the same SST files reachable, sees exactly those column families.
+  //
+  // Unlike the DB's own MANIFEST it carries no edit history, so its size
+  // follows the live state of the chosen column families, not every flush
+  // and compaction the whole DB has logged. Remote compaction uses it to give
+  // a job only the metadata of the column family it compacts.
+  virtual Status GetManifestSnapshot(
+      const std::vector<ColumnFamilyHandle*>& /*column_families*/,
+      std::string* /*manifest*/) {
+    return Status::NotSupported("GetManifestSnapshot");
+  }
+
   // Get the metadata of the default column family.
   void GetColumnFamilyMetaData(ColumnFamilyMetaData* metadata) {
     GetColumnFamilyMetaData(DefaultColumnFamily(), metadata);

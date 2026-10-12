@@ -6812,6 +6812,158 @@ TEST_F(DBBasicTest, FileChecksumInFileOptions) {
   Close();
 }
 
+namespace {
+// A directory holding `manifest` as the MANIFEST and hard links to every SST
+// (and the IDENTITY) of `src`.
+void MakeSnapshotDir(Env* env, const std::string& src, const std::string& dst,
+                     const std::string& manifest) {
+  ASSERT_OK(env->CreateDirIfMissing(dst));
+  std::vector<std::string> children;
+  ASSERT_OK(env->GetChildren(src, &children));
+  for (const auto& f : children) {
+    if (f == "IDENTITY" ||
+        (f.size() > 4 && f.compare(f.size() - 4, 4, ".sst") == 0)) {
+      ASSERT_OK(env->LinkFile(src + "/" + f, dst + "/" + f));
+    }
+  }
+  ASSERT_OK(WriteStringToFile(env, manifest, dst + "/MANIFEST-000001", true));
+  ASSERT_OK(WriteStringToFile(env, "MANIFEST-000001\n", dst + "/CURRENT", true));
+}
+
+void ExpectSameFiles(const ColumnFamilyMetaData& want,
+                     const ColumnFamilyMetaData& got) {
+  ASSERT_EQ(want.file_count, got.file_count);
+  ASSERT_EQ(want.levels.size(), got.levels.size());
+  for (size_t l = 0; l < want.levels.size(); ++l) {
+    const auto& w = want.levels[l].files;
+    const auto& g = got.levels[l].files;
+    ASSERT_EQ(w.size(), g.size()) << "level " << l;
+    for (size_t i = 0; i < w.size(); ++i) {
+      EXPECT_EQ(w[i].file_number, g[i].file_number);
+      EXPECT_EQ(w[i].size, g[i].size);
+      EXPECT_EQ(w[i].smallest_seqno, g[i].smallest_seqno);
+      EXPECT_EQ(w[i].largest_seqno, g[i].largest_seqno);
+      EXPECT_EQ(w[i].smallestkey, g[i].smallestkey);
+      EXPECT_EQ(w[i].largestkey, g[i].largestkey);
+      EXPECT_EQ(w[i].epoch_number, g[i].epoch_number);
+    }
+  }
+}
+}  // namespace
+
+TEST_F(DBBasicTest, GetManifestSnapshot) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 4;
+  CreateAndReopenWithCF({"one", "two"}, options);
+
+  // "one": three generations on three levels, a tombstone on top.
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put(1, Key(i), "v0-" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush(1));
+  MoveFilesToLevel(3, 1);
+  for (int i = 0; i < 10; i += 2) {
+    ASSERT_OK(Put(1, Key(i), "v1-" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush(1));
+  MoveFilesToLevel(1, 1);
+  ASSERT_OK(Delete(1, Key(3)));
+  ASSERT_OK(Put(1, Key(4), "v2"));
+  ASSERT_OK(Flush(1));
+  // "two": state the snapshot must not describe.
+  ASSERT_OK(Put(2, "other", "x"));
+  ASSERT_OK(Flush(2));
+
+  std::string manifest;
+  ASSERT_OK(db_->GetManifestSnapshot({handles_[1]}, &manifest));
+  ASSERT_FALSE(manifest.empty());
+
+  const std::string snapdir = dbname_ + "_manifest_snapshot";
+  ASSERT_OK(DestroyDB(snapdir, options));
+  MakeSnapshotDir(env_, dbname_, snapdir, manifest);
+
+  std::vector<std::string> names;
+  ASSERT_OK(DB::ListColumnFamilies(DBOptions(options), snapdir, &names));
+  ASSERT_EQ(names, (std::vector<std::string>{kDefaultColumnFamilyName, "one"}));
+
+  std::vector<ColumnFamilyDescriptor> cfds = {
+      {kDefaultColumnFamilyName, options}, {"one", options}};
+  std::vector<ColumnFamilyHandle*> snap_handles;
+  std::unique_ptr<DB> snap;
+  ASSERT_OK(DB::OpenForReadOnly(DBOptions(options), snapdir, cfds,
+                                &snap_handles, &snap));
+
+  ColumnFamilyMetaData live, got;
+  db_->GetColumnFamilyMetaData(handles_[1], &live);
+  snap->GetColumnFamilyMetaData(snap_handles[1], &got);
+  ASSERT_GE(live.file_count, 3u);
+  ExpectSameFiles(live, got);
+
+  for (int i = 0; i < 10; ++i) {
+    std::string want, have;
+    Status ws = db_->Get(ReadOptions(), handles_[1], Key(i), &want);
+    Status hs = snap->Get(ReadOptions(), snap_handles[1], Key(i), &have);
+    ASSERT_EQ(ws.IsNotFound(), hs.IsNotFound()) << Key(i);
+    if (ws.ok()) {
+      ASSERT_EQ(want, have) << Key(i);
+    }
+  }
+  std::string deleted;
+  ASSERT_TRUE(snap->Get(ReadOptions(), snap_handles[1], Key(3), &deleted)
+                  .IsNotFound());
+
+  for (auto* h : snap_handles) {
+    ASSERT_OK(snap->DestroyColumnFamilyHandle(h));
+  }
+  snap.reset();
+  ASSERT_OK(DestroyDB(snapdir, options));
+
+  // Edits to other column families do not grow it: it describes live state,
+  // not history.
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_OK(Put(2, "churn" + std::to_string(i), "x"));
+    ASSERT_OK(Flush(2));
+  }
+  std::string again;
+  ASSERT_OK(db_->GetManifestSnapshot({handles_[1]}, &again));
+  ASSERT_LE(again.size(), manifest.size() + 16);
+}
+
+TEST_F(DBBasicTest, GetManifestSnapshotDefaultOnly) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"one"}, options);
+  ASSERT_OK(Put(0, "k", "v"));
+  ASSERT_OK(Flush(0));
+  std::string manifest;
+  ASSERT_OK(db_->GetManifestSnapshot({}, &manifest));
+  const std::string snapdir = dbname_ + "_manifest_snapshot_default";
+  ASSERT_OK(DestroyDB(snapdir, options));
+  MakeSnapshotDir(env_, dbname_, snapdir, manifest);
+  std::vector<std::string> names;
+  ASSERT_OK(DB::ListColumnFamilies(DBOptions(options), snapdir, &names));
+  ASSERT_EQ(names, (std::vector<std::string>{kDefaultColumnFamilyName}));
+  std::unique_ptr<DB> snap;
+  ASSERT_OK(DB::OpenForReadOnly(options, snapdir, &snap));
+  std::string v;
+  ASSERT_OK(snap->Get(ReadOptions(), "k", &v));
+  ASSERT_EQ(v, "v");
+  snap.reset();
+  ASSERT_OK(DestroyDB(snapdir, options));
+}
+
+TEST_F(DBBasicTest, GetManifestSnapshotRejectsDroppedColumnFamily) {
+  Options options = CurrentOptions();
+  CreateAndReopenWithCF({"one"}, options);
+  ASSERT_OK(db_->DropColumnFamily(handles_[1]));
+  std::string manifest;
+  ASSERT_TRUE(
+      db_->GetManifestSnapshot({handles_[1]}, &manifest).IsInvalidArgument());
+  ASSERT_TRUE(manifest.empty());
+  ASSERT_TRUE(db_->GetManifestSnapshot({nullptr}, &manifest).IsInvalidArgument());
+  ASSERT_TRUE(db_->GetManifestSnapshot({}, nullptr).IsInvalidArgument());
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

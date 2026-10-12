@@ -5471,6 +5471,198 @@ void DBImpl::GetAllColumnFamilyMetaData(
   }
 }
 
+namespace {
+// The MANIFEST snapshot is built in memory: a log::Writer over this sink.
+class StringSinkFile : public FSWritableFile {
+ public:
+  explicit StringSinkFile(std::string* out) : out_(out) {}
+  using FSWritableFile::Append;
+  IOStatus Append(const Slice& data, const IOOptions& /*options*/,
+                  IODebugContext* /*dbg*/) override {
+    out_->append(data.data(), data.size());
+    return IOStatus::OK();
+  }
+  IOStatus Close(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+  IOStatus Flush(const IOOptions& /*options*/,
+                 IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+  IOStatus Sync(const IOOptions& /*options*/,
+                IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+  uint64_t GetFileSize(const IOOptions& /*options*/,
+                       IODebugContext* /*dbg*/) override {
+    return out_->size();
+  }
+
+ private:
+  std::string* out_;
+};
+}  // namespace
+
+Status DBImpl::GetManifestSnapshot(
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::string* manifest) {
+  if (manifest == nullptr) {
+    return Status::InvalidArgument("manifest is null");
+  }
+  // One column family's state, pinned under the mutex and encoded after it is
+  // released: a pinned Version never changes.
+  struct Pinned {
+    ColumnFamilyData* cfd;
+    Version* version;
+    uint64_t log_number;
+    std::string full_history_ts_low;
+  };
+  std::vector<Pinned> pinned;
+  uint64_t next_file_number = 0;
+  SequenceNumber last_sequence = 0;
+  uint64_t min_log_to_keep = 0;
+  uint32_t max_column_family = 0;
+  Status s;
+  {
+    InstrumentedMutexLock l(&mutex_);
+    std::vector<ColumnFamilyData*> cfds;
+    cfds.push_back(versions_->GetColumnFamilySet()->GetDefault());
+    for (ColumnFamilyHandle* h : column_families) {
+      if (h == nullptr) {
+        return Status::InvalidArgument("null column family handle");
+      }
+      ColumnFamilyData* cfd =
+          static_cast_with_check<ColumnFamilyHandleImpl>(h)->cfd();
+      if (cfd->IsDropped()) {
+        return Status::InvalidArgument("column family " + cfd->GetName() +
+                                       " is dropped");
+      }
+      if (std::find(cfds.begin(), cfds.end(), cfd) == cfds.end()) {
+        cfds.push_back(cfd);
+      }
+    }
+    std::sort(cfds.begin(), cfds.end(),
+              [](ColumnFamilyData* a, ColumnFamilyData* b) {
+                return a->GetID() < b->GetID();
+              });
+    for (ColumnFamilyData* cfd : cfds) {
+      cfd->Ref();
+      Version* v = cfd->current();
+      v->Ref();
+      pinned.push_back(
+          {cfd, v, cfd->GetLogNumber(), cfd->GetFullHistoryTsLow()});
+    }
+    next_file_number = versions_->current_next_file_number();
+    last_sequence = versions_->LastSequence();
+    min_log_to_keep = versions_->min_log_number_to_keep();
+    max_column_family = versions_->GetColumnFamilySet()->GetMaxColumnFamily();
+  }
+
+  // The same records VersionSet::WriteCurrentStateToManifest writes for a new
+  // MANIFEST, for the pinned column families only.
+  std::string out;
+  {
+    std::unique_ptr<WritableFileWriter> file(new WritableFileWriter(
+        std::unique_ptr<FSWritableFile>(new StringSinkFile(&out)),
+        "MANIFEST-snapshot", FileOptions()));
+    log::Writer log(std::move(file), 0, false);
+    const WriteOptions wo;
+    auto add = [&](const VersionEdit& edit, size_t ts_size) -> Status {
+      std::string record;
+      if (!edit.EncodeTo(&record, ts_size)) {
+        return Status::Corruption("Unable to Encode VersionEdit: " +
+                                  edit.DebugString(true));
+      }
+      return log.AddRecord(wo, record);
+    };
+    if (immutable_db_options_.write_dbid_to_manifest && !db_id_.empty()) {
+      VersionEdit edit;
+      edit.SetDBId(db_id_);
+      s = add(edit, 0);
+    }
+    for (const Pinned& p : pinned) {
+      if (!s.ok()) {
+        break;
+      }
+      ColumnFamilyData* cfd = p.cfd;
+      const Comparator* ucmp = cfd->user_comparator();
+      {
+        VersionEdit edit;
+        if (cfd->GetID() != 0) {
+          edit.AddColumnFamily(cfd->GetName());
+          edit.SetColumnFamily(cfd->GetID());
+        }
+        edit.SetComparatorName(ucmp->Name());
+        edit.SetPersistUserDefinedTimestamps(
+            cfd->ioptions().persist_user_defined_timestamps);
+        s = add(edit, 0);
+      }
+      if (!s.ok()) {
+        break;
+      }
+      VersionEdit edit;
+      edit.SetColumnFamily(cfd->GetID());
+      const VersionStorageInfo* vstorage = p.version->storage_info();
+      for (int level = 0; level < cfd->NumberLevels(); level++) {
+        for (const FileMetaData* f : vstorage->LevelFiles(level)) {
+          edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
+                       f->fd.GetFileSize(), f->smallest, f->largest,
+                       f->fd.smallest_seqno, f->fd.largest_seqno,
+                       f->marked_for_compaction, f->temperature,
+                       f->oldest_blob_file_number, f->oldest_ancester_time,
+                       f->file_creation_time, f->epoch_number,
+                       f->file_checksum, f->file_checksum_func_name,
+                       f->unique_id, f->compensated_range_deletion_size,
+                       f->tail_size, f->user_defined_timestamps_persisted,
+                       f->min_timestamp, f->max_timestamp,
+                       f->file_open_metadata);
+        }
+      }
+      edit.SetCompactCursors(vstorage->GetCompactCursors());
+      for (const auto& meta : vstorage->GetBlobFiles()) {
+        edit.AddBlobFile(meta->GetBlobFileNumber(), meta->GetTotalBlobCount(),
+                         meta->GetTotalBlobBytes(), meta->GetChecksumMethod(),
+                         meta->GetChecksumValue());
+        if (meta->GetGarbageBlobCount() > 0) {
+          edit.AddBlobFileGarbage(meta->GetBlobFileNumber(),
+                                  meta->GetGarbageBlobCount(),
+                                  meta->GetGarbageBlobBytes());
+        }
+      }
+      edit.SetLogNumber(p.log_number);
+      if (cfd->GetID() == 0 && min_log_to_keep != 0) {
+        edit.SetMinLogNumberToKeep(min_log_to_keep);
+      }
+      if (!p.full_history_ts_low.empty()) {
+        edit.SetFullHistoryTsLow(p.full_history_ts_low);
+      }
+      edit.SetLastSequence(last_sequence);
+      s = add(edit, ucmp->timestamp_size());
+    }
+    if (s.ok()) {
+      // What a new MANIFEST's first batch carries after the snapshot.
+      VersionEdit edit;
+      edit.SetNextFile(next_file_number);
+      edit.SetLastSequence(last_sequence);
+      edit.SetMaxColumnFamily(max_column_family);
+      s = add(edit, 0);
+    }
+  }
+
+  {
+    InstrumentedMutexLock l(&mutex_);
+    for (const Pinned& p : pinned) {
+      p.version->Unref();
+      p.cfd->UnrefAndTryDelete();
+    }
+  }
+  if (s.ok()) {
+    manifest->swap(out);
+  }
+  return s;
+}
+
 Status DBImpl::GetDbIdentity(std::string& identity) const {
   identity.assign(db_id_);
   return Status::OK();

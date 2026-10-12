@@ -603,6 +603,10 @@ class DBImpl : public DB {
                                const GetColumnFamilyMetaDataOptions& options,
                                ColumnFamilyMetaData* metadata) override;
 
+  Status GetManifestSnapshot(
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      std::string* manifest) override;
+
   void GetAllColumnFamilyMetaData(
       std::vector<ColumnFamilyMetaData>* metadata) override;
 

@@ -483,6 +483,12 @@ class StackableDB : public DB {
     db_->GetColumnFamilyMetaData(column_family, options, metadata);
   }
 
+  Status GetManifestSnapshot(
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      std::string* manifest) override {
+    return db_->GetManifestSnapshot(column_families, manifest);
+  }
+
   using DB::StartBlockCacheTrace;
   Status StartBlockCacheTrace(
       const TraceOptions& trace_options,
