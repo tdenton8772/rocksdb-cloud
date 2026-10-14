@@ -469,6 +469,16 @@ class CloudFileSystemOptions {
   // Default: 1 hour
   std::optional<std::chrono::seconds> cloud_file_deletion_delay;
 
+  // Upload a MANIFEST's growth as small delta objects next to it instead of
+  // the whole file on every sync (include/rocksdb/cloud/manifest_delta.h).
+  // The whole file is uploaded again once the deltas since the last whole
+  // upload exceed max(its size, manifest_delta_rebase_bytes) or number
+  // manifest_delta_max_count. Readers assemble deltas whatever this is set to.
+  // Default: false
+  bool upload_manifest_deltas = false;
+  uint64_t manifest_delta_rebase_bytes = 4 << 20;
+  uint64_t manifest_delta_max_count = 256;
+
   // Type info map for this class.
   static const std::unordered_map<std::string, OptionTypeInfo>
       cloud_fs_option_type_info;
@@ -621,8 +631,17 @@ class CloudFileSystem : public FileSystem {
   // For the MANIFEST writer: called on Sync(). True means the copy is
   // deferred and the caller must not upload now.
   virtual bool DeferManifestUpload(const std::string& /*local_name*/,
-                                   const std::string& /*cloud_name*/) {
+                                   const std::string& /*cloud_name*/,
+                                   uint64_t /*gen*/ = 0) {
     return false;
+  }
+  // Uploads the MANIFEST `local_name` to `cloud_name`: the whole file, or with
+  // CloudFileSystemOptions::upload_manifest_deltas the bytes generation `gen`
+  // added since its last upload (include/rocksdb/cloud/manifest_delta.h).
+  virtual IOStatus UploadManifest(const std::string& local_name,
+                                  const std::string& cloud_name,
+                                  uint64_t /*gen*/) {
+    return CopyLocalFileToDest(local_name, cloud_name);
   }
   // For the MANIFEST writer: an undeferred copy succeeded and supersedes any
   // pending one.

@@ -11,6 +11,7 @@
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_storage_provider_impl.h"
+#include "rocksdb/cloud/manifest_delta.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
@@ -114,6 +115,15 @@ CloudStorageWritableFileImpl::CloudStorageWritableFileImpl(
   // Is this a manifest file?
   is_manifest_ = IsManifestFile(fname_no_epoch);
   assert(IsSstFile(fname_no_epoch) || is_manifest_);
+  if (is_manifest_) {
+    // This writer's MANIFEST generation: deltas it uploads belong to it.
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    manifest_gen_ = manifest_delta::NewGeneration(
+        now_ms, Random::GetTLSInstance()->Next());
+  }
 
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),
       "[%s] CloudWritableFile bucket %s opened local file %s "
@@ -244,10 +254,10 @@ IOStatus CloudStorageWritableFileImpl::Sync(const IOOptions& opts,
   // (CloudFileSystem::BeginManifestUploadBatch); the local file is synced
   // above either way.
   if (is_manifest_ && stat.ok()) {
-    if (cfs_->DeferManifestUpload(fname_, cloud_fname_)) {
+    if (cfs_->DeferManifestUpload(fname_, cloud_fname_, manifest_gen_)) {
       return stat;
     }
-    stat = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+    stat = cfs_->UploadManifest(fname_, cloud_fname_, manifest_gen_);
     if (stat.ok()) {
       cfs_->ManifestUploaded();
       Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),

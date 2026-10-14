@@ -46,6 +46,7 @@ class CloudStorageWritableFileImpl : public CloudStorageWritableFile {
   std::string bucket_;
   std::string cloud_fname_;
   bool is_manifest_;
+  uint64_t manifest_gen_ = 0;  // this MANIFEST generation (manifest_delta.h)
 
  public:
   CloudStorageWritableFileImpl(CloudFileSystem* fs,

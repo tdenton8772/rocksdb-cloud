@@ -18,6 +18,7 @@
 #include "rocksdb/cloud/cloud_file_deletion_scheduler.h"
 #include "rocksdb/cloud/cloud_log_controller.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
+#include "rocksdb/cloud/manifest_delta.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -72,15 +73,216 @@ IOStatus CloudFileSystemImpl::ExistsCloudObject(const std::string& fname) {
 
 IOStatus CloudFileSystemImpl::GetCloudObject(const std::string& fname) {
   auto st = IOStatus::NotFound();
+  // A MANIFEST is its base object plus the deltas uploaded next to it.
+  const bool manifest = IsManifestFile(RemoveEpoch(fname));
   if (HasDestBucket()) {
     st = GetStorageProvider()->GetCloudObject(GetDestBucketName(),
                                               destname(fname), fname);
+    if (st.ok() && manifest) {
+      st = ApplyManifestDeltas(GetDestBucketName(), destname(fname), fname);
+    }
   }
   if (st.IsNotFound() && HasSrcBucket() && !SrcMatchesDest()) {
     st = GetStorageProvider()->GetCloudObject(GetSrcBucketName(),
                                               srcname(fname), fname);
+    if (st.ok() && manifest) {
+      st = ApplyManifestDeltas(GetSrcBucketName(), srcname(fname), fname);
+    }
   }
   return st;
+}
+
+namespace {
+// "<dir>/MANIFEST-<epoch>" -> ("<dir>", "<epoch>"); epoch "" without one.
+void SplitManifestObject(const std::string& object, std::string* dir,
+                         std::string* epoch) {
+  const size_t slash = object.find_last_of('/');
+  *dir = slash == std::string::npos ? std::string() : object.substr(0, slash);
+  const std::string base =
+      slash == std::string::npos ? object : object.substr(slash + 1);
+  const std::string prefix = "MANIFEST-";
+  *epoch = base.compare(0, prefix.size(), prefix) == 0
+               ? base.substr(prefix.size())
+               : std::string();
+}
+std::string JoinObject(const std::string& dir, const std::string& name) {
+  return dir.empty() ? name : dir + "/" + name;
+}
+}  // namespace
+
+IOStatus CloudFileSystemImpl::ApplyManifestDeltas(const std::string& bucket,
+                                                  const std::string& object,
+                                                  const std::string& local) {
+  std::string dir, epoch;
+  SplitManifestObject(object, &dir, &epoch);
+  if (epoch.empty()) {
+    return IOStatus::OK();
+  }
+  std::vector<std::string> names;
+  IOStatus st = GetStorageProvider()->ListCloudObjects(bucket, dir, &names);
+  if (!st.ok()) {
+    return st;
+  }
+  uint64_t size = 0;
+  st = base_fs_->GetFileSize(local, IOOptions(), &size, nullptr);
+  if (!st.ok()) {
+    return st;
+  }
+  const manifest_delta::Plan plan =
+      manifest_delta::PlanAssembly(size, names, epoch);
+  if (plan.gap) {
+    return IOStatus::Corruption("MANIFEST delta missing after byte " +
+                                std::to_string(plan.final_size) + " for " +
+                                object);
+  }
+  if (!plan.use_deltas || plan.deltas.empty()) {
+    return IOStatus::OK();
+  }
+  std::unique_ptr<FSWritableFile> out;
+  st = base_fs_->ReopenWritableFile(local, FileOptions(), &out, nullptr);
+  if (!st.ok()) {
+    return st;
+  }
+  const std::string tmp = local + ".mlog";
+  for (const auto& d : plan.deltas) {
+    st = GetStorageProvider()->GetCloudObject(bucket, JoinObject(dir, d.object),
+                                              tmp);
+    if (!st.ok()) {
+      break;
+    }
+    std::string bytes;
+    st = ReadFileToString(base_fs_.get(), tmp, &bytes);
+    if (!st.ok()) {
+      break;
+    }
+    if (bytes.size() != d.end - d.off) {
+      st = IOStatus::Corruption("MANIFEST delta " + d.object + " holds " +
+                                std::to_string(bytes.size()) + " bytes");
+      break;
+    }
+    // A delta may start before the bytes held (the tail of one a whole
+    // upload covered in part).
+    const uint64_t skip = size > d.off ? size - d.off : 0;
+    st = out->Append(Slice(bytes.data() + skip, bytes.size() - skip),
+                     IOOptions(), nullptr);
+    if (!st.ok()) {
+      break;
+    }
+    size = d.end;
+  }
+  base_fs_->DeleteFile(tmp, IOOptions(), nullptr);
+  if (st.ok()) {
+    st = out->Sync(IOOptions(), nullptr);
+  }
+  IOStatus cs = out->Close(IOOptions(), nullptr);
+  if (st.ok()) {
+    st = cs;
+  }
+  if (st.ok()) {
+    Log(InfoLogLevel::INFO_LEVEL, info_log_,
+        "[cloud_fs] MANIFEST %s assembled from its base and %zu delta(s): "
+        "%" PRIu64 " bytes",
+        object.c_str(), plan.deltas.size(), size);
+  }
+  return st;
+}
+
+IOStatus CloudFileSystemImpl::UploadManifest(const std::string& local_name,
+                                             const std::string& cloud_name,
+                                             uint64_t gen) {
+  std::string dir, epoch;
+  SplitManifestObject(cloud_name, &dir, &epoch);
+  if (!cloud_fs_options.upload_manifest_deltas || epoch.empty() || gen == 0) {
+    return CopyLocalFileToDest(local_name, cloud_name);
+  }
+  std::lock_guard<std::mutex> lk(manifest_delta_mu_);
+  uint64_t size = 0;
+  IOStatus st = base_fs_->GetFileSize(local_name, IOOptions(), &size, nullptr);
+  if (!st.ok()) {
+    return st;
+  }
+  ManifestUploadState& s = manifest_upload_state_[cloud_name];
+  const uint64_t rebase =
+      std::max<uint64_t>(s.base, cloud_fs_options.manifest_delta_rebase_bytes);
+  const bool whole = s.gen != gen || s.uploaded == 0 || size < s.uploaded ||
+                     s.delta_bytes >= rebase ||
+                     s.deltas >= cloud_fs_options.manifest_delta_max_count;
+  const std::string bucket = GetDestBucketName();
+  if (whole) {
+    // The whole file as the base, then its marker; then what the marker
+    // supersedes: other generations' objects, this one's covered deltas and
+    // older markers. A reader that sees the base without the marker uses the
+    // base alone, which is complete as of now.
+    st = CopyLocalFileToDest(local_name, cloud_name);
+    if (!st.ok()) {
+      return st;
+    }
+    const std::string marker = local_name + ".mlog-marker";
+    st = WriteStringToFile(base_fs_.get(), Slice(), marker, false);
+    if (st.ok()) {
+      st = GetStorageProvider()->PutCloudObject(
+          marker, bucket,
+          JoinObject(dir, manifest_delta::BaseMarker(epoch, gen, size)));
+    }
+    base_fs_->DeleteFile(marker, IOOptions(), nullptr);
+    if (!st.ok()) {
+      // The base is up and complete; without the marker readers use it alone
+      // and this generation keeps uploading whole files until one sticks.
+      s = ManifestUploadState();
+      return IOStatus::OK();
+    }
+    std::vector<std::string> names;
+    if (GetStorageProvider()->ListCloudObjects(bucket, dir, &names).ok()) {
+      for (const auto& n : names) {
+        const manifest_delta::Name p = manifest_delta::Parse(n);
+        if (p.kind == manifest_delta::Name::kNone || p.epoch != epoch) {
+          continue;
+        }
+        const bool keep =
+            p.gen == gen &&
+            ((p.kind == manifest_delta::Name::kBase && p.size == size) ||
+             (p.kind == manifest_delta::Name::kDelta && p.end > size));
+        if (!keep) {
+          GetStorageProvider()->DeleteCloudObject(bucket, JoinObject(dir, p.object));
+        }
+      }
+    }
+    s.gen = gen;
+    s.uploaded = size;
+    s.base = size;
+    s.delta_bytes = 0;
+    s.deltas = 0;
+    return IOStatus::OK();
+  }
+  if (size == s.uploaded) {
+    return IOStatus::OK();
+  }
+  // The bytes appended since the last upload.
+  std::string all;
+  st = ReadFileToString(base_fs_.get(), local_name, &all);
+  if (!st.ok()) {
+    return st;
+  }
+  if (all.size() < size) {
+    size = all.size();
+  }
+  const std::string tmp = local_name + ".mlog-delta";
+  st = WriteStringToFile(base_fs_.get(),
+                         Slice(all.data() + s.uploaded, size - s.uploaded), tmp,
+                         false);
+  if (st.ok()) {
+    st = GetStorageProvider()->PutCloudObject(
+        tmp, bucket,
+        JoinObject(dir, manifest_delta::Delta(epoch, gen, s.uploaded, size)));
+  }
+  base_fs_->DeleteFile(tmp, IOOptions(), nullptr);
+  if (!st.ok()) {
+    return st;
+  }
+  s.delta_bytes += size - s.uploaded;
+  s.deltas += 1;
+  s.uploaded = size;
+  return IOStatus::OK();
 }
 
 IOStatus CloudFileSystemImpl::GetCloudObjectSize(const std::string& fname,
@@ -1013,6 +1215,16 @@ bool CloudFileSystemImpl::IsFileInvisible(
 
     return !is_active;
   } else {
+    // MANIFEST deltas and markers (manifest_delta.h) of an epoch other than
+    // the current MANIFEST's.
+    const manifest_delta::Name delta = manifest_delta::Parse(fname);
+    if (delta.kind != manifest_delta::Name::kNone) {
+      const size_t slash = fname.find_last_of('/');
+      const std::string dir =
+          slash == std::string::npos ? std::string() : fname.substr(0, slash + 1);
+      return RemapFilename(dir + "MANIFEST") !=
+             dir + ManifestFileWithEpoch(delta.epoch);
+    }
     auto noepoch = RemoveEpoch(fname);
     if ((IsSstFile(noepoch) || IsManifestFile(noepoch)) &&
         (RemapFilename(noepoch) != fname)) {
@@ -2516,6 +2728,7 @@ void CloudFileSystemImpl::BeginManifestUploadBatch() {
 
 IOStatus CloudFileSystemImpl::EndManifestUploadBatch() {
   std::string local, cloud;
+  uint64_t gen = 0;
   {
     std::lock_guard<std::mutex> lk(manifest_batch_mu_);
     if (manifest_batch_depth_ > 0) {
@@ -2526,11 +2739,12 @@ IOStatus CloudFileSystemImpl::EndManifestUploadBatch() {
     }
     local = pending_manifest_local_;
     cloud = pending_manifest_cloud_;
+    gen = pending_manifest_gen_;
   }
   // The copy runs outside the lock; a MANIFEST Sync() that lands meanwhile
   // uploads on its own (no batch is open) and clears the pending flag, which
   // is fine -- its copy is at least as new as this one.
-  IOStatus st = CopyLocalFileToDest(local, cloud);
+  IOStatus st = UploadManifest(local, cloud, gen);
   if (st.ok()) {
     std::lock_guard<std::mutex> lk(manifest_batch_mu_);
     if (pending_manifest_local_ == local) {
@@ -2553,7 +2767,8 @@ bool CloudFileSystemImpl::HasDeferredManifestUpload() const {
 }
 
 bool CloudFileSystemImpl::DeferManifestUpload(const std::string& local_name,
-                                              const std::string& cloud_name) {
+                                              const std::string& cloud_name,
+                                              uint64_t gen) {
   std::lock_guard<std::mutex> lk(manifest_batch_mu_);
   if (manifest_batch_depth_ == 0) {
     return false;
@@ -2561,6 +2776,7 @@ bool CloudFileSystemImpl::DeferManifestUpload(const std::string& local_name,
   manifest_upload_pending_ = true;
   pending_manifest_local_ = local_name;
   pending_manifest_cloud_ = cloud_name;
+  pending_manifest_gen_ = gen;
   return true;
 }
 

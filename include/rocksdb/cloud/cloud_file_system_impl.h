@@ -6,6 +6,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/file_system.h"
@@ -257,8 +258,17 @@ class CloudFileSystemImpl : public CloudFileSystem {
   IOStatus EndManifestUploadBatch() override;
   bool HasDeferredManifestUpload() const override;
   bool DeferManifestUpload(const std::string& local_name,
-                           const std::string& cloud_name) override;
+                           const std::string& cloud_name,
+                           uint64_t gen = 0) override;
   void ManifestUploaded() override;
+  IOStatus UploadManifest(const std::string& local_name,
+                          const std::string& cloud_name, uint64_t gen) override;
+  // After the MANIFEST `object` of `bucket` was fetched to `local`: append the
+  // deltas uploaded next to it (manifest_delta.h). Corruption if one is
+  // missing in the middle of the chain.
+  IOStatus ApplyManifestDeltas(const std::string& bucket,
+                               const std::string& object,
+                               const std::string& local);
 
   // Apply cloud manifest delta to in-memory cloud manifest. Does not change the
   // on-disk state.
@@ -484,6 +494,19 @@ class CloudFileSystemImpl : public CloudFileSystem {
   bool manifest_upload_pending_{false};
   std::string pending_manifest_local_;
   std::string pending_manifest_cloud_;
+  uint64_t pending_manifest_gen_{0};
+
+  // Per cloud MANIFEST name: what UploadManifest has uploaded of which
+  // generation (manifest_delta.h).
+  struct ManifestUploadState {
+    uint64_t gen = 0;
+    uint64_t uploaded = 0;     // bytes of the local file in the cloud
+    uint64_t base = 0;         // the last whole upload's size
+    uint64_t delta_bytes = 0;  // since then
+    uint64_t deltas = 0;
+  };
+  std::mutex manifest_delta_mu_;
+  std::unordered_map<std::string, ManifestUploadState> manifest_upload_state_;
 
   // This runs only in tests when we want to disable cloud manifest
   // functionality
