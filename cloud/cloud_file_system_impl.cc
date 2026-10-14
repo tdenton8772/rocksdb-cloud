@@ -271,8 +271,13 @@ IOStatus CloudFileSystemImpl::UploadManifest(const std::string& local_name,
     // objects, this one's covered deltas and older markers. A reader that
     // sees the base without the marker uses the base alone, which is complete
     // as of now.
+    // Readers use only the marker's name; the body repeats it because the
+    // provider refuses to upload an empty file (PutCloudObject: "Zero size").
     const std::string marker = local_name + ".mlog-marker";
-    st = WriteStringToFile(base_fs_.get(), Slice(), marker, false);
+    const std::string body = "gen=" + manifest_delta::Hex16(gen) +
+                             " size=" + std::to_string(size) +
+                             " hash=" + manifest_delta::Hex16(hash) + "\n";
+    st = WriteStringToFile(base_fs_.get(), Slice(body), marker, false);
     if (st.ok()) {
       st = GetStorageProvider()->PutCloudObject(
           marker, bucket,
