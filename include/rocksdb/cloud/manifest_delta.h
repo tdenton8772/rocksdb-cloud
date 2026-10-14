@@ -4,19 +4,24 @@
 // the whole file on every sync (CloudFileSystemOptions::upload_manifest_deltas).
 //
 // Objects next to the base, MANIFEST-<epoch>:
-//   mlog-<epoch>-<gen>-base-<size>          marker: the base holds generation
-//                                           <gen>'s first <size> bytes
+//   mlog-<epoch>-<gen>-base-<size16x>-<hash16x>  marker: the base holds
+//                                     generation <gen>'s first <size> bytes,
+//                                     whose Hash() is <hash>
 //   mlog-<epoch>-<gen>-<off16x>-<end16x>    bytes [off, end) of generation <gen>
 // A generation is one MANIFEST writer's lifetime (a new MANIFEST within an
 // epoch is a new generation; its id is random). The writer uploads the whole
 // file as the base and then its marker, deltas after that, and again the whole
 // file (and a new marker) when the deltas outgrow the base.
 //
-// A reader takes the base; if a marker of the base's exact size exists, it
-// appends that generation's deltas in order. The base alone is always a
-// complete MANIFEST as of its upload, so without a matching marker (a crash
-// between base and marker, an older writer) the base is used as is. A missing
-// delta in the middle of the chain is corruption: the reader fails.
+// A reader lists the objects, then takes the base; if a marker of the base's
+// size and hash is listed, it appends that generation's deltas in order. The
+// base alone is always a complete MANIFEST as of its upload, so without a
+// matching marker (a crash between base and marker, an older writer, a whole
+// upload that landed after the listing) the base is used as is. The hash keeps
+// a marker from matching another generation's base of the same size. A delta
+// missing in the middle of the chain is corruption: the reader fails. A delta
+// listed but gone when fetched was superseded by a whole upload: the reader
+// starts again.
 //
 // Names never start with "MANIFEST": rocksdb-cloud's invisible-file cleanup
 // deletes such objects unless they are the current epoch's MANIFEST.
@@ -44,6 +49,7 @@ struct Name {
   uint64_t off = 0;   // delta: first byte
   uint64_t end = 0;   // delta: one past the last byte
   uint64_t size = 0;  // marker: base size
+  uint64_t hash = 0;  // marker: Hash() of the base
   std::string object; // the name it was parsed from (basename)
 };
 
@@ -57,9 +63,20 @@ inline std::string Prefix(const std::string& epoch) {
   return std::string(kPrefix) + epoch + "-";
 }
 inline std::string BaseMarker(const std::string& epoch, uint64_t gen,
-                              uint64_t size) {
-  return Prefix(epoch) + Hex16(gen) + "-base-" + Hex16(size);
+                              uint64_t size, uint64_t hash) {
+  return Prefix(epoch) + Hex16(gen) + "-base-" + Hex16(size) + "-" + Hex16(hash);
 }
+
+// FNV-1a, 64 bit. Pass the previous result as `h` to continue over more bytes.
+constexpr uint64_t kHashSeed = 0xcbf29ce484222325ULL;
+inline uint64_t Hash(const char* p, size_t n, uint64_t h = kHashSeed) {
+  for (size_t i = 0; i < n; ++i) {
+    h ^= static_cast<unsigned char>(p[i]);
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+inline uint64_t Hash(const std::string& s) { return Hash(s.data(), s.size()); }
 inline std::string Delta(const std::string& epoch, uint64_t gen, uint64_t off,
                          uint64_t end) {
   return Prefix(epoch) + Hex16(gen) + "-" + Hex16(off) + "-" + Hex16(end);
@@ -110,10 +127,10 @@ inline Name Parse(const std::string& object) {
   const std::string body = base.substr(sizeof(kPrefix) - 1);
   std::vector<std::string> t;
   std::string head;
-  // Marker: <epoch>-<gen>-base-<size>
-  if (detail::SplitTail(body, 3, &t, &head) && t[1] == "base" &&
+  // Marker: <epoch>-<gen>-base-<size>-<hash>
+  if (detail::SplitTail(body, 4, &t, &head) && t[1] == "base" &&
       detail::ParseHex(t[0], &n.gen) && detail::ParseHex(t[2], &n.size) &&
-      !head.empty()) {
+      detail::ParseHex(t[3], &n.hash) && !head.empty()) {
     n.kind = Name::kBase;
     n.epoch = head;
     return n;
@@ -129,8 +146,8 @@ inline Name Parse(const std::string& object) {
   return n;
 }
 
-// What a reader applies on top of a base of `base_size` bytes, given the
-// object names next to it.
+// What a reader applies on top of a base of `base_size` bytes whose Hash() is
+// `base_hash`, given the object names listed (before the base was read).
 struct Plan {
   bool use_deltas = false;  // a marker matches the base
   bool gap = false;         // a delta of the chosen generation is missing
@@ -139,7 +156,8 @@ struct Plan {
   uint64_t final_size = 0;
 };
 
-inline Plan PlanAssembly(uint64_t base_size, const std::vector<std::string>& names,
+inline Plan PlanAssembly(uint64_t base_size, uint64_t base_hash,
+                         const std::vector<std::string>& names,
                          const std::string& epoch) {
   Plan p;
   p.final_size = base_size;
@@ -149,8 +167,9 @@ inline Plan PlanAssembly(uint64_t base_size, const std::vector<std::string>& nam
     Name n = Parse(s);
     if (n.kind == Name::kNone || n.epoch != epoch) continue;
     // Generations are time-ordered (NewGeneration): of the markers matching
-    // the base's size, the newest is the writer that uploaded this base.
-    if (n.kind == Name::kBase && n.size == base_size && (!found || n.gen > p.gen)) {
+    // the base, the newest is the writer that uploaded it.
+    if (n.kind == Name::kBase && n.size == base_size && n.hash == base_hash &&
+        (!found || n.gen > p.gen)) {
       found = true;
       p.gen = n.gen;
     }

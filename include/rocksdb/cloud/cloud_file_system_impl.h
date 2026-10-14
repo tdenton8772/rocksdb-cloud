@@ -263,12 +263,19 @@ class CloudFileSystemImpl : public CloudFileSystem {
   void ManifestUploaded() override;
   IOStatus UploadManifest(const std::string& local_name,
                           const std::string& cloud_name, uint64_t gen) override;
-  // After the MANIFEST `object` of `bucket` was fetched to `local`: append the
+  // Fetches the MANIFEST `object` of `bucket` to `local`: its base plus the
   // deltas uploaded next to it (manifest_delta.h). Corruption if one is
   // missing in the middle of the chain.
+  IOStatus GetManifestObject(const std::string& bucket,
+                             const std::string& object,
+                             const std::string& local);
+  // After the base was fetched to `local`: append the deltas `names` (listed
+  // before the base was read) plan for it. NotFound if a planned delta is
+  // gone, which a whole upload since the listing explains.
   IOStatus ApplyManifestDeltas(const std::string& bucket,
                                const std::string& object,
-                               const std::string& local);
+                               const std::string& local,
+                               const std::vector<std::string>& names);
 
   // Apply cloud manifest delta to in-memory cloud manifest. Does not change the
   // on-disk state.

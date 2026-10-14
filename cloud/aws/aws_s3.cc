@@ -391,6 +391,10 @@ class S3StorageProvider : public CloudStorageProviderImpl {
   IOStatus ListCloudObjects(const std::string& bucket_name,
                             const std::string& object_path,
                             std::vector<std::string>* result) override;
+  IOStatus ListCloudObjectsWithPrefix(const std::string& bucket_name,
+                                      const std::string& object_path,
+                                      const std::string& name_prefix,
+                                      std::vector<std::string>* result) override;
   IOStatus ExistsCloudObject(const std::string& bucket_name,
                              const std::string& object_path) override;
   IOStatus GetCloudObjectSize(const std::string& bucket_name,
@@ -620,11 +624,19 @@ IOStatus S3StorageProvider::DeleteCloudObject(const std::string& bucket_name,
 IOStatus S3StorageProvider::ListCloudObjects(const std::string& bucket_name,
                                              const std::string& object_path,
                                              std::vector<std::string>* result) {
+  return ListCloudObjectsWithPrefix(bucket_name, object_path, "", result);
+}
+
+IOStatus S3StorageProvider::ListCloudObjectsWithPrefix(
+    const std::string& bucket_name, const std::string& object_path,
+    const std::string& name_prefix, std::vector<std::string>* result) {
   // S3 paths don't start with '/'
   auto prefix = ltrim_if(object_path, '/');
   // S3 paths better end with '/', otherwise we might also get a list of files
   // in a directory for which our path is a prefix
   prefix = ensure_ends_with_pathsep(std::move(prefix));
+  // Names are relative to the directory; the request also narrows by name.
+  const std::string key_prefix = prefix + name_prefix;
   // the starting object marker
   Aws::String marker;
   bool loop = true;
@@ -636,7 +648,7 @@ IOStatus S3StorageProvider::ListCloudObjects(const std::string& bucket_name,
     request.SetMaxKeys(cfs_->GetCloudFileSystemOptions()
                            .number_objects_listed_in_one_iteration);
 
-    request.SetPrefix(ToAwsString(prefix));
+    request.SetPrefix(ToAwsString(key_prefix));
     request.SetMarker(marker);
 
     Aws::S3::Model::ListObjectsOutcome outcome =

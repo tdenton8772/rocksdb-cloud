@@ -12,6 +12,7 @@
 #include "env/composite_env_wrapper.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_storage_provider_impl.h"
+#include "rocksdb/cloud/manifest_delta.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
@@ -193,8 +194,24 @@ IOStatus ManifestReader::GetLiveFiles(const std::string& bucket_path,
   }
   std::unique_ptr<SequentialFileReader> file_reader;
   {
-    auto manifestFile =
-        ManifestFileWithEpoch(bucket_path, cloud_manifest->GetCurrentEpoch());
+    const std::string epoch = cloud_manifest->GetCurrentEpoch();
+    auto manifestFile = ManifestFileWithEpoch(bucket_path, epoch);
+    // This reads the base object as a stream and never its deltas
+    // (manifest_delta.h). A base without them lacks the newest files, and a
+    // purge from it would delete live ones: refuse instead.
+    {
+      std::vector<std::string> deltas;
+      s = cfs_->GetStorageProvider()->ListCloudObjectsWithPrefix(
+          bucket_prefix_, bucket_path, manifest_delta::Prefix(epoch), &deltas);
+      if (!s.ok()) {
+        return s;
+      }
+      if (!deltas.empty()) {
+        return IOStatus::NotSupported(
+            "MANIFEST " + manifestFile +
+            " has deltas; this reader reads only the base");
+      }
+    }
     std::unique_ptr<FSSequentialFile> file;
     s = cfs_->NewSequentialFileCloud(bucket_prefix_, manifestFile, file_opts,
                                      &file, dbg);

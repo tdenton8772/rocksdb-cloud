@@ -81,6 +81,26 @@ class CloudStorageProvider : public Configurable {
                                     const std::string& object_path,
                                     std::vector<std::string>* path_names) = 0;
 
+  // The objects directly under `object_path` whose names start with
+  // `name_prefix`, named relative to `object_path` as ListCloudObjects names
+  // them. The default lists the whole path and filters; a provider that can
+  // list by key prefix overrides it.
+  virtual IOStatus ListCloudObjectsWithPrefix(
+      const std::string& bucket_name, const std::string& object_path,
+      const std::string& name_prefix, std::vector<std::string>* path_names) {
+    std::vector<std::string> all;
+    IOStatus st = ListCloudObjects(bucket_name, object_path, &all);
+    if (!st.ok()) {
+      return st;
+    }
+    for (auto& n : all) {
+      if (n.compare(0, name_prefix.size(), name_prefix) == 0) {
+        path_names->push_back(std::move(n));
+      }
+    }
+    return st;
+  }
+
   // Does the specified object exist in the cloud storage
   virtual IOStatus ExistsCloudObject(const std::string& bucket_name,
                                      const std::string& object_path) = 0;
